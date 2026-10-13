@@ -1,81 +1,99 @@
 """OCR 引擎池
-- 支持 GPU/CPU 切换
-- 支持多引擎并行（多线程 OCR）
+- 自动检测 onnxruntime 变体（CPU / DirectML / GPU）
+- 支持多引擎并行（仅 CPU 模式）
 """
 
-import threading
 import numpy as np
 import mss
+
+from cuda_setup import (
+    check_onnxruntime_variant,
+    load_cuda_dlls,
+)
 
 
 class OCREngine:
     def __init__(self):
-        self.engines = []          # 引擎池
-        self.pool_size = 1         # 池大小
-        self.use_gpu = False
+        self.engines = []
+        self.pool_size = 1
+        self.variant = 'cpu'
         self.last_error = ''
 
     # ================= 初始化 =================
 
-    def init(self, use_gpu=False, pool_size=1):
+    def init(self, pool_size=1):
         """
         初始化 OCR 引擎池
-        返回：实际模式（'gpu' 或 'cpu'）
+        根据当前安装的 onnxruntime 变体自动选择加速方式
         """
         self.last_error = ''
         self.engines = []
-
-        # GPU 模式下池大小强制为 1（避免显存翻倍）
-        if use_gpu and pool_size > 1:
-            print(f"[OCR] GPU 模式下池大小自动降为 1（避免显存溢出）")
-            pool_size = 1
         self.pool_size = max(1, pool_size)
 
-        # 尝试 GPU
-        if use_gpu:
-            ok = self._init_engines(use_gpu=True)
-            if ok:
-                self.use_gpu = True
-                print(f"[OCR] ✅ 使用 GPU（池大小 {len(self.engines)}）")
-                return 'gpu'
-            else:
-                print(f"[OCR] ⚠️ GPU 失败：{self.last_error}，回退 CPU")
-
-        # CPU
-        self._init_engines(use_gpu=False)
-        self.use_gpu = False
-        print(f"[OCR] 使用 CPU（池大小 {len(self.engines)}）")
-        return 'cpu'
-
-    def _init_engines(self, use_gpu):
-        """尝试创建 pool_size 个引擎"""
+        # 检测变体
         try:
-            from rapidocr import RapidOCR
-            if use_gpu:
-                from config import (
-                    GPU_USE_CUDA, GPU_CUDNN_SEARCH, GPU_CLS_ON_CPU,
-                )
-                params = {}
-                params["EngineConfig.onnxruntime.use_cuda"] = GPU_USE_CUDA
-                params["EngineConfig.onnxruntime.cuda_ep_cfg."
-                       "cudnn_conv_algo_search"] = GPU_CUDNN_SEARCH
-                params["Det.use_cuda"] = True
-                params["Rec.use_cuda"] = True
-                params["Cls.use_cuda"] = not GPU_CLS_ON_CPU
-                engine = RapidOCR(params=params)
-                # GPU 只需一个
-                dummy = np.zeros((32, 128, 3), dtype=np.uint8)
-                _ = engine(dummy)
-                self.engines = [engine]
-                return True
-            else:
-                for _ in range(self.pool_size):
-                    self.engines.append(RapidOCR())
-                return True
+            self.variant = check_onnxruntime_variant() or 'cpu'
+        except Exception:
+            self.variant = 'cpu'
+
+        # GPU 模式下先加载 CUDA DLL
+        if self.variant == 'gpu':
+            try:
+                load_cuda_dlls()
+            except Exception as e:
+                print(f"[OCR] CUDA DLL 加载失败：{e}")
+
+        # DirectML / GPU 只创建一个引擎（显存限制）
+        if self.variant in ('gpu', 'directml'):
+            self.pool_size = 1
+
+        # 创建引擎
+        try:
+            self._init_engines()
+            print(f"[OCR] 使用 {self.variant}，池大小 {len(self.engines)}")
+            return self.variant
         except Exception as e:
             self.last_error = str(e)
-            self.engines = []
-            return False
+            print(f"[OCR] 初始化失败：{e}，回退 CPU")
+            # 回退 CPU
+            self.variant = 'cpu'
+            try:
+                self._init_engines()
+                return 'cpu'
+            except Exception as e2:
+                self.last_error = str(e2)
+                self.engines = []
+                return 'cpu'
+
+    def _init_engines(self):
+        from rapidocr import RapidOCR
+
+        params = {}
+
+        if self.variant == 'gpu':
+            params["EngineConfig.onnxruntime.use_cuda"] = True
+            params["EngineConfig.onnxruntime.cuda_ep_cfg."
+                   "cudnn_conv_algo_search"] = "DEFAULT"
+            params["Det.use_cuda"] = True
+            params["Rec.use_cuda"] = True
+            params["Cls.use_cuda"] = False
+
+        elif self.variant == 'directml':
+            params["EngineConfig.onnxruntime.use_dml"] = True
+            params["Det.use_dml"] = True
+            params["Rec.use_dml"] = True
+            params["Cls.use_dml"] = False
+
+        # 创建
+        if self.variant in ('gpu', 'directml'):
+            engine = RapidOCR(params=params)
+            # 自检
+            dummy = np.zeros((32, 128, 3), dtype=np.uint8)
+            _ = engine(dummy)
+            self.engines = [engine]
+        else:
+            for _ in range(self.pool_size):
+                self.engines.append(RapidOCR())
 
     # ================= 截图 =================
 
@@ -87,18 +105,11 @@ class OCREngine:
     # ================= 识别 =================
 
     def recognize(self, image_np):
-        """单张识别（用第一个引擎）"""
         if not self.engines:
             return []
         return self._recognize_one(self.engines[0], image_np)
 
     def recognize_batch(self, images):
-        """
-        批量并行识别
-        - pool_size==1 或单张：顺序处理
-        - pool_size>1：多线程并行
-        返回：list of results（顺序与输入对应）
-        """
         if not self.engines or not images:
             return [[] for _ in images]
 
@@ -126,7 +137,6 @@ class OCREngine:
         return results
 
     def _recognize_one(self, engine, image_np):
-        """单引擎识别"""
         try:
             result = engine(image_np)
             if result is None or not result.txts:
@@ -149,12 +159,8 @@ class OCREngine:
     def get_mode_text(self):
         if not self.engines:
             return "未初始化"
-        m = "GPU" if self.use_gpu else "CPU"
-        return f"{m} × {len(self.engines)}"
+        return f"{self.variant} × {len(self.engines)}"
 
     def check_gpu_available(self):
-        try:
-            import onnxruntime as ort
-            return 'CUDAExecutionProvider' in ort.get_available_providers()
-        except Exception:
-            return False
+        """兼容旧接口：是否使用非 CPU 加速"""
+        return self.variant in ('gpu', 'directml')

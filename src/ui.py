@@ -1,8 +1,9 @@
-"""实时屏幕翻译 - UI 模块
-包含主窗口和所有界面组件（带版本号 + 配置持久化）
+"""LST - UI 模块
+主窗口、加速方式管理、配置持久化
 """
 
 import queue
+import sys
 import time
 import threading
 
@@ -20,8 +21,7 @@ from config import (
     DEFAULT_ENABLE_FRAME_DIFF, DEFAULT_ENABLE_FILTER,
     DEFAULT_ENABLE_BLOCK_OCR,
     DEFAULT_ENABLE_ASYNC_TRANSLATE, DEFAULT_ENABLE_WINDOW_POOL,
-    DEFAULT_ENABLE_MULTITHREAD_OCR, MULTITHREAD_OCR_POOL_SIZE,
-    DEFAULT_USE_GPU,
+    MULTITHREAD_OCR_POOL_SIZE,
 )
 from ocr_engine import OCREngine
 from cache import ParagraphCache
@@ -35,12 +35,16 @@ from logger import get_logger, open_log_dir, clear_logs
 from scroll_detector import ScrollDetector
 from config_manager import get_config, open_config_dir, get_config_path
 from version import get_window_title, __version__, APP_NAME
+from cuda_setup import (
+    install_cuda, install_directml, install_cpu_onnxruntime,
+    check_onnxruntime_variant, check_cuda_ready, check_directml_ready,
+    get_current_engine_text, is_frozen,
+)
 
 
 log = get_logger('ui')
 
 
-# ==================== 常量 ====================
 CACHE_MIN = 100
 CACHE_MAX = 2000
 CACHE_DEFAULT = 500
@@ -91,11 +95,9 @@ class CollapsibleFrame(ctk.CTkFrame):
 class TranslatorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-
-        # 窗口标题带版本
         self.title(get_window_title())
 
-        # ============ 加载用户配置 ============
+        # ============ 配置 ============
         self.user_cfg = get_config()
         log.info(f"配置文件：{get_config_path()}")
 
@@ -104,19 +106,12 @@ class TranslatorApp(ctk.CTk):
         self.minsize(660, 600)
         self.attributes('-topmost', True)
 
-        # 读取配置
         initial_region = self.user_cfg.get_region()
         initial_font = self.user_cfg.get('font_size', INITIAL_FONT_SIZE)
         saved_mode = self.user_cfg.get('performance_mode', DEFAULT_MODE)
         if saved_mode not in PERFORMANCE_MODES:
             saved_mode = DEFAULT_MODE
         saved_hotkeys = self.user_cfg.get_hotkeys()
-
-        saved_use_gpu = self.user_cfg.get('use_gpu', DEFAULT_USE_GPU)
-        saved_mt = self.user_cfg.get('use_multithread_ocr',
-                                     DEFAULT_ENABLE_MULTITHREAD_OCR)
-        saved_pool_size = self.user_cfg.get('multithread_pool_size',
-                                            MULTITHREAD_OCR_POOL_SIZE)
 
         saved_frame_diff = self.user_cfg.get('enable_frame_diff',
                                              DEFAULT_ENABLE_FRAME_DIFF)
@@ -140,20 +135,15 @@ class TranslatorApp(ctk.CTk):
         saved_freeze_mode = self.user_cfg.get('freeze_mode', 'follow')
 
         log.info(f"========== 启动 v{__version__} ==========")
+        if is_frozen():
+            log.info("[启动] 打包模式（exe）")
 
-        # 互斥：GPU 优先
-        if saved_use_gpu and saved_mt:
-            saved_mt = False
-
-        # ============ 装配核心组件 ============
+        # ============ 核心组件 ============
         self.translator = Translator()
         self.ocr_engine = OCREngine()
 
-        pool_size = saved_pool_size if saved_mt else 1
-        self._actual_ocr_mode = self.ocr_engine.init(
-            use_gpu=saved_use_gpu, pool_size=pool_size,
-        )
-        log.info(f"OCR 引擎初始化完成：{self._actual_ocr_mode} × {pool_size}")
+        variant = self.ocr_engine.init(pool_size=MULTITHREAD_OCR_POOL_SIZE)
+        log.info(f"OCR 引擎初始化：{variant} × {len(self.ocr_engine.engines)}")
 
         self.cache = ParagraphCache(
             min_overlap=REUSE_MIN_OVERLAP,
@@ -173,7 +163,7 @@ class TranslatorApp(ctk.CTk):
             enable_block_ocr=saved_block,
             enable_async_translate=saved_async,
             enable_window_pool=saved_wpool,
-            enable_multithread_ocr=saved_mt,
+            enable_multithread_ocr=True,
         )
         self.app_state.performance_mode = saved_mode
         self.app_state.base_font_size = initial_font
@@ -194,7 +184,6 @@ class TranslatorApp(ctk.CTk):
             on_change=self.on_region_changed,
         )
 
-        # 滚动检测独立线程
         self.scroll_detector = ScrollDetector(
             get_region_fn=self.app_state.snapshot_region,
             on_scroll=self._on_scroll_detected,
@@ -202,7 +191,6 @@ class TranslatorApp(ctk.CTk):
         )
         self.scroll_detector.start()
 
-        # 热键
         self.hotkeys = dict(saved_hotkeys)
         self.hk_mgr = HotkeyManager()
         self._register_all_hotkeys()
@@ -212,28 +200,26 @@ class TranslatorApp(ctk.CTk):
         self._border_visible = True
         self._current_mode = saved_mode
         self._freeze_mode = saved_freeze_mode
+        self._accel_installing = False
+        self._accel_buttons = []
 
         # UI
         self._build_ui()
 
-        self.after(100, self._sync_gpu_ui)
-
-        # 恢复 UI 状态
+        self.after(100, self._sync_accel_ui)
         self._restore_ui_from_config(
             saved_mode, saved_scan, initial_font, saved_inpaint,
             saved_frame_diff, saved_block, saved_filter, saved_async,
             saved_wpool, saved_cache_max, saved_auto_clean,
-            saved_freeze_mode, saved_mt,
+            saved_freeze_mode,
         )
-
         self.after(TICK_MS, self._tick)
 
-    # ================= 恢复 UI 状态 =================
+    # ================= 恢复 UI =================
 
     def _restore_ui_from_config(self, mode, scan, font, inpaint,
                                 frame_diff, block, filt, async_t,
-                                wpool, cache_max, auto_clean,
-                                freeze_mode, mt_ocr):
+                                wpool, cache_max, auto_clean, freeze_mode):
         try:
             self.mode_selector.set(PERFORMANCE_MODES[mode]['name'])
             self._update_mode_desc(mode)
@@ -245,27 +231,22 @@ class TranslatorApp(ctk.CTk):
 
             if inpaint and CV2_AVAILABLE:
                 self.inpaint_switch.select()
-
             if frame_diff:
                 self.frame_diff_switch.select()
             else:
                 self.frame_diff_switch.deselect()
-
             if block:
                 self.block_ocr_switch.select()
             else:
                 self.block_ocr_switch.deselect()
-
             if filt:
                 self.filter_switch.select()
             else:
                 self.filter_switch.deselect()
-
             if async_t:
                 self.async_translate_switch.select()
             else:
                 self.async_translate_switch.deselect()
-
             if wpool:
                 self.window_pool_switch.select()
             else:
@@ -274,7 +255,6 @@ class TranslatorApp(ctk.CTk):
             self.cache_limit_slider.set(cache_max)
             self.cache_limit_label.configure(text=str(cache_max))
             self.cache.max_size = cache_max
-
             if auto_clean:
                 self.auto_clean_switch.select()
             else:
@@ -285,16 +265,11 @@ class TranslatorApp(ctk.CTk):
                     text="🔄 恢复跟随",
                     fg_color='#ff9900', hover_color='#e68a00',
                 )
-                self.bottom_label.configure(
-                    text="📌 已钉住（配置恢复）：译文固定")
-
-            if mt_ocr:
-                self.multithread_ocr_switch.select()
-
+                self.bottom_label.configure(text="📌 已钉住（配置恢复）")
         except Exception as e:
             log.exception(f"[UI] 恢复配置失败：{e}")
 
-    # ================= 滚动回调 =================
+    # ================= 滚动 =================
 
     def _is_scroll_active(self):
         return (self.app_state.running
@@ -342,7 +317,6 @@ class TranslatorApp(ctk.CTk):
         )
         self.status_label.pack(side='left', padx=10)
 
-        # 版本号（右上角）
         self.version_label = ctk.CTkLabel(
             top, text=f"{APP_NAME} v{__version__}",
             font=(FONT_NAME, 10), text_color='#3a86ff',
@@ -450,6 +424,7 @@ class TranslatorApp(ctk.CTk):
         self._refresh_hotkey_hint()
 
     def _build_display_tab(self, parent):
+        # 性能模式
         ctk.CTkLabel(
             parent, text="性能模式：", font=(FONT_NAME, 11, 'bold'),
         ).grid(row=0, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
@@ -477,49 +452,68 @@ class TranslatorApp(ctk.CTk):
         )
         self._update_mode_desc(DEFAULT_MODE)
 
+        # ============ 加速方式 ============
         ctk.CTkLabel(
-            parent, text="加速方式（二选一）：",
+            parent, text="加速方式：",
             font=(FONT_NAME, 11, 'bold'),
         ).grid(row=2, column=0, columnspan=3,
                sticky='w', padx=(15, 5), pady=(8, 4))
 
-        self.gpu_switch = ctk.CTkSwitch(
-            parent, text="GPU 加速（NVIDIA 显卡）",
-            command=self._on_gpu_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+        self.ort_variant_label = ctk.CTkLabel(
+            parent, text="当前引擎：检测中...",
+            font=(FONT_NAME, 9), text_color='#666666',
+            anchor='w',
         )
-        if DEFAULT_USE_GPU:
-            self.gpu_switch.select()
-        self.gpu_switch.grid(
+        self.ort_variant_label.grid(
             row=3, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 6))
 
-        self.multithread_ocr_switch = ctk.CTkSwitch(
-            parent,
-            text=f"多线程 OCR（{MULTITHREAD_OCR_POOL_SIZE} 引擎并行，CPU）",
-            command=self._on_multithread_ocr_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
-        )
-        if DEFAULT_ENABLE_MULTITHREAD_OCR:
-            self.multithread_ocr_switch.select()
-        self.multithread_ocr_switch.grid(
+        accel_btns = ctk.CTkFrame(parent, fg_color='transparent')
+        accel_btns.grid(
             row=4, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4),
-        )
+            sticky='ew', padx=(15, 15), pady=(0, 6))
 
-        self.gpu_status_label = ctk.CTkLabel(
+        btn1 = ctk.CTkButton(
+            accel_btns, text="多线程 CPU\n(0MB)",
+            width=130, height=50,
+            font=(FONT_NAME, 10),
+            fg_color='#6c757d', hover_color='#5a6268',
+            command=self.install_cpu_accel,
+        )
+        btn1.pack(side='left', padx=3)
+        self._accel_buttons.append(btn1)
+
+        btn2 = ctk.CTkButton(
+            accel_btns, text="DirectML GPU\n(50MB，支持所有显卡)",
+            width=180, height=50,
+            font=(FONT_NAME, 10),
+            fg_color='#3a86ff', hover_color='#2a6fd8',
+            command=self.install_directml_accel,
+        )
+        btn2.pack(side='left', padx=3)
+        self._accel_buttons.append(btn2)
+
+        btn3 = ctk.CTkButton(
+            accel_btns, text="NVIDIA CUDA\n(1.6GB，仅 NVIDIA)",
+            width=160, height=50,
+            font=(FONT_NAME, 10),
+            fg_color='#28a745', hover_color='#1e7e34',
+            command=self.install_cuda_accel,
+        )
+        btn3.pack(side='left', padx=3)
+        self._accel_buttons.append(btn3)
+
+        self.accel_status_label = ctk.CTkLabel(
             parent, text="",
             font=(FONT_NAME, 9), text_color='#666666',
             anchor='w', justify='left',
+            wraplength=600,
         )
-        self.gpu_status_label.grid(
+        self.accel_status_label.grid(
             row=5, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 10),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 10))
 
+        # ============ 优化功能 ============
         ctk.CTkLabel(
             parent, text="优化功能：", font=(FONT_NAME, 11, 'bold'),
         ).grid(row=6, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
@@ -534,8 +528,7 @@ class TranslatorApp(ctk.CTk):
             self.frame_diff_switch.select()
         self.frame_diff_switch.grid(
             row=7, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 4))
 
         self.block_ocr_switch = ctk.CTkSwitch(
             parent, text="分块 OCR（只识别变化的区域）",
@@ -547,8 +540,7 @@ class TranslatorApp(ctk.CTk):
             self.block_ocr_switch.select()
         self.block_ocr_switch.grid(
             row=8, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 4))
 
         self.filter_switch = ctk.CTkSwitch(
             parent, text="文字过滤（过滤异常框）",
@@ -560,8 +552,7 @@ class TranslatorApp(ctk.CTk):
             self.filter_switch.select()
         self.filter_switch.grid(
             row=9, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 4))
 
         self.async_translate_switch = ctk.CTkSwitch(
             parent, text="异步翻译（不阻塞 OCR）",
@@ -573,8 +564,7 @@ class TranslatorApp(ctk.CTk):
             self.async_translate_switch.select()
         self.async_translate_switch.grid(
             row=10, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 4))
 
         self.window_pool_switch = ctk.CTkSwitch(
             parent, text="窗口池（复用译文窗口）",
@@ -586,9 +576,9 @@ class TranslatorApp(ctk.CTk):
             self.window_pool_switch.select()
         self.window_pool_switch.grid(
             row=11, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 10),
-        )
+            sticky='w', padx=(25, 15), pady=(0, 10))
 
+        # 刷新间隔
         ctk.CTkLabel(
             parent, text="刷新间隔 (秒)：", font=(FONT_NAME, 11),
         ).grid(row=12, column=0, sticky='w', padx=(15, 5), pady=8)
@@ -731,13 +721,160 @@ class TranslatorApp(ctk.CTk):
         self.bottom_label.configure(text="已打开配置目录")
 
     def open_about(self):
-        """打开关于窗口"""
         try:
             from about_dialog import AboutDialog
             dlg = AboutDialog(self)
             dlg.grab_set()
         except Exception as e:
             log.exception(f"[关于] 打开失败：{e}")
+
+    # ================= 加速方式 =================
+
+    def _sync_accel_ui(self):
+        """刷新加速方式状态"""
+        try:
+            variant = check_onnxruntime_variant() or '未安装'
+            variant_map = {
+                'cpu': 'CPU 多线程',
+                'gpu': 'NVIDIA CUDA',
+                'directml': 'DirectML GPU',
+                '未安装': '未安装',
+            }
+            self.ort_variant_label.configure(
+                text=f"当前引擎：{variant_map.get(variant, variant)}")
+
+            # 👇 打包环境：禁用三个加速按钮
+            if is_frozen():
+                self._set_accel_buttons_state('disabled')
+                self.accel_status_label.configure(
+                    text="ℹ️ 打包版本无法自动安装加速环境，请下载对应版本 exe "
+                         "（LST-CPU / LST-DirectML / LST-CUDA）",
+                    text_color='#cc6600')
+                return
+
+            # 源码环境：按钮可用
+            self._set_accel_buttons_state('normal')
+
+            if variant == 'gpu':
+                ok, msg = check_cuda_ready()
+            elif variant == 'directml':
+                ok, msg = check_directml_ready()
+            else:
+                ok, msg = True, "CPU 多线程模式"
+
+            if ok:
+                self.accel_status_label.configure(
+                    text=f"✅ {msg}（如需切换请点上方按钮）",
+                    text_color='#00a000')
+            else:
+                self.accel_status_label.configure(
+                    text=f"⚠️ {msg}", text_color='#cc6600')
+        except Exception as e:
+            log.exception("[加速] 状态刷新失败")
+            self.accel_status_label.configure(
+                text=f"状态获取失败：{e}", text_color='#cc0000')
+
+    def _set_accel_buttons_state(self, state):
+        """统一设置三个加速按钮状态"""
+        try:
+            for btn in self._accel_buttons:
+                btn.configure(state=state)
+        except Exception:
+            pass
+
+    def install_cpu_accel(self):
+        if is_frozen():
+            self._show_frozen_warning()
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "切换到 CPU 多线程",
+            "将卸载 GPU 加速包，改用 CPU 多线程。\n"
+            "耗时几秒钟，是否继续？"
+        ):
+            return
+        self._run_install('CPU 多线程', install_cpu_onnxruntime)
+
+    def install_directml_accel(self):
+        if is_frozen():
+            self._show_frozen_warning()
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "安装 DirectML 加速",
+            "将下载 onnxruntime-directml（约 50MB）\n\n"
+            "• 支持 NVIDIA / AMD / Intel 显卡\n"
+            "• 不需要 CUDA 库\n"
+            "• 性能约为 CUDA 的 70~80%\n\n"
+            "是否继续？"
+        ):
+            return
+        self._run_install('DirectML', install_directml)
+
+    def install_cuda_accel(self):
+        if is_frozen():
+            self._show_frozen_warning()
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "安装 NVIDIA CUDA",
+            "将下载 NVIDIA CUDA 库（约 1.6GB）\n\n"
+            "• 仅支持 NVIDIA 显卡\n"
+            "• 需要已安装 NVIDIA 驱动\n"
+            "• 速度最快\n\n"
+            "下载耗时可能较长，是否继续？"
+        ):
+            return
+        self._run_install('NVIDIA CUDA', install_cuda)
+
+    def _show_frozen_warning(self):
+        """打包环境警告"""
+        from tkinter import messagebox
+        messagebox.showinfo(
+            "打包版本限制",
+            "当前是打包版本（exe），无法自动安装加速环境。\n\n"
+            "如需 GPU 加速，请下载对应版本：\n"
+            "  • LST-CPU.exe      （多线程 CPU）\n"
+            "  • LST-DirectML.exe （支持所有显卡）\n"
+            "  • LST-CUDA.exe     （仅 NVIDIA）\n\n"
+            "或使用源码运行（python main.py）后点此按钮。"
+        )
+
+    def _run_install(self, name, install_fn):
+        if self._accel_installing:
+            self.bottom_label.configure(text="正在安装中...")
+            return
+
+        self._accel_installing = True
+        self.accel_status_label.configure(
+            text=f"⏳ 开始安装 {name}...", text_color='#666666')
+        self.bottom_label.configure(text=f"正在安装 {name}...")
+        log.info(f"[加速] 开始安装 {name}")
+
+        def progress(msg):
+            try:
+                self.after(0, lambda: self.accel_status_label.configure(
+                    text=f"⏳ {msg}", text_color='#666666'))
+            except Exception:
+                pass
+
+        def done(success, msg):
+            def _finish():
+                self._accel_installing = False
+                if success:
+                    self.accel_status_label.configure(
+                        text=f"✅ {msg}", text_color='#00a000')
+                    from tkinter import messagebox
+                    messagebox.showinfo("完成", msg)
+                else:
+                    self.accel_status_label.configure(
+                        text=f"❌ {msg[:80]}", text_color='#cc0000')
+                    from tkinter import messagebox
+                    messagebox.showerror("失败", msg)
+                self._sync_accel_ui()
+            self.after(0, _finish)
+
+        install_fn(progress_cb=progress, done_cb=done)
 
     # ================= 跟随 / 钉住 =================
 
@@ -751,8 +888,7 @@ class TranslatorApp(ctk.CTk):
                 text="🔄 恢复跟随",
                 fg_color='#ff9900', hover_color='#e68a00',
             )
-            self.bottom_label.configure(
-                text="📌 已钉住：译文固定，滚页不动")
+            self.bottom_label.configure(text="📌 已钉住：译文固定")
             log.info("[模式] 切换到钉住")
         else:
             self._freeze_mode = 'follow'
@@ -771,178 +907,11 @@ class TranslatorApp(ctk.CTk):
                 text="📌 钉住译文",
                 fg_color='#3a86ff', hover_color='#2a6fd8',
             )
-            self.bottom_label.configure(
-                text="🔄 已恢复跟随：译文随原文滚动")
+            self.bottom_label.configure(text="🔄 已恢复跟随")
             log.info("[模式] 切换到跟随")
 
         self.user_cfg.set('freeze_mode', self._freeze_mode)
         self.user_cfg.save()
-
-    # ================= GPU / 多线程 =================
-
-    def _sync_gpu_ui(self):
-        gpu_available = self.ocr_engine.check_gpu_available()
-        mode = self._actual_ocr_mode
-
-        if mode == 'gpu':
-            self.gpu_status_label.configure(
-                text="✅ 已启用 GPU 加速（多线程 OCR 已禁用）",
-                text_color='#00a000')
-            self.multithread_ocr_switch.configure(state='disabled')
-            if self.multithread_ocr_switch.get():
-                self.multithread_ocr_switch.deselect()
-                self.app_state.enable_multithread_ocr = False
-
-        elif not gpu_available:
-            self.gpu_switch.configure(state='disabled')
-            if self.gpu_switch.get():
-                self.gpu_switch.deselect()
-            self.gpu_status_label.configure(
-                text="❌ 未检测到 CUDA 环境，可使用多线程 OCR（CPU）",
-                text_color='#cc0000')
-            self.multithread_ocr_switch.configure(state='normal')
-
-        else:
-            self.gpu_status_label.configure(
-                text="ℹ️ 选择加速方式：GPU 或多线程 OCR（二选一）",
-                text_color='#666666')
-            self.multithread_ocr_switch.configure(state='normal')
-
-    def _on_gpu_toggle(self):
-        enabled = bool(self.gpu_switch.get())
-
-        if not enabled:
-            self.bottom_label.configure(text="正在切换到 CPU...")
-            self.update_idletasks()
-            self._restart_ocr_engine(use_gpu=False)
-            self.multithread_ocr_switch.configure(state='normal')
-            return
-
-        if not self.ocr_engine.check_gpu_available():
-            self.gpu_switch.deselect()
-            self.gpu_status_label.configure(
-                text="❌ 未检测到 CUDA 环境", text_color='#cc0000')
-            self.bottom_label.configure(text="GPU 不可用")
-            return
-
-        if self.multithread_ocr_switch.get():
-            self.multithread_ocr_switch.deselect()
-            self.app_state.enable_multithread_ocr = False
-            log.info("[互斥] GPU 开启，自动关闭多线程 OCR")
-
-        self.multithread_ocr_switch.configure(state='disabled')
-
-        self.bottom_label.configure(text="正在初始化 GPU 引擎...")
-        self.gpu_status_label.configure(
-            text="⏳ 初始化中...", text_color='#666666')
-        self.update_idletasks()
-        self._restart_ocr_engine(use_gpu=True)
-
-    def _on_multithread_ocr_toggle(self):
-        enabled = bool(self.multithread_ocr_switch.get())
-
-        if enabled and self.gpu_switch.get():
-            self.gpu_switch.deselect()
-            log.info("[互斥] 多线程 OCR 开启，自动关闭 GPU")
-            self.gpu_switch.configure(state='disabled')
-
-            self.bottom_label.configure(text="正在切换到 CPU 多线程引擎...")
-            self.update_idletasks()
-
-            pool_size = MULTITHREAD_OCR_POOL_SIZE
-            self._reinit_ocr_pool(use_gpu=False, pool_size=pool_size)
-            self.app_state.enable_multithread_ocr = True
-
-            self.gpu_status_label.configure(
-                text=f"✅ 已启用 CPU 多线程 OCR（{pool_size} 引擎）",
-                text_color='#00a000')
-            self.bottom_label.configure(
-                text=f"多线程 OCR：已开启（{pool_size} 引擎）")
-            log.info(f"[开关] 多线程 OCR：已开启（{pool_size} 引擎）")
-
-            self.user_cfg.set('use_multithread_ocr', True)
-            self.user_cfg.set('use_gpu', False)
-            self.user_cfg.save()
-            return
-
-        if enabled:
-            if self.ocr_engine.check_gpu_available():
-                self.gpu_switch.configure(state='normal')
-            self.app_state.enable_multithread_ocr = True
-            pool_size = MULTITHREAD_OCR_POOL_SIZE
-            self._reinit_ocr_pool(use_gpu=False, pool_size=pool_size)
-            self.gpu_status_label.configure(
-                text=f"✅ 已启用 CPU 多线程 OCR（{pool_size} 引擎）",
-                text_color='#00a000')
-            self.bottom_label.configure(
-                text=f"多线程 OCR：已开启（{pool_size} 引擎）")
-            log.info(f"[开关] 多线程 OCR：已开启（{pool_size} 引擎）")
-        else:
-            self.app_state.enable_multithread_ocr = False
-            self._reinit_ocr_pool(use_gpu=False, pool_size=1)
-            if self.ocr_engine.check_gpu_available():
-                self.gpu_switch.configure(state='normal')
-            self.gpu_status_label.configure(
-                text="ℹ️ 选择加速方式：GPU 或多线程 OCR（二选一）",
-                text_color='#666666')
-            self.bottom_label.configure(text="多线程 OCR：已关闭（单引擎）")
-            log.info("[开关] 多线程 OCR：已关闭")
-
-        self.user_cfg.set('use_multithread_ocr',
-                          self.app_state.enable_multithread_ocr)
-        self.user_cfg.save()
-
-    def _restart_ocr_engine(self, use_gpu):
-        old_running = self.app_state.running
-        self.app_state.running = False
-        pool_size = 1
-        try:
-            mode = self.ocr_engine.init(use_gpu=use_gpu, pool_size=pool_size)
-            self._actual_ocr_mode = mode
-            self.cache.clear()
-            if hasattr(self.pipeline, 'inpaint_cache'):
-                self.pipeline.inpaint_cache.clear()
-            self.app_state.reset_signature()
-            self.overlay.clear()
-            if mode == 'gpu':
-                self.gpu_switch.select()
-                self.gpu_status_label.configure(
-                    text="✅ 已启用 GPU 加速（多线程 OCR 已禁用）",
-                    text_color='#00a000')
-                self.bottom_label.configure(text="✅ GPU 加速已启用")
-            else:
-                self.gpu_switch.deselect()
-                err = self.ocr_engine.last_error or "未知原因"
-                self.gpu_status_label.configure(
-                    text=f"⚠️ GPU 失败，已回退 CPU：{err[:40]}",
-                    text_color='#cc6600')
-                self.bottom_label.configure(text="GPU 失败，已回退 CPU")
-            log.info(f"[GPU] OCR 引擎切换到 {mode}")
-
-            self.user_cfg.set('use_gpu', (mode == 'gpu'))
-            self.user_cfg.save()
-        except Exception as e:
-            log.exception(f"[GPU] 切换失败：{e}")
-            self.bottom_label.configure(text=f"切换失败：{e}")
-        finally:
-            self.app_state.running = old_running
-
-    def _reinit_ocr_pool(self, use_gpu, pool_size):
-        old_running = self.app_state.running
-        self.app_state.running = False
-        try:
-            mode = self.ocr_engine.init(use_gpu=use_gpu, pool_size=pool_size)
-            self._actual_ocr_mode = mode
-            self.cache.clear()
-            if hasattr(self.pipeline, 'inpaint_cache'):
-                self.pipeline.inpaint_cache.clear()
-            self.app_state.reset_signature()
-            self.overlay.clear()
-            log.info(f"[OCR] 引擎池重建：{mode} × {len(self.ocr_engine.engines)}")
-        except Exception as e:
-            log.exception(f"[OCR] 重建失败：{e}")
-        finally:
-            self.app_state.running = old_running
 
     # ================= 性能模式 =================
 
@@ -964,7 +933,6 @@ class TranslatorApp(ctk.CTk):
         self.app_state.reset_signature()
         self.bottom_label.configure(text=f"性能模式：{cfg['name']}")
         log.info(f"[模式] 切换为 {cfg['name']}")
-
         self.user_cfg.set('performance_mode', mode_key)
         self.user_cfg.set('scan_interval', cfg['scan_interval'])
         self.user_cfg.save()
@@ -1154,7 +1122,6 @@ class TranslatorApp(ctk.CTk):
         else:
             self.bottom_label.configure(text="✅ 所有热键已更新")
             log.info("[热键] 全部更新成功")
-
         self.user_cfg.set_hotkeys(new_hotkeys)
         self.user_cfg.save()
 
@@ -1207,10 +1174,8 @@ class TranslatorApp(ctk.CTk):
         self.overlay.clear()
         self._update_region_label()
         self.bottom_label.configure(text="区域已更新")
-
         self.user_cfg.set_region(new_region)
         self.user_cfg.save()
-
         log.info(f"[区域] 更新为 {new_region}")
 
     def _update_region_label(self):
@@ -1294,7 +1259,7 @@ class TranslatorApp(ctk.CTk):
             log.exception(f"[截图错误] {e}")
 
     def quit_app(self):
-        log.info("========== 退出 ==========")
+        log.info(f"========== 退出 v{__version__} ==========")
 
         try:
             self.user_cfg.set('window_geometry', self.geometry())
