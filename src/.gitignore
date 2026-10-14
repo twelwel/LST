@@ -1,8 +1,39 @@
+# 虚拟环境
 .venv/
+venv/
+env/
+
+# Python 缓存
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# PyInstaller
 build/
 dist/
 *.spec
+!LST.spec
+
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+logs/
+
+# 测试
 test/
+tests/
+
+# 用户配置（不要提交）
+*.env
+config.local.json

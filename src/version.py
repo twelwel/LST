@@ -2,10 +2,10 @@
 所有版本号统一在这里修改
 """
 
-__version__ = "1.0.0"
-__version_tuple__ = (1, 0, 0)
-__author__ = "你的名字"
-__email__ = "your@email.com"
+__version__ = "1.10.0"
+__version_tuple__ = (1, 10, 0)
+__author__ = "twelwel"
+__email__ = "2033697674@qq.com"
 __license__ = "MIT"
 
 APP_NAME = "LST"
@@ -15,6 +15,7 @@ REPO_URL = "https://github.com/twelwel/LST"
 RELEASE_URL = REPO_URL + "/releases"
 
 VERSION_INFO = {
+    "1.10.0": "版本 1.10.0：新增本地词典和以及快速覆盖优化",
     "1.0.0": "首个正式版本：实时屏幕 OCR + 翻译",
 }
 

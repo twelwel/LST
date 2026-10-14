@@ -1,7 +1,9 @@
 """LST - UI 模块
-主窗口、加速方式管理、配置持久化
+三模式翻译：本地 / 混合 / 联网
+短语缓存 + 本地词典（支持文件夹）+ API
 """
 
+import os
 import queue
 import sys
 import time
@@ -16,6 +18,13 @@ from config import (
     SCAN_MIN, SCAN_MAX, FONT_MIN, FONT_MAX,
     FRAME_SIMILARITY_THRESHOLD, POSITION_QUANTIZE,
     DEFAULT_USE_INPAINTING,
+    DEFAULT_ENABLE_FINE_TEXT,
+    DEFAULT_ENABLE_ASYNC_OVERLAY,
+    DEFAULT_ENABLE_GENERAL_FILTER,
+    DEFAULT_ENABLE_PHRASE_CACHE,
+    DEFAULT_PHRASE_TABLE_PATH,
+    DEFAULT_TRANSLATION_MODE,
+    DEFAULT_LOCAL_DICT_PATH,
     PERFORMANCE_MODES, DEFAULT_MODE,
     IDLE_THRESHOLD_FOR_SLOWDOWN, IDLE_SLOWDOWN_FACTOR,
     DEFAULT_ENABLE_FRAME_DIFF, DEFAULT_ENABLE_FILTER,
@@ -36,9 +45,8 @@ from scroll_detector import ScrollDetector
 from config_manager import get_config, open_config_dir, get_config_path
 from version import get_window_title, __version__, APP_NAME
 from cuda_setup import (
-    install_cuda, install_directml, install_cpu_onnxruntime,
     check_onnxruntime_variant, check_cuda_ready, check_directml_ready,
-    get_current_engine_text, is_frozen,
+    is_frozen,
 )
 
 
@@ -48,7 +56,7 @@ log = get_logger('ui')
 CACHE_MIN = 100
 CACHE_MAX = 2000
 CACHE_DEFAULT = 500
-TICK_MS = 16
+TICK_MS = 10
 BOUNDARY_PADDING = 10
 
 
@@ -101,7 +109,7 @@ class TranslatorApp(ctk.CTk):
         self.user_cfg = get_config()
         log.info(f"配置文件：{get_config_path()}")
 
-        geo = self.user_cfg.get('window_geometry', "740x820+50+50")
+        geo = self.user_cfg.get('window_geometry', "740x1080+50+50")
         self.geometry(geo)
         self.minsize(660, 600)
         self.attributes('-topmost', True)
@@ -119,6 +127,16 @@ class TranslatorApp(ctk.CTk):
                                         DEFAULT_ENABLE_BLOCK_OCR)
         saved_filter = self.user_cfg.get('enable_filter',
                                          DEFAULT_ENABLE_FILTER)
+        saved_general_filter = self.user_cfg.get(
+            'enable_general_filter', DEFAULT_ENABLE_GENERAL_FILTER)
+        saved_phrase_cache = self.user_cfg.get(
+            'enable_phrase_cache', DEFAULT_ENABLE_PHRASE_CACHE)
+        saved_phrase_table_path = self.user_cfg.get(
+            'phrase_table_path', DEFAULT_PHRASE_TABLE_PATH)
+        saved_translation_mode = self.user_cfg.get(
+            'translation_mode', DEFAULT_TRANSLATION_MODE)
+        saved_local_dict_path = self.user_cfg.get(
+            'local_dict_path', DEFAULT_LOCAL_DICT_PATH)
         saved_async = self.user_cfg.get('enable_async_translate',
                                         DEFAULT_ENABLE_ASYNC_TRANSLATE)
         saved_wpool = self.user_cfg.get('enable_window_pool',
@@ -130,9 +148,15 @@ class TranslatorApp(ctk.CTk):
         )
         saved_inpaint = self.user_cfg.get('use_inpainting',
                                           DEFAULT_USE_INPAINTING)
+        saved_fine_text = self.user_cfg.get('enable_fine_text',
+                                            DEFAULT_ENABLE_FINE_TEXT)
+        saved_async_overlay = self.user_cfg.get(
+            'enable_async_overlay', DEFAULT_ENABLE_ASYNC_OVERLAY)
         saved_cache_max = self.user_cfg.get('cache_max_size', CACHE_DEFAULT)
         saved_auto_clean = self.user_cfg.get('auto_clean', True)
-        saved_freeze_mode = self.user_cfg.get('freeze_mode', 'follow')
+        saved_follow_mode = self.user_cfg.get('follow_mode', 'follow')
+        if saved_follow_mode not in ('default', 'follow', 'pin'):
+            saved_follow_mode = 'follow'
 
         log.info(f"========== 启动 v{__version__} ==========")
         if is_frozen():
@@ -142,7 +166,27 @@ class TranslatorApp(ctk.CTk):
         self.translator = Translator()
         self.ocr_engine = OCREngine()
 
-        variant = self.ocr_engine.init(pool_size=MULTITHREAD_OCR_POOL_SIZE)
+        saved_accel_mode = self.user_cfg.get('accel_mode', '')
+        current_variant = check_onnxruntime_variant() or 'cpu'
+
+        if saved_accel_mode == 'directml' and current_variant == 'directml':
+            init_mode = 'directml'
+        elif saved_accel_mode == 'cuda' and current_variant == 'gpu':
+            init_mode = 'cuda'
+        elif saved_accel_mode == 'cpu_multi':
+            init_mode = 'cpu_multi'
+        else:
+            if current_variant == 'directml':
+                init_mode = 'directml'
+            elif current_variant == 'gpu':
+                init_mode = 'cuda'
+            else:
+                init_mode = 'cpu_multi'
+
+        variant = self.ocr_engine.init(
+            mode=init_mode,
+            pool_size=MULTITHREAD_OCR_POOL_SIZE,
+        )
         log.info(f"OCR 引擎初始化：{variant} × {len(self.ocr_engine.engines)}")
 
         self.cache = ParagraphCache(
@@ -157,6 +201,11 @@ class TranslatorApp(ctk.CTk):
             frame_similarity_threshold=FRAME_SIMILARITY_THRESHOLD,
             position_quantize=POSITION_QUANTIZE,
             use_inpainting=saved_inpaint,
+            enable_fine_text=saved_fine_text,
+            enable_general_filter=saved_general_filter,
+            enable_phrase_cache=saved_phrase_cache,
+            translation_mode=saved_translation_mode,
+            local_dict_path=saved_local_dict_path,
             mode_cfg=default_cfg,
             enable_frame_diff=saved_frame_diff,
             enable_filter=saved_filter,
@@ -167,16 +216,27 @@ class TranslatorApp(ctk.CTk):
         )
         self.app_state.performance_mode = saved_mode
         self.app_state.base_font_size = initial_font
-        self.app_state.freeze_overlay = (saved_freeze_mode == 'pin')
         self.app_state.scan_interval = saved_scan
+        self.app_state.follow_mode = saved_follow_mode
+        self.app_state.freeze_overlay = (saved_follow_mode == 'pin')
 
         self.pipeline = Pipeline(
             self.ocr_engine, self.cache, self.translator, self.app_state,
         )
         self.pipeline.start()
 
+        # 应用用户指定的短语表路径
+        try:
+            self.pipeline.phrase_cache.set_external_path(
+                saved_phrase_table_path)
+            if saved_phrase_table_path:
+                self.pipeline.phrase_cache.load_external()
+        except Exception as e:
+            log.exception(f"[短语表] 初始化失败：{e}")
+
         self.overlay = OverlayWindow(self, font_name=FONT_NAME)
         self.overlay.set_pool_enabled(saved_wpool)
+        self.overlay.set_async_enabled(saved_async_overlay)
 
         self.region_manager = RegionManager(
             self, initial_region,
@@ -199,27 +259,32 @@ class TranslatorApp(ctk.CTk):
         self._last_cache_ui_update = 0
         self._border_visible = True
         self._current_mode = saved_mode
-        self._freeze_mode = saved_freeze_mode
-        self._accel_installing = False
-        self._accel_buttons = []
 
         # UI
         self._build_ui()
 
         self.after(100, self._sync_accel_ui)
+        self.after(100, self._sync_follow_mode_ui)
         self._restore_ui_from_config(
             saved_mode, saved_scan, initial_font, saved_inpaint,
+            saved_fine_text, saved_async_overlay,
+            saved_general_filter, saved_phrase_cache,
+            saved_phrase_table_path,
+            saved_translation_mode, saved_local_dict_path,
             saved_frame_diff, saved_block, saved_filter, saved_async,
             saved_wpool, saved_cache_max, saved_auto_clean,
-            saved_freeze_mode,
         )
         self.after(TICK_MS, self._tick)
 
     # ================= 恢复 UI =================
 
     def _restore_ui_from_config(self, mode, scan, font, inpaint,
+                                fine_text, async_overlay,
+                                general_filter, phrase_cache,
+                                phrase_table_path,
+                                translation_mode, local_dict_path,
                                 frame_diff, block, filt, async_t,
-                                wpool, cache_max, auto_clean, freeze_mode):
+                                wpool, cache_max, auto_clean):
         try:
             self.mode_selector.set(PERFORMANCE_MODES[mode]['name'])
             self._update_mode_desc(mode)
@@ -231,6 +296,38 @@ class TranslatorApp(ctk.CTk):
 
             if inpaint and CV2_AVAILABLE:
                 self.inpaint_switch.select()
+            else:
+                self.inpaint_switch.deselect()
+
+            if fine_text and CV2_AVAILABLE:
+                self.fine_text_switch.select()
+            else:
+                self.fine_text_switch.deselect()
+
+            if async_overlay:
+                self.async_overlay_switch.select()
+            else:
+                self.async_overlay_switch.deselect()
+
+            if general_filter:
+                self.general_filter_switch.select()
+            else:
+                self.general_filter_switch.deselect()
+
+            if phrase_cache:
+                self.phrase_cache_switch.select()
+            else:
+                self.phrase_cache_switch.deselect()
+
+            # 翻译模式
+            mode_map = {
+                'local': '本地',
+                'hybrid': '混合',
+                'online': '联网',
+            }
+            self.trans_mode_selector.set(
+                mode_map.get(translation_mode, '混合'))
+
             if frame_diff:
                 self.frame_diff_switch.select()
             else:
@@ -260,22 +357,21 @@ class TranslatorApp(ctk.CTk):
             else:
                 self.auto_clean_switch.deselect()
 
-            if freeze_mode == 'pin':
-                self.btn_freeze.configure(
-                    text="🔄 恢复跟随",
-                    fg_color='#ff9900', hover_color='#e68a00',
-                )
-                self.bottom_label.configure(text="📌 已钉住（配置恢复）")
+            self._update_phrase_count()
+            self._update_dict_count()
         except Exception as e:
             log.exception(f"[UI] 恢复配置失败：{e}")
 
     # ================= 滚动 =================
 
     def _is_scroll_active(self):
-        return (self.app_state.running
-                and not self.app_state.freeze_overlay)
+        if self.app_state.follow_mode != 'follow':
+            return False
+        return self.app_state.running
 
     def _on_scroll_detected(self, dy):
+        if self.app_state.follow_mode != 'follow':
+            return
         self.app_state.scroll_boost = True
         try:
             self.after(0, lambda: self._apply_scroll(dy))
@@ -283,7 +379,7 @@ class TranslatorApp(ctk.CTk):
             pass
 
     def _apply_scroll(self, dy):
-        if self.app_state.freeze_overlay:
+        if self.app_state.follow_mode != 'follow':
             return
         try:
             self.overlay.scroll_by(dy)
@@ -297,13 +393,22 @@ class TranslatorApp(ctk.CTk):
             'toggle': self.toggle_running,
             'config': self.open_config,
             'border': self.toggle_border,
-            'freeze': self.toggle_freeze,
+            'freeze': self.toggle_freeze_hotkey,
             'quit':   self.quit_app,
         }[name]
 
     def _register_all_hotkeys(self):
         for name, hk in self.hotkeys.items():
             self.hk_mgr.register(name, hk, self._get_callback(name))
+
+    def toggle_freeze_hotkey(self):
+        mode = self.app_state.follow_mode
+        next_mode = {
+            'default': 'follow',
+            'follow': 'pin',
+            'pin': 'default',
+        }[mode]
+        self.set_follow_mode(next_mode)
 
     # ================= UI 构建 =================
 
@@ -328,6 +433,55 @@ class TranslatorApp(ctk.CTk):
         )
         self.hotkey_hint.pack(side='right', padx=10)
 
+        # 翻译模式
+        trans_frame = ctk.CTkFrame(self)
+        trans_frame.pack(fill='x', padx=10, pady=5)
+
+        ctk.CTkLabel(
+            trans_frame, text="翻译模式：",
+            font=(FONT_NAME, 11, 'bold'),
+        ).pack(side='left', padx=(5, 8))
+
+        self.trans_mode_selector = ctk.CTkSegmentedButton(
+            trans_frame,
+            values=["本地", "混合", "联网"],
+            command=self._on_trans_mode_change,
+            font=(FONT_NAME, 11),
+        )
+        self.trans_mode_selector.set("混合")
+        self.trans_mode_selector.pack(
+            side='left', fill='x', expand=True, padx=5)
+
+        self.trans_mode_desc = ctk.CTkLabel(
+            trans_frame, text="", font=(FONT_NAME, 9),
+            text_color='#666666', width=280, anchor='w',
+        )
+        self.trans_mode_desc.pack(side='left', padx=8)
+
+        # 译文模式
+        follow_frame = ctk.CTkFrame(self)
+        follow_frame.pack(fill='x', padx=10, pady=5)
+
+        ctk.CTkLabel(
+            follow_frame, text="译文模式：",
+            font=(FONT_NAME, 11, 'bold'),
+        ).pack(side='left', padx=(5, 8))
+
+        self.follow_selector = ctk.CTkSegmentedButton(
+            follow_frame,
+            values=["默认", "跟随", "钉住"],
+            command=self._on_follow_mode_change,
+            font=(FONT_NAME, 11),
+        )
+        self.follow_selector.pack(side='left', fill='x', expand=True, padx=5)
+
+        self.follow_desc_label = ctk.CTkLabel(
+            follow_frame, text="", font=(FONT_NAME, 9),
+            text_color='#666666', width=260, anchor='w',
+        )
+        self.follow_desc_label.pack(side='left', padx=8)
+
+        # 按钮行 1
         btn_frame = ctk.CTkFrame(self)
         btn_frame.pack(fill='x', padx=10, pady=5)
 
@@ -353,13 +507,7 @@ class TranslatorApp(ctk.CTk):
         )
         self.btn_border.pack(side='left', padx=3)
 
-        self.btn_freeze = ctk.CTkButton(
-            btn_frame, text="📌 钉住译文", width=100,
-            fg_color='#3a86ff', hover_color='#2a6fd8',
-            command=self.toggle_freeze,
-        )
-        self.btn_freeze.pack(side='left', padx=3)
-
+        # 按钮行 2
         btn_frame2 = ctk.CTkFrame(self)
         btn_frame2.pack(fill='x', padx=10, pady=5)
 
@@ -422,6 +570,7 @@ class TranslatorApp(ctk.CTk):
         self.bottom_label.pack(side='bottom', pady=5)
 
         self._refresh_hotkey_hint()
+        self._sync_trans_mode_ui()
 
     def _build_display_tab(self, parent):
         # 性能模式
@@ -452,9 +601,9 @@ class TranslatorApp(ctk.CTk):
         )
         self._update_mode_desc(DEFAULT_MODE)
 
-        # ============ 加速方式 ============
+        # 加速方式
         ctk.CTkLabel(
-            parent, text="加速方式：",
+            parent, text="加速方式（运行时切换）：",
             font=(FONT_NAME, 11, 'bold'),
         ).grid(row=2, column=0, columnspan=3,
                sticky='w', padx=(15, 5), pady=(8, 4))
@@ -473,35 +622,33 @@ class TranslatorApp(ctk.CTk):
             row=4, column=0, columnspan=3,
             sticky='ew', padx=(15, 15), pady=(0, 6))
 
-        btn1 = ctk.CTkButton(
-            accel_btns, text="多线程 CPU\n(0MB)",
-            width=130, height=50,
+        self.btn_cpu_multi = ctk.CTkButton(
+            accel_btns,
+            text=f"多线程 CPU\n({MULTITHREAD_OCR_POOL_SIZE} 引擎)",
+            width=140, height=50,
             font=(FONT_NAME, 10),
             fg_color='#6c757d', hover_color='#5a6268',
-            command=self.install_cpu_accel,
+            command=lambda: self.switch_accel_mode('cpu_multi'),
         )
-        btn1.pack(side='left', padx=3)
-        self._accel_buttons.append(btn1)
+        self.btn_cpu_multi.pack(side='left', padx=3)
 
-        btn2 = ctk.CTkButton(
-            accel_btns, text="DirectML GPU\n(50MB，支持所有显卡)",
-            width=180, height=50,
+        self.btn_directml = ctk.CTkButton(
+            accel_btns, text="DirectML GPU\n(单引擎)",
+            width=140, height=50,
             font=(FONT_NAME, 10),
             fg_color='#3a86ff', hover_color='#2a6fd8',
-            command=self.install_directml_accel,
+            command=lambda: self.switch_accel_mode('directml'),
         )
-        btn2.pack(side='left', padx=3)
-        self._accel_buttons.append(btn2)
+        self.btn_directml.pack(side='left', padx=3)
 
-        btn3 = ctk.CTkButton(
-            accel_btns, text="NVIDIA CUDA\n(1.6GB，仅 NVIDIA)",
-            width=160, height=50,
+        self.btn_cuda = ctk.CTkButton(
+            accel_btns, text="NVIDIA CUDA\n(单引擎)",
+            width=140, height=50,
             font=(FONT_NAME, 10),
             fg_color='#28a745', hover_color='#1e7e34',
-            command=self.install_cuda_accel,
+            command=lambda: self.switch_accel_mode('cuda'),
         )
-        btn3.pack(side='left', padx=3)
-        self._accel_buttons.append(btn3)
+        self.btn_cuda.pack(side='left', padx=3)
 
         self.accel_status_label = ctk.CTkLabel(
             parent, text="",
@@ -513,11 +660,12 @@ class TranslatorApp(ctk.CTk):
             row=5, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 10))
 
-        # ============ 优化功能 ============
+        # 优化功能
         ctk.CTkLabel(
             parent, text="优化功能：", font=(FONT_NAME, 11, 'bold'),
         ).grid(row=6, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
 
+        # 1. 帧差
         self.frame_diff_switch = ctk.CTkSwitch(
             parent, text="帧差检测（静止时跳过）",
             command=self._on_frame_diff_toggle,
@@ -530,6 +678,7 @@ class TranslatorApp(ctk.CTk):
             row=7, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
+        # 2. 分块 OCR
         self.block_ocr_switch = ctk.CTkSwitch(
             parent, text="分块 OCR（只识别变化的区域）",
             command=self._on_block_ocr_toggle,
@@ -542,6 +691,7 @@ class TranslatorApp(ctk.CTk):
             row=8, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
+        # 3. 文字过滤
         self.filter_switch = ctk.CTkSwitch(
             parent, text="文字过滤（过滤异常框）",
             command=self._on_filter_toggle,
@@ -554,6 +704,103 @@ class TranslatorApp(ctk.CTk):
             row=9, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
+        # 4. 通用过滤
+        self.general_filter_switch = ctk.CTkSwitch(
+            parent, text="通用过滤（艺术字/数字/单位）",
+            command=self._on_general_filter_toggle,
+            onvalue=True, offvalue=False,
+            font=(FONT_NAME, 10),
+        )
+        if DEFAULT_ENABLE_GENERAL_FILTER:
+            self.general_filter_switch.select()
+        self.general_filter_switch.grid(
+            row=10, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 4))
+
+        # 5. 短语缓存
+        self.phrase_cache_switch = ctk.CTkSwitch(
+            parent, text="短语缓存（常见短语立即显示）",
+            command=self._on_phrase_cache_toggle,
+            onvalue=True, offvalue=False,
+            font=(FONT_NAME, 10),
+        )
+        if DEFAULT_ENABLE_PHRASE_CACHE:
+            self.phrase_cache_switch.select()
+        self.phrase_cache_switch.grid(
+            row=11, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 4))
+
+        # 短语表按钮
+        phrase_btns = ctk.CTkFrame(parent, fg_color='transparent')
+        phrase_btns.grid(
+            row=12, column=0, columnspan=3,
+            sticky='ew', padx=(45, 15), pady=(0, 8))
+
+        ctk.CTkButton(
+            phrase_btns, text="选择短语表", width=110, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#3a86ff', hover_color='#2a6fd8',
+            command=self.select_phrase_file,
+        ).pack(side='left', padx=3)
+
+        ctk.CTkButton(
+            phrase_btns, text="重载", width=70, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#6f42c1', hover_color='#5a35a0',
+            command=self.reload_phrase_file,
+        ).pack(side='left', padx=3)
+
+        ctk.CTkButton(
+            phrase_btns, text="清除路径", width=80, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#6c757d', hover_color='#5a6268',
+            command=self.clear_phrase_file,
+        ).pack(side='left', padx=3)
+
+        self.phrase_count_label = ctk.CTkLabel(
+            phrase_btns, text="", font=(FONT_NAME, 9),
+            text_color='#666666',
+        )
+        self.phrase_count_label.pack(side='left', padx=8)
+
+        # 本地词典
+        ctk.CTkLabel(
+            parent, text="本地词典：", font=(FONT_NAME, 11, 'bold'),
+        ).grid(row=13, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
+
+        dict_btns = ctk.CTkFrame(parent, fg_color='transparent')
+        dict_btns.grid(
+            row=14, column=0, columnspan=3,
+            sticky='ew', padx=(25, 15), pady=(0, 8))
+
+        ctk.CTkButton(
+            dict_btns, text="选择词典", width=100, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#3a86ff', hover_color='#2a6fd8',
+            command=self.select_dict_file,
+        ).pack(side='left', padx=3)
+
+        ctk.CTkButton(
+            dict_btns, text="重载", width=70, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#6f42c1', hover_color='#5a35a0',
+            command=self.reload_dict_file,
+        ).pack(side='left', padx=3)
+
+        ctk.CTkButton(
+            dict_btns, text="清除路径", width=80, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#6c757d', hover_color='#5a6268',
+            command=self.clear_dict_file,
+        ).pack(side='left', padx=3)
+
+        self.dict_count_label = ctk.CTkLabel(
+            dict_btns, text="", font=(FONT_NAME, 9),
+            text_color='#666666',
+        )
+        self.dict_count_label.pack(side='left', padx=8)
+
+        # 6. 异步翻译
         self.async_translate_switch = ctk.CTkSwitch(
             parent, text="异步翻译（不阻塞 OCR）",
             command=self._on_async_translate_toggle,
@@ -563,9 +810,10 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_ASYNC_TRANSLATE:
             self.async_translate_switch.select()
         self.async_translate_switch.grid(
-            row=10, column=0, columnspan=3,
+            row=15, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
+        # 7. 窗口池
         self.window_pool_switch = ctk.CTkSwitch(
             parent, text="窗口池（复用译文窗口）",
             command=self._on_window_pool_toggle,
@@ -575,20 +823,20 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_WINDOW_POOL:
             self.window_pool_switch.select()
         self.window_pool_switch.grid(
-            row=11, column=0, columnspan=3,
+            row=16, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 10))
 
         # 刷新间隔
         ctk.CTkLabel(
             parent, text="刷新间隔 (秒)：", font=(FONT_NAME, 11),
-        ).grid(row=12, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=17, column=0, sticky='w', padx=(15, 5), pady=8)
 
         self.scan_value_label = ctk.CTkLabel(
             parent,
             text=f"{PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval']:.2f} s",
             width=60, font=(FONT_NAME, 11),
         )
-        self.scan_value_label.grid(row=12, column=2, sticky='e', padx=(5, 15))
+        self.scan_value_label.grid(row=17, column=2, sticky='e', padx=(5, 15))
 
         n_steps = int((SCAN_MAX - SCAN_MIN) / 0.05)
         self.scan_slider = ctk.CTkSlider(
@@ -597,17 +845,17 @@ class TranslatorApp(ctk.CTk):
             command=self._on_scan_change,
         )
         self.scan_slider.set(PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval'])
-        self.scan_slider.grid(row=12, column=1, sticky='ew', padx=10)
+        self.scan_slider.grid(row=17, column=1, sticky='ew', padx=10)
 
         ctk.CTkLabel(
             parent, text="文字大小：", font=(FONT_NAME, 11),
-        ).grid(row=13, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=18, column=0, sticky='w', padx=(15, 5), pady=8)
 
         self.font_value_label = ctk.CTkLabel(
             parent, text=str(INITIAL_FONT_SIZE), width=60,
             font=(FONT_NAME, 11),
         )
-        self.font_value_label.grid(row=13, column=2, sticky='e', padx=(5, 15))
+        self.font_value_label.grid(row=18, column=2, sticky='e', padx=(5, 15))
 
         self.font_slider = ctk.CTkSlider(
             parent, from_=FONT_MIN, to=FONT_MAX,
@@ -615,11 +863,12 @@ class TranslatorApp(ctk.CTk):
             command=self._on_font_change,
         )
         self.font_slider.set(INITIAL_FONT_SIZE)
-        self.font_slider.grid(row=13, column=1, sticky='ew', padx=10)
+        self.font_slider.grid(row=18, column=1, sticky='ew', padx=10)
 
+        # 图像修复
         ctk.CTkLabel(
-            parent, text="图像修复（类原生文字）：", font=(FONT_NAME, 11),
-        ).grid(row=14, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+            parent, text="图像修复（整框）：", font=(FONT_NAME, 11),
+        ).grid(row=19, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
 
         self.inpaint_switch = ctk.CTkSwitch(
             parent, text="",
@@ -628,14 +877,48 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_USE_INPAINTING and CV2_AVAILABLE:
             self.inpaint_switch.select()
-        self.inpaint_switch.grid(row=14, column=1, sticky='w', padx=10)
+        self.inpaint_switch.grid(row=19, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.inpaint_switch.configure(state='disabled')
 
+        # 精细文字替换
+        ctk.CTkLabel(
+            parent, text="精细文字替换（保留背景）：",
+            font=(FONT_NAME, 11),
+        ).grid(row=20, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
+
+        self.fine_text_switch = ctk.CTkSwitch(
+            parent, text="",
+            command=self._on_fine_text_toggle,
+            onvalue=True, offvalue=False,
+        )
+        if DEFAULT_ENABLE_FINE_TEXT and CV2_AVAILABLE:
+            self.fine_text_switch.select()
+        self.fine_text_switch.grid(row=20, column=1, sticky='w', padx=10)
+
+        if not CV2_AVAILABLE:
+            self.fine_text_switch.configure(state='disabled')
+
+        # 异步覆盖
+        ctk.CTkLabel(
+            parent, text="异步覆盖（逐字显示）：",
+            font=(FONT_NAME, 11),
+        ).grid(row=21, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
+
+        self.async_overlay_switch = ctk.CTkSwitch(
+            parent, text="",
+            command=self._on_async_overlay_toggle,
+            onvalue=True, offvalue=False,
+        )
+        if DEFAULT_ENABLE_ASYNC_OVERLAY:
+            self.async_overlay_switch.select()
+        self.async_overlay_switch.grid(row=21, column=1, sticky='w', padx=10)
+
+        # 自动清理
         ctk.CTkLabel(
             parent, text="自动清理缓存：", font=(FONT_NAME, 11),
-        ).grid(row=15, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+        ).grid(row=22, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
 
         self.auto_clean_switch = ctk.CTkSwitch(
             parent, text="",
@@ -643,17 +926,18 @@ class TranslatorApp(ctk.CTk):
             onvalue=True, offvalue=False,
         )
         self.auto_clean_switch.select()
-        self.auto_clean_switch.grid(row=15, column=1, sticky='w', padx=10)
+        self.auto_clean_switch.grid(row=22, column=1, sticky='w', padx=10)
 
+        # 缓存上限
         ctk.CTkLabel(
             parent, text="缓存上限：", font=(FONT_NAME, 11),
-        ).grid(row=16, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=23, column=0, sticky='w', padx=(15, 5), pady=8)
 
         self.cache_limit_label = ctk.CTkLabel(
             parent, text=str(CACHE_DEFAULT), width=60,
             font=(FONT_NAME, 11),
         )
-        self.cache_limit_label.grid(row=16, column=2, sticky='e', padx=(5, 15))
+        self.cache_limit_label.grid(row=23, column=2, sticky='e', padx=(5, 15))
 
         self.cache_limit_slider = ctk.CTkSlider(
             parent, from_=CACHE_MIN, to=CACHE_MAX,
@@ -661,10 +945,10 @@ class TranslatorApp(ctk.CTk):
             command=self._on_cache_limit_change,
         )
         self.cache_limit_slider.set(CACHE_DEFAULT)
-        self.cache_limit_slider.grid(row=16, column=1, sticky='ew', padx=10)
+        self.cache_limit_slider.grid(row=23, column=1, sticky='ew', padx=10)
 
         cache_row = ctk.CTkFrame(parent, fg_color='transparent')
-        cache_row.grid(row=17, column=0, columnspan=3,
+        cache_row.grid(row=24, column=0, columnspan=3,
                        sticky='ew', padx=(15, 15), pady=(5, 15))
 
         self.cache_size_label = ctk.CTkLabel(
@@ -679,6 +963,9 @@ class TranslatorApp(ctk.CTk):
         ).pack(side='right')
 
         parent.grid_columnconfigure(1, weight=1)
+
+        self._update_phrase_count()
+        self._update_dict_count()
 
     def _build_hotkey_tab(self, parent):
         self.hotkey_entries = {}
@@ -705,6 +992,109 @@ class TranslatorApp(ctk.CTk):
 
         parent.grid_columnconfigure(1, weight=1)
 
+    # ================= 翻译模式 =================
+
+    def _on_trans_mode_change(self, mode_name):
+        mode_map = {
+            '本地': 'local',
+            '混合': 'hybrid',
+            '联网': 'online',
+        }
+        mode = mode_map.get(mode_name, 'hybrid')
+        self.app_state.translation_mode = mode
+        self._sync_trans_mode_ui()
+
+        self.user_cfg.set('translation_mode', mode)
+        self.user_cfg.save()
+
+        log.info(f"[翻译模式] 切换为 {mode}")
+        self.bottom_label.configure(text=f"翻译模式：{mode_name}")
+
+    def _sync_trans_mode_ui(self):
+        mode = self.app_state.translation_mode
+
+        name_map = {
+            'local': '本地',
+            'hybrid': '混合',
+            'online': '联网',
+        }
+        try:
+            self.trans_mode_selector.set(name_map.get(mode, '混合'))
+        except Exception:
+            pass
+
+        desc_map = {
+            'local': '只用本地词典+短语缓存，无网络',
+            'hybrid': '本地优先，未命中走 API',
+            'online': '短语缓存优先，其余走 API',
+        }
+        try:
+            self.trans_mode_desc.configure(
+                text=desc_map.get(mode, ''))
+        except Exception:
+            pass
+
+    # ================= 译文模式 =================
+
+    def _on_follow_mode_change(self, mode_name):
+        mode_map = {
+            '默认': 'default',
+            '跟随': 'follow',
+            '钉住': 'pin',
+        }
+        mode = mode_map.get(mode_name, 'follow')
+        self.set_follow_mode(mode)
+
+    def set_follow_mode(self, mode):
+        if mode not in ('default', 'follow', 'pin'):
+            return
+
+        self.app_state.follow_mode = mode
+        self.app_state.freeze_overlay = (mode == 'pin')
+
+        self.scroll_detector.reset()
+        self.app_state.scroll_boost = False
+
+        if mode != 'pin':
+            try:
+                while True:
+                    self.pipeline.result_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.overlay.clear()
+            self.app_state.reset_signature()
+
+        self._sync_follow_mode_ui()
+
+        self.user_cfg.set('follow_mode', mode)
+        self.user_cfg.save()
+
+        log.info(f"[译文模式] 切换为 {mode}")
+
+    def _sync_follow_mode_ui(self):
+        mode = self.app_state.follow_mode
+
+        name_map = {
+            'default': '默认',
+            'follow': '跟随',
+            'pin': '钉住',
+        }
+        try:
+            self.follow_selector.set(name_map.get(mode, '跟随'))
+        except Exception:
+            pass
+
+        desc_map = {
+            'default': '滚动时重新识别（不平移）',
+            'follow': '滚动时译文实时跟随',
+            'pin': '译文固定，滚页不动',
+        }
+        try:
+            self.follow_desc_label.configure(
+                text=desc_map.get(mode, ''))
+        except Exception:
+            pass
+
     # ================= 日志/配置/关于 =================
 
     def open_logs(self):
@@ -728,190 +1118,346 @@ class TranslatorApp(ctk.CTk):
         except Exception as e:
             log.exception(f"[关于] 打开失败：{e}")
 
-    # ================= 加速方式 =================
+    # ================= 短语表 =================
 
-    def _sync_accel_ui(self):
-        """刷新加速方式状态"""
+    def select_phrase_file(self):
+        from tkinter import filedialog
+
         try:
-            variant = check_onnxruntime_variant() or '未安装'
-            variant_map = {
-                'cpu': 'CPU 多线程',
-                'gpu': 'NVIDIA CUDA',
-                'directml': 'DirectML GPU',
-                '未安装': '未安装',
-            }
-            self.ort_variant_label.configure(
-                text=f"当前引擎：{variant_map.get(variant, variant)}")
+            current = self.pipeline.phrase_cache.get_external_path()
+            init_dir = os.path.dirname(current) if current else ''
 
-            # 👇 打包环境：禁用三个加速按钮
-            if is_frozen():
-                self._set_accel_buttons_state('disabled')
-                self.accel_status_label.configure(
-                    text="ℹ️ 打包版本无法自动安装加速环境，请下载对应版本 exe "
-                         "（LST-CPU / LST-DirectML / LST-CUDA）",
-                    text_color='#cc6600')
+            path = filedialog.askopenfilename(
+                title="选择短语表文件",
+                initialdir=init_dir or None,
+                filetypes=[
+                    ("文本文件", "*.txt"),
+                    ("CSV 文件", "*.csv"),
+                    ("JSON 文件", "*.json"),
+                    ("所有文件", "*.*"),
+                ],
+            )
+            if not path:
                 return
 
-            # 源码环境：按钮可用
-            self._set_accel_buttons_state('normal')
+            self.pipeline.phrase_cache.set_external_path(path)
+            count = self.pipeline.phrase_cache.load_external()
 
-            if variant == 'gpu':
+            self.user_cfg.set('phrase_table_path', path)
+            self.user_cfg.save()
+
+            self._update_phrase_count()
+            self.bottom_label.configure(
+                text=f"✅ 已选择短语表：{os.path.basename(path)}"
+                     f"（加载 {count} 条）")
+            log.info(f"[短语表] 用户选择：{path}")
+
+        except Exception as e:
+            log.exception(f"[短语表] 选择失败：{e}")
+            self.bottom_label.configure(text="选择短语表失败")
+
+    def reload_phrase_file(self):
+        try:
+            path = self.pipeline.phrase_cache.get_external_path()
+            if not path:
+                self.bottom_label.configure(
+                    text="⚠️ 未指定短语表文件")
+                return
+
+            count = self.pipeline.phrase_cache.reload_external()
+            self._update_phrase_count()
+            self.bottom_label.configure(
+                text=f"✅ 已重载：{os.path.basename(path)}"
+                     f"（共 {count} 条）")
+            log.info(f"[短语表] 重载：{path}")
+        except Exception as e:
+            log.exception(f"[短语表] 重载失败：{e}")
+            self.bottom_label.configure(text="重载失败")
+
+    def clear_phrase_file(self):
+        try:
+            self.pipeline.phrase_cache.set_external_path('')
+            self.user_cfg.set('phrase_table_path', '')
+            self.user_cfg.save()
+            self._update_phrase_count()
+            self.bottom_label.configure(text="已清除外部短语表路径")
+            log.info("[短语表] 已清除路径")
+        except Exception as e:
+            log.exception(f"[短语表] 清除失败：{e}")
+
+    def _update_phrase_count(self):
+        try:
+            stats = self.pipeline.phrase_cache.stats()
+            path = self.pipeline.phrase_cache.get_external_path()
+
+            if path:
+                fname = os.path.basename(path)
+                text = (f"共 {stats['total']} 条"
+                        f"（内置 {stats['builtin']} + 其他 {stats['user']}）"
+                        f" | 表：{fname}")
+            else:
+                text = (f"共 {stats['total']} 条"
+                        f"（内置 {stats['builtin']} + 自定义 {stats['user']}）")
+
+            self.phrase_count_label.configure(text=text)
+        except Exception:
+            pass
+
+    # ================= 本地词典 =================
+
+    def select_dict_file(self):
+        """让用户选择词典文件 或 文件夹"""
+        from tkinter import messagebox, filedialog
+
+        try:
+            # 询问用户要选文件还是文件夹
+            choice = messagebox.askyesnocancel(
+                "选择方式",
+                "点【是】选择文件夹（自动扫描所有词典文件）\n"
+                "点【否】选择单个文件\n"
+                "点【取消】放弃",
+            )
+
+            if choice is None:
+                return
+
+            if choice:
+                # 选文件夹
+                current = self.pipeline.local_dict.get_path()
+                init_dir = current if os.path.isdir(current) else ''
+
+                path = filedialog.askdirectory(
+                    title="选择词典文件夹（自动扫描）",
+                    initialdir=init_dir or None,
+                )
+            else:
+                # 选文件
+                current = self.pipeline.local_dict.get_path()
+                init_dir = os.path.dirname(current) if current else ''
+
+                path = filedialog.askopenfilename(
+                    title="选择词典文件",
+                    initialdir=init_dir or None,
+                    filetypes=[
+                        ("词典文件", "*.txt *.csv *.json *.tsv"),
+                        ("文本文件", "*.txt"),
+                        ("CSV 文件", "*.csv"),
+                        ("JSON 文件", "*.json"),
+                        ("所有文件", "*.*"),
+                    ],
+                )
+
+            if not path:
+                return
+
+            # 加载
+            self.pipeline.local_dict.set_path(path)
+            count = self.pipeline.local_dict.load(path)
+
+            self.user_cfg.set('local_dict_path', path)
+            self.user_cfg.save()
+
+            self._update_dict_count()
+
+            name = os.path.basename(path)
+            if os.path.isdir(path):
+                self.bottom_label.configure(
+                    text=f"✅ 已加载词典文件夹：{name}"
+                         f"（{count} 条词条）")
+            else:
+                self.bottom_label.configure(
+                    text=f"✅ 已加载词典文件：{name}"
+                         f"（{count} 条词条）")
+
+            log.info(f"[本地词典] 用户选择：{path}")
+
+        except Exception as e:
+            log.exception(f"[本地词典] 选择失败：{e}")
+            self.bottom_label.configure(text="选择本地词典失败")
+
+    def reload_dict_file(self):
+        try:
+            path = self.pipeline.local_dict.get_path()
+            if not path:
+                self.bottom_label.configure(
+                    text="⚠️ 未指定本地词典")
+                return
+
+            count = self.pipeline.local_dict.reload()
+            self._update_dict_count()
+
+            name = os.path.basename(path)
+            self.bottom_label.configure(
+                text=f"✅ 已重载：{name}（共 {count} 条）")
+            log.info(f"[本地词典] 重载：{path}")
+        except Exception as e:
+            log.exception(f"[本地词典] 重载失败：{e}")
+            self.bottom_label.configure(text="重载失败")
+
+    def clear_dict_file(self):
+        try:
+            self.pipeline.local_dict.set_path('')
+            self.pipeline.local_dict.clear()
+            self.user_cfg.set('local_dict_path', '')
+            self.user_cfg.save()
+            self._update_dict_count()
+            self.bottom_label.configure(text="已清除本地词典")
+            log.info("[本地词典] 已清除")
+        except Exception as e:
+            log.exception(f"[本地词典] 清除失败：{e}")
+
+    def _update_dict_count(self):
+        """更新本地词典计数显示"""
+        try:
+            n = self.pipeline.local_dict.size()
+            path = self.pipeline.local_dict.get_path()
+            stats = self.pipeline.local_dict.stats()
+
+            if path:
+                name = os.path.basename(path)
+                is_folder = stats.get('is_folder', False)
+                total_files = stats.get('total_files', 1)
+                enc = stats.get('encodings', '?')
+                skipped = stats.get('skipped', 0)
+
+                if is_folder:
+                    text = (f"共 {n} 条 | 文件夹 {name}"
+                            f"（{total_files} 个文件）"
+                            f" | {enc} | 跳过 {skipped} 行")
+                else:
+                    text = (f"共 {n} 条 | {name}"
+                            f" | {enc} | 跳过 {skipped} 行")
+            else:
+                text = "未指定词典文件/文件夹"
+
+            self.dict_count_label.configure(text=text)
+        except Exception:
+            pass
+
+    # ================= 加速方式 =================
+
+    def switch_accel_mode(self, mode):
+        current_variant = check_onnxruntime_variant() or 'cpu'
+
+        if mode == 'directml' and current_variant != 'directml':
+            self._show_need_install('DirectML', 'onnxruntime-directml', '50MB')
+            return
+        if mode == 'cuda' and current_variant != 'gpu':
+            self._show_need_install('NVIDIA CUDA', 'onnxruntime-gpu', '1.6GB')
+            return
+        if self.ocr_engine.mode == mode:
+            self.bottom_label.configure(text="已经是该模式")
+            return
+
+        old_running = self.app_state.running
+        self.app_state.running = False
+
+        self.accel_status_label.configure(
+            text=f"⏳ 正在切换到 {mode}...", text_color='#666666')
+        self.bottom_label.configure(text=f"切换到 {mode}...")
+        self.update_idletasks()
+        log.info(f"[加速] 切换：{self.ocr_engine.mode} → {mode}")
+
+        try:
+            actual = self.ocr_engine.init(
+                mode=mode, pool_size=MULTITHREAD_OCR_POOL_SIZE)
+            log.info(f"[加速] 切换完成：{actual}")
+
+            self.cache.clear()
+            if hasattr(self.pipeline, 'inpaint_cache'):
+                self.pipeline.inpaint_cache.clear()
+            if hasattr(self.pipeline, 'fine_cache'):
+                self.pipeline.fine_cache.clear()
+            if hasattr(self.pipeline, 'color_cache'):
+                self.pipeline.color_cache.clear()
+            self.app_state.reset_signature()
+            self.overlay.clear()
+
+            self.user_cfg.set('accel_mode', actual)
+            self.user_cfg.save()
+
+            self._sync_accel_ui()
+            self.bottom_label.configure(text=f"✅ 已切换到 {actual}")
+        except Exception as e:
+            log.exception(f"[加速] 切换失败")
+            self.bottom_label.configure(text=f"切换失败：{e}")
+        finally:
+            self.app_state.running = old_running
+
+    def _show_need_install(self, name, pkg, size):
+        from tkinter import messagebox
+        messagebox.showinfo(
+            f"需要安装 {name}",
+            f"当前 onnxruntime 版本不支持 {name}。\n\n"
+            f"需要先安装：{pkg}（约 {size}）\n\n"
+            f"请使用源码运行（python main.py）后安装，\n"
+            f"或下载对应版本的 exe。"
+        )
+
+    def _sync_accel_ui(self):
+        try:
+            current_variant = check_onnxruntime_variant() or 'cpu'
+            current_mode = self.ocr_engine.mode
+
+            mode_map = {
+                'cpu_multi': '多线程 CPU',
+                'directml': 'DirectML GPU',
+                'cuda': 'NVIDIA CUDA',
+            }
+            self.ort_variant_label.configure(
+                text=f"当前引擎：{mode_map.get(current_mode, current_mode)}")
+
+            self._highlight_buttons(current_mode, current_variant)
+
+            if current_mode == 'cuda':
                 ok, msg = check_cuda_ready()
-            elif variant == 'directml':
+                if ok:
+                    self.accel_status_label.configure(
+                        text="✅ CUDA 加速运行中", text_color='#00a000')
+                else:
+                    self.accel_status_label.configure(
+                        text=f"⚠️ {msg}", text_color='#cc6600')
+            elif current_mode == 'directml':
                 ok, msg = check_directml_ready()
+                if ok:
+                    self.accel_status_label.configure(
+                        text="✅ DirectML 加速运行中（支持所有显卡）",
+                        text_color='#00a000')
+                else:
+                    self.accel_status_label.configure(
+                        text=f"⚠️ {msg}", text_color='#cc6600')
             else:
-                ok, msg = True, "CPU 多线程模式"
-
-            if ok:
+                n = len(self.ocr_engine.engines)
                 self.accel_status_label.configure(
-                    text=f"✅ {msg}（如需切换请点上方按钮）",
+                    text=f"✅ CPU 多线程运行中（{n} 引擎）",
                     text_color='#00a000')
-            else:
-                self.accel_status_label.configure(
-                    text=f"⚠️ {msg}", text_color='#cc6600')
         except Exception as e:
             log.exception("[加速] 状态刷新失败")
             self.accel_status_label.configure(
                 text=f"状态获取失败：{e}", text_color='#cc0000')
 
-    def _set_accel_buttons_state(self, state):
-        """统一设置三个加速按钮状态"""
+    def _highlight_buttons(self, current_mode, variant):
         try:
-            for btn in self._accel_buttons:
-                btn.configure(state=state)
+            self.btn_cpu_multi.configure(
+                fg_color='#28a745' if current_mode == 'cpu_multi' else '#6c757d',
+                state='normal',
+            )
+            if variant == 'directml':
+                self.btn_directml.configure(
+                    fg_color='#28a745' if current_mode == 'directml' else '#3a86ff',
+                    state='normal')
+            else:
+                self.btn_directml.configure(
+                    fg_color='#adb5bd', state='disabled')
+            if variant == 'gpu':
+                self.btn_cuda.configure(
+                    fg_color='#28a745' if current_mode == 'cuda' else '#28a745',
+                    state='normal')
+            else:
+                self.btn_cuda.configure(
+                    fg_color='#adb5bd', state='disabled')
         except Exception:
             pass
-
-    def install_cpu_accel(self):
-        if is_frozen():
-            self._show_frozen_warning()
-            return
-        from tkinter import messagebox
-        if not messagebox.askyesno(
-            "切换到 CPU 多线程",
-            "将卸载 GPU 加速包，改用 CPU 多线程。\n"
-            "耗时几秒钟，是否继续？"
-        ):
-            return
-        self._run_install('CPU 多线程', install_cpu_onnxruntime)
-
-    def install_directml_accel(self):
-        if is_frozen():
-            self._show_frozen_warning()
-            return
-        from tkinter import messagebox
-        if not messagebox.askyesno(
-            "安装 DirectML 加速",
-            "将下载 onnxruntime-directml（约 50MB）\n\n"
-            "• 支持 NVIDIA / AMD / Intel 显卡\n"
-            "• 不需要 CUDA 库\n"
-            "• 性能约为 CUDA 的 70~80%\n\n"
-            "是否继续？"
-        ):
-            return
-        self._run_install('DirectML', install_directml)
-
-    def install_cuda_accel(self):
-        if is_frozen():
-            self._show_frozen_warning()
-            return
-        from tkinter import messagebox
-        if not messagebox.askyesno(
-            "安装 NVIDIA CUDA",
-            "将下载 NVIDIA CUDA 库（约 1.6GB）\n\n"
-            "• 仅支持 NVIDIA 显卡\n"
-            "• 需要已安装 NVIDIA 驱动\n"
-            "• 速度最快\n\n"
-            "下载耗时可能较长，是否继续？"
-        ):
-            return
-        self._run_install('NVIDIA CUDA', install_cuda)
-
-    def _show_frozen_warning(self):
-        """打包环境警告"""
-        from tkinter import messagebox
-        messagebox.showinfo(
-            "打包版本限制",
-            "当前是打包版本（exe），无法自动安装加速环境。\n\n"
-            "如需 GPU 加速，请下载对应版本：\n"
-            "  • LST-CPU.exe      （多线程 CPU）\n"
-            "  • LST-DirectML.exe （支持所有显卡）\n"
-            "  • LST-CUDA.exe     （仅 NVIDIA）\n\n"
-            "或使用源码运行（python main.py）后点此按钮。"
-        )
-
-    def _run_install(self, name, install_fn):
-        if self._accel_installing:
-            self.bottom_label.configure(text="正在安装中...")
-            return
-
-        self._accel_installing = True
-        self.accel_status_label.configure(
-            text=f"⏳ 开始安装 {name}...", text_color='#666666')
-        self.bottom_label.configure(text=f"正在安装 {name}...")
-        log.info(f"[加速] 开始安装 {name}")
-
-        def progress(msg):
-            try:
-                self.after(0, lambda: self.accel_status_label.configure(
-                    text=f"⏳ {msg}", text_color='#666666'))
-            except Exception:
-                pass
-
-        def done(success, msg):
-            def _finish():
-                self._accel_installing = False
-                if success:
-                    self.accel_status_label.configure(
-                        text=f"✅ {msg}", text_color='#00a000')
-                    from tkinter import messagebox
-                    messagebox.showinfo("完成", msg)
-                else:
-                    self.accel_status_label.configure(
-                        text=f"❌ {msg[:80]}", text_color='#cc0000')
-                    from tkinter import messagebox
-                    messagebox.showerror("失败", msg)
-                self._sync_accel_ui()
-            self.after(0, _finish)
-
-        install_fn(progress_cb=progress, done_cb=done)
-
-    # ================= 跟随 / 钉住 =================
-
-    def toggle_freeze(self):
-        if self._freeze_mode == 'follow':
-            self._freeze_mode = 'pin'
-            self.app_state.freeze_overlay = True
-            self.app_state.scroll_boost = False
-            self.scroll_detector.reset()
-            self.btn_freeze.configure(
-                text="🔄 恢复跟随",
-                fg_color='#ff9900', hover_color='#e68a00',
-            )
-            self.bottom_label.configure(text="📌 已钉住：译文固定")
-            log.info("[模式] 切换到钉住")
-        else:
-            self._freeze_mode = 'follow'
-            self.app_state.freeze_overlay = False
-
-            try:
-                while True:
-                    self.pipeline.result_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self.overlay.clear()
-            self.app_state.reset_signature()
-            self.scroll_detector.reset()
-
-            self.btn_freeze.configure(
-                text="📌 钉住译文",
-                fg_color='#3a86ff', hover_color='#2a6fd8',
-            )
-            self.bottom_label.configure(text="🔄 已恢复跟随")
-            log.info("[模式] 切换到跟随")
-
-        self.user_cfg.set('freeze_mode', self._freeze_mode)
-        self.user_cfg.save()
 
     # ================= 性能模式 =================
 
@@ -931,19 +1477,24 @@ class TranslatorApp(ctk.CTk):
         self.scan_value_label.configure(text=f"{cfg['scan_interval']:.2f} s")
         self._update_mode_desc(mode_key)
         self.app_state.reset_signature()
-        self.bottom_label.configure(text=f"性能模式：{cfg['name']}")
-        log.info(f"[模式] 切换为 {cfg['name']}")
+
+        fast_tag = "（分段翻译）" if cfg.get('fast_mode') else "（批量翻译）"
+        self.bottom_label.configure(text=f"性能模式：{cfg['name']}{fast_tag}")
+        log.info(f"[模式] 切换为 {cfg['name']} {fast_tag}")
+
         self.user_cfg.set('performance_mode', mode_key)
         self.user_cfg.set('scan_interval', cfg['scan_interval'])
         self.user_cfg.save()
 
     def _update_mode_desc(self, mode_key):
         cfg = PERFORMANCE_MODES[mode_key]
+        mode_tag = "分段翻译" if cfg.get('fast_mode') else "批量翻译"
         desc = (
             f"扫描 {cfg['scan_interval']:.2f}s | "
             f"灵敏度 {cfg['change_ratio_threshold']:.2f} | "
             f"外扩 {cfg['bbox_padding']}px | "
-            f"OCR {cfg['max_ocr_width']}×{cfg['max_ocr_height']}"
+            f"OCR {cfg['max_ocr_width']}×{cfg['max_ocr_height']} | "
+            f"{mode_tag}"
         )
         self.mode_desc_label.configure(text=desc)
 
@@ -979,6 +1530,26 @@ class TranslatorApp(ctk.CTk):
         self.user_cfg.set('enable_filter', enabled)
         self.user_cfg.save()
 
+    def _on_general_filter_toggle(self):
+        enabled = bool(self.general_filter_switch.get())
+        self.app_state.enable_general_filter = enabled
+        self.app_state.reset_signature()
+        msg = "通用过滤：已开启" if enabled else "通用过滤：已关闭"
+        self.bottom_label.configure(text=msg)
+        log.info(f"[开关] {msg}")
+        self.user_cfg.set('enable_general_filter', enabled)
+        self.user_cfg.save()
+
+    def _on_phrase_cache_toggle(self):
+        enabled = bool(self.phrase_cache_switch.get())
+        self.app_state.enable_phrase_cache = enabled
+        self.app_state.reset_signature()
+        msg = "短语缓存：已开启" if enabled else "短语缓存：已关闭"
+        self.bottom_label.configure(text=msg)
+        log.info(f"[开关] {msg}")
+        self.user_cfg.set('enable_phrase_cache', enabled)
+        self.user_cfg.save()
+
     def _on_async_translate_toggle(self):
         enabled = bool(self.async_translate_switch.get())
         self.app_state.enable_async_translate = enabled
@@ -996,6 +1567,28 @@ class TranslatorApp(ctk.CTk):
         self.bottom_label.configure(text=msg)
         log.info(f"[开关] {msg}")
         self.user_cfg.set('enable_window_pool', enabled)
+        self.user_cfg.save()
+
+    def _on_fine_text_toggle(self):
+        enabled = bool(self.fine_text_switch.get())
+        self.app_state.enable_fine_text = enabled
+        self.overlay.clear()
+        self.app_state.reset_signature()
+        msg = ("精细文字替换：已启用" if enabled
+               else "精细文字替换：已关闭")
+        self.bottom_label.configure(text=msg)
+        log.info(f"[设置] {msg}")
+        self.user_cfg.set('enable_fine_text', enabled)
+        self.user_cfg.save()
+
+    def _on_async_overlay_toggle(self):
+        enabled = bool(self.async_overlay_switch.get())
+        self.overlay.set_async_enabled(enabled)
+        msg = ("异步覆盖：已启用（逐字显示）" if enabled
+               else "异步覆盖：已关闭")
+        self.bottom_label.configure(text=msg)
+        log.info(f"[设置] {msg}")
+        self.user_cfg.set('enable_async_overlay', enabled)
         self.user_cfg.save()
 
     # ================= 其他设置 =================
@@ -1021,7 +1614,7 @@ class TranslatorApp(ctk.CTk):
         self.app_state.use_inpainting = enabled
         self.overlay.clear()
         self.app_state.reset_signature()
-        msg = "图像修复：已启用" if enabled else "图像修复：已关闭"
+        msg = "图像修复（整框）：已启用" if enabled else "图像修复（整框）：已关闭"
         self.bottom_label.configure(text=msg)
         log.info(f"[设置] {msg}")
         self.user_cfg.set('use_inpainting', enabled)
@@ -1048,6 +1641,10 @@ class TranslatorApp(ctk.CTk):
         self.cache.clear()
         if hasattr(self.pipeline, 'inpaint_cache'):
             self.pipeline.inpaint_cache.clear()
+        if hasattr(self.pipeline, 'fine_cache'):
+            self.pipeline.fine_cache.clear()
+        if hasattr(self.pipeline, 'color_cache'):
+            self.pipeline.color_cache.clear()
         self._update_cache_label()
         self.bottom_label.configure(text="缓存已清空")
         log.info("[缓存] 手动清空")
@@ -1059,8 +1656,6 @@ class TranslatorApp(ctk.CTk):
             self.cache_size_label.configure(text=f"缓存条目：{n} / {cap}")
         except Exception:
             pass
-
-    # ================= API =================
 
     def open_api_config(self):
         from api_setup_dialog import APISetupDialog
@@ -1129,7 +1724,7 @@ class TranslatorApp(ctk.CTk):
         hk = self.hotkeys
         self.hotkey_hint.configure(
             text=f"{hk['toggle']} 开始/暂停 | "
-                 f"{hk['freeze']} 钉住 | "
+                 f"{hk['freeze']} 切换模式 | "
                  f"{hk['quit']} 退出")
 
     # ================= 交互 =================
@@ -1188,7 +1783,15 @@ class TranslatorApp(ctk.CTk):
 
     def _tick(self):
         try:
-            if not self.app_state.freeze_overlay:
+            mode = self.app_state.follow_mode
+            is_pin = (mode == 'pin')
+            is_follow = (mode == 'follow')
+            is_fast = self.app_state.fast_mode
+
+            if not is_follow:
+                self.app_state.scroll_boost = False
+
+            if not is_pin:
                 try:
                     while True:
                         msg = self.pipeline.result_queue.get_nowait()
@@ -1205,11 +1808,16 @@ class TranslatorApp(ctk.CTk):
                     pass
 
                 try:
+                    self.overlay.tick_animation()
+                except Exception as e:
+                    log.exception(f"[UI] 动画推进失败：{e}")
+
+                try:
                     region = self.app_state.snapshot_region()
                     pruned = self.overlay.prune_out_of_bounds(
                         region, padding=BOUNDARY_PADDING)
                     if pruned:
-                        log.info(f"[跟随] 移除 {pruned} 个超出边界的译文")
+                        log.info(f"[{mode}] 移除 {pruned} 个超出边界的译文")
                 except Exception as e:
                     log.exception(f"[UI] 边界裁剪失败：{e}")
 
@@ -1218,29 +1826,55 @@ class TranslatorApp(ctk.CTk):
             if now - self._last_cache_ui_update >= 5:
                 try:
                     self._update_cache_label()
+                    self._update_phrase_count()
+                    self._update_dict_count()
                 except Exception:
                     pass
                 self._last_cache_ui_update = now
 
-            if (self.app_state.running
-                    and not self.app_state.freeze_overlay):
+            if self.app_state.running and not is_pin:
                 base = self.app_state.scan_interval
                 idle = self.app_state.idle_count
 
-                if self.scroll_detector.is_scrolling():
-                    interval = base * 0.25
-                    self.app_state.scroll_boost = True
+                try:
+                    qsize = self.pipeline.task_queue.qsize()
+                except Exception:
+                    qsize = 0
+
+                if is_fast:
+                    if is_follow and self.scroll_detector.is_scrolling():
+                        interval = max(0.03, base * 0.2)
+                        self.app_state.scroll_boost = True
+                    else:
+                        interval = base * 0.3
+                        self.app_state.scroll_boost = False
+
+                    if qsize >= 1:
+                        interval *= 2.0
                 else:
-                    interval = base
-                    self.app_state.scroll_boost = False
-                    if idle >= IDLE_THRESHOLD_FOR_SLOWDOWN:
-                        interval = base * IDLE_SLOWDOWN_FACTOR
-                    elif idle >= 1:
-                        interval = base * 1.5
+                    pending = getattr(self.app_state, 'pending_change', False)
+
+                    if is_follow and self.scroll_detector.is_scrolling():
+                        interval = base * 0.25
+                        self.app_state.scroll_boost = True
+                    elif pending:
+                        interval = base * 0.3
+                        self.app_state.scroll_boost = False
+                    else:
+                        interval = base
+                        self.app_state.scroll_boost = False
+                        if idle >= IDLE_THRESHOLD_FOR_SLOWDOWN:
+                            interval = base * IDLE_SLOWDOWN_FACTOR
+                        elif idle >= 1:
+                            interval = base * 1.5
+
+                        if qsize >= 1:
+                            interval *= 2.0
 
                 if now - self._last_capture >= interval:
                     try:
                         self._do_capture()
+                        self.app_state.pending_change = True
                     except Exception as e:
                         log.exception(f"[UI] 截图失败：{e}")
                     self._last_capture = now
@@ -1266,6 +1900,11 @@ class TranslatorApp(ctk.CTk):
             self.user_cfg.save()
         except Exception as e:
             log.error(f"[退出] 保存配置失败：{e}")
+
+        try:
+            self.pipeline.phrase_cache.save_user_phrases()
+        except Exception:
+            pass
 
         try:
             self.scroll_detector.stop()

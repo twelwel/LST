@@ -1,13 +1,14 @@
 """
 自动排版模块
-- OCR 异常框过滤（按截图区域自适应）
-- 段落合并（长文本才合并，单个词/词组不合并）
-- 段落哈希（对边界变化免疫）
-- 段落显示 key（用于 overlay 平移）
+- OCR 异常框过滤
+- 通用内容过滤（艺术字/招牌/数字/单位等）
+- 段落合并
 - 自适应字号
 """
 
 import hashlib
+import re
+
 
 # ==================== 段落合并参数 ====================
 LINE_GAP_RATIO = 0.6
@@ -18,16 +19,39 @@ MIN_MERGE_LINE_WIDTH = 150
 LENGTH_SIMILAR_RATIO = 0.35
 
 # ==================== OCR 异常框过滤参数 ====================
-# 按截图区域的相对比例来过滤（关键修复）
-MAX_WIDTH_RATIO = 0.98          # 单个框宽度不能超过截图宽度的 98%
-MAX_HEIGHT_RATIO = 0.50         # 单个框高度不能超过截图高度的 50%
-MAX_AREA_RATIO = 0.30           # 单个框面积不能超过截图面积的 30%
-
-# 绝对上限（兜底，防止区域太大时失效）
+MAX_WIDTH_RATIO = 0.98
+MAX_HEIGHT_RATIO = 0.50
+MAX_AREA_RATIO = 0.30
 ABS_MAX_WIDTH = 3000
 ABS_MAX_HEIGHT = 400
 
 MIN_CONFIDENCE_LENGTH = 2
+
+# ==================== 通用过滤参数 ====================
+# 数字占比超过此值 → 过滤（如 "123.45"、"2024"）
+DIGIT_RATIO_THRESHOLD = 0.6
+# 短文本长度（含）→ 过滤（如 "OK"、"Hi"、"A"）
+SHORT_TEXT_LENGTH = 3
+# 符号占比超过此值 → 过滤（如 "★→◆"）
+SYMBOL_RATIO_THRESHOLD = 0.5
+
+# 常见单位正则（数字+单位 → 过滤）
+UNIT_PATTERN = re.compile(
+    r'^\s*[\d\.,]+\s*'
+    r'(?:[a-zA-Z°%‰㎡m²m³sSminh℃℉pxPXpt°]+|'
+    r'[米厘毫]|[个只条张页块]|[元角分]|[年月日时分秒]|'
+    r'[kKMGT]?[mMgGlL]?[bB]?)\s*$'
+)
+
+# 艺术字/装饰性字符
+DECORATIVE_CHARS = set(
+    '★☆●○◎◆◇■□▲△▼▽◀▶◁▷♠♥♦♣♤♡♢♧'
+    '→←↑↓↔↕⇒⇐⇑⇓'
+    '※§¶†‡•·※'
+    '☎☏✉✂✎✏✐✓✔✗✘'
+    '①②③④⑤⑥⑦⑧⑨⑩'
+    'ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ'
+)
 
 # ==================== 字号参数 ====================
 MIN_FONT_SIZE = 9
@@ -64,16 +88,12 @@ def paragraph_display_key(paragraph):
 # ==================== OCR 异常框过滤 ====================
 
 def filter_invalid_items(items, region_w=None, region_h=None):
-    """
-    过滤 OCR 误识别的异常文本框
-    关键：使用相对截图区域的**比例**判断，而不是绝对像素
-    """
+    """过滤 OCR 误识别的异常文本框"""
     if not items:
         return []
 
-    # 计算动态上限
     if region_w and region_h:
-        max_w = min(ABS_MAX_WIDTH,  int(region_w * MAX_WIDTH_RATIO))
+        max_w = min(ABS_MAX_WIDTH, int(region_w * MAX_WIDTH_RATIO))
         max_h = min(ABS_MAX_HEIGHT, int(region_h * MAX_HEIGHT_RATIO))
         max_area = int(region_w * region_h * MAX_AREA_RATIO)
     else:
@@ -89,25 +109,13 @@ def filter_invalid_items(items, region_w=None, region_h=None):
         h = y2 - y1
         area = w * h
 
-        # 1) 尺寸过大（按比例）
         if w > max_w or h > max_h:
-            # 只在明显异常时才打印，避免刷屏
-            if w > max_w * 1.1 or h > max_h * 1.1:
-                print(f"[过滤] 尺寸过大: '{text[:20]}' "
-                      f"w={w}(max{max_w}) h={h}(max{max_h})")
             continue
-
-        # 2) 面积过大
         if area > max_area:
-            print(f"[过滤] 面积过大: '{text[:20]}' "
-                  f"area={area}(max{max_area})")
             continue
-
-        # 3) 文本过短
         if len(text) < MIN_CONFIDENCE_LENGTH:
             continue
 
-        # 4) 必须包含字母、数字或汉字
         has_meaningful = any(
             ch.isalnum() or '\u4e00' <= ch <= '\u9fff'
             for ch in text
@@ -115,14 +123,139 @@ def filter_invalid_items(items, region_w=None, region_h=None):
         if not has_meaningful:
             continue
 
-        # 5) 宽高比极端异常
         if h > 0 and (w / h) > 50:
-            print(f"[过滤] 宽高比异常: '{text[:20]}' w/h={w/h:.1f}")
             continue
         if w > 0 and (h / w) > 15:
-            print(f"[过滤] 宽高比异常: '{text[:20]}' h/w={h/w:.1f}")
             continue
 
+        valid.append(it)
+    return valid
+
+
+# ==================== 通用内容过滤 ====================
+
+def _digit_ratio(text):
+    """数字字符占比"""
+    if not text:
+        return 0
+    digits = sum(1 for ch in text if ch.isdigit() or ch in '.,')
+    return digits / len(text)
+
+
+def _symbol_ratio(text):
+    """符号字符占比（非字母/数字/汉字）"""
+    if not text:
+        return 0
+    symbols = sum(
+        1 for ch in text
+        if not ch.isalnum() and not ('\u4e00' <= ch <= '\u9fff')
+        and not ch.isspace()
+    )
+    return symbols / len(text)
+
+
+def _is_decorative(text):
+    """是否主要为装饰性字符（艺术字、招牌）"""
+    if not text:
+        return True
+    deco = sum(1 for ch in text if ch in DECORATIVE_CHARS)
+    return deco / len(text) > 0.5
+
+
+def _is_number_or_unit(text):
+    """是否纯数字 / 数字+单位"""
+    t = text.strip()
+    if not t:
+        return True
+
+    # 纯数字（含小数、千分位）
+    if re.fullmatch(r'[\d\.,]+', t):
+        return True
+
+    # 数字 + 单位
+    if UNIT_PATTERN.match(t):
+        return True
+
+    # 数字占比过高（如 "3.14"、"2024 05 12"）
+    if _digit_ratio(t) >= DIGIT_RATIO_THRESHOLD:
+        # 但如果含中文，可能是正文
+        if not any('\u4e00' <= ch <= '\u9fff' for ch in t):
+            return True
+
+    return False
+
+
+def _is_too_short(text):
+    """是否过短（如 "OK"、"A"、"Hi"）"""
+    t = text.strip()
+    if len(t) <= SHORT_TEXT_LENGTH:
+        # 但如果是中文，可能是有意义的词
+        if not any('\u4e00' <= ch <= '\u9fff' for ch in t):
+            return True
+    return False
+
+
+def _is_symbol_heavy(text):
+    """是否符号过多"""
+    return _symbol_ratio(text) >= SYMBOL_RATIO_THRESHOLD
+
+
+def is_general_content_filtered(text, debug=False):
+    """
+    通用过滤：判断是否应该过滤掉
+    返回 True 表示应该过滤
+
+    过滤类型：
+    - 艺术字 / 装饰符号
+    - 招牌（纯数字/单位）
+    - 数字 / 单位
+    - 过短文本
+    - 符号过多
+    """
+    if not text or not text.strip():
+        return True
+
+    t = text.strip()
+
+    # 1) 装饰性字符
+    if _is_decorative(t):
+        if debug:
+            print(f"[通用过滤] 装饰字符: '{t}'")
+        return True
+
+    # 2) 数字 / 单位
+    if _is_number_or_unit(t):
+        if debug:
+            print(f"[通用过滤] 数字/单位: '{t}'")
+        return True
+
+    # 3) 过短
+    if _is_too_short(t):
+        if debug:
+            print(f"[通用过滤] 过短: '{t}'")
+        return True
+
+    # 4) 符号过多
+    if _is_symbol_heavy(t):
+        if debug:
+            print(f"[通用过滤] 符号过多: '{t}'")
+        return True
+
+    return False
+
+
+def filter_general_content(items, debug=False):
+    """过滤 OCR 结果中的非正文内容"""
+    if not items:
+        return []
+
+    valid = []
+    for it in items:
+        text = it['text'].strip()
+        if not text:
+            continue
+        if is_general_content_filtered(text, debug=debug):
+            continue
         valid.append(it)
     return valid
 
