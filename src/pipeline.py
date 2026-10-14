@@ -1,8 +1,8 @@
 """后台处理管道
 - 6 种翻译策略：离线 / 单翻译 API / 多翻译轮询 / 混合 / 单 AI / 多 AI 投票
 - 快速响应层（本地词典 + 短语缓存）：所有策略共用，只处理单词和词组
-- 显示模式：覆盖 / 双语
-- 译文颜色：全模式通用（auto / 用户指定）
+- 显示模式：覆盖 / 双语 / 小窗口
+- 译文颜色：全模式通用
 """
 
 import queue
@@ -45,6 +45,7 @@ from config import (
     LOCAL_LOOKUP_MAX_WORDS,
     LOCAL_LOOKUP_MAX_CHARS,
 )
+from translation.strategies import STRATEGY_LABELS
 
 
 log = get_logger('pipeline')
@@ -91,7 +92,7 @@ class AppState:
         # 翻译策略（6 种）
         self.translation_strategy = 'single_translate'
 
-        # 显示模式：'overlay' / 'bilingual'
+        # 显示模式：'overlay' / 'bilingual' / 'window'
         self.display_mode = 'overlay'
 
         # 译文颜色：'auto' 或 '#RRGGBB'
@@ -218,7 +219,6 @@ class Pipeline:
         user_fg = getattr(self.state, 'fg_color', 'auto')
         if user_fg and user_fg != 'auto':
             return user_fg
-        # auto：按背景亮度反色
         luminance = (avg_rgb[0] * 0.299 +
                      avg_rgb[1] * 0.587 +
                      avg_rgb[2] * 0.114)
@@ -419,7 +419,6 @@ class Pipeline:
             if not text:
                 continue
 
-            # 长文本跳过（同 _lookup_local 规则）
             if len(text) > LOCAL_LOOKUP_MAX_CHARS:
                 continue
             wc = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
@@ -451,7 +450,6 @@ class Pipeline:
     def _lookup_local(self, text):
         """
         快速响应层（本地词典 + 短语缓存）
-        规则：
         - 开关关闭 → 直接返回 None（全走策略）
         - 只处理单词和词组，长文本跳过交给上层策略
         """
@@ -462,19 +460,16 @@ class Pipeline:
         if not text:
             return None
 
-        # 长度规则：长文本跳过
         if len(text) > LOCAL_LOOKUP_MAX_CHARS:
             return None
         word_count = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
         if word_count > LOCAL_LOOKUP_MAX_WORDS:
             return None
 
-        # 1) 短语缓存（整句优先）
         zh = self.phrase_cache.lookup_fuzzy(text)
         if zh:
             return zh
 
-        # 2) 本地词典（智能多级查询）
         zh = self.local_dict.smart_lookup(text)
         if zh:
             return zh
@@ -550,6 +545,7 @@ class Pipeline:
         # 按策略处理
         strategy = getattr(self.state, 'translation_strategy',
                            'single_translate')
+        strategy_name = STRATEGY_LABELS.get(strategy, strategy)
 
         need_api = []
         for p in to_translate:
@@ -570,6 +566,7 @@ class Pipeline:
                 self.cache.put(p_hash, zh, line_hashes)
                 continue
 
+            # 离线策略未命中：跳过
             if strategy == 'local_only':
                 continue
 
@@ -587,14 +584,15 @@ class Pipeline:
                 f"OCR {(t_ocr-t_frame_diff)*1000:.0f}ms | "
                 f"推送 {(t_emit-t_ocr)*1000:.0f}ms | "
                 f"{len(to_translate)} 段 / {len(need_api)} 需API | "
-                f"策略 {strategy}"
+                f"策略 {strategy_name}"
             )
 
         if need_api:
             mt_tag = " [多线程OCR]" if use_mt else ""
             fast_tag = " [快档]" if self.state.fast_mode else ""
             log.info(f"[段落] 共 {len(to_translate)} 段 | "
-                     f"需 API {len(need_api)} | 策略 {strategy} | "
+                     f"需 API {len(need_api)} | "
+                     f"策略 {strategy_name} ({strategy}) | "
                      f"变化区 {w}x{h}{mt_tag}{fast_tag}")
 
             if self.state.fast_mode:
@@ -678,8 +676,8 @@ class Pipeline:
 
             x1, y1, x2, y2 = p['box']
 
-            # ============ 双语模式 ============
-            if display_mode == 'bilingual':
+            # ============ 双语 / 小窗口模式：只算颜色，不覆盖 ============
+            if display_mode in ('bilingual', 'window'):
                 avg = self._crop_avg_color(img, x1, y1, x2, y2)
                 bg_hex = f'#{avg[0]:02x}{avg[1]:02x}{avg[2]:02x}'
                 fg = self._resolve_fg_color(avg)
@@ -695,7 +693,7 @@ class Pipeline:
                     'fg': fg,
                     'bg_image': None,
                     'key': paragraph_display_key(p),
-                    'bilingual': True,
+                    'bilingual': (display_mode == 'bilingual'),
                     'orig_w': x2 - x1,
                     'orig_h': y2 - y1,
                 }
@@ -723,7 +721,6 @@ class Pipeline:
                         self.color_cache[p_hash] = sample_text_color(
                             img, x1, y1, x2, y2
                         )
-                    # 精细模式自带文字颜色采样，但用户指定时优先
                     user_fg = getattr(self.state, 'fg_color', 'auto')
                     if user_fg and user_fg != 'auto':
                         fg = user_fg

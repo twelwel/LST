@@ -1,7 +1,12 @@
-"""5 种翻译策略"""
+"""翻译策略 —— 6 种模式"""
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+
+from logger import get_logger
+
+
+log = get_logger('strategy')
 
 
 def _similarity(a, b):
@@ -14,8 +19,8 @@ class BaseStrategy:
     name = 'base'
 
     def __init__(self, translate_providers, ai_providers, options):
-        self.translate_providers = translate_providers
-        self.ai_providers = ai_providers
+        self.translate_providers = list(translate_providers or [])
+        self.ai_providers = list(ai_providers or [])
         self.options = options or {}
         self._rr_lock = threading.Lock()
         self._rr_index = 0
@@ -23,7 +28,6 @@ class BaseStrategy:
     def translate(self, text: str) -> str:
         raise NotImplementedError
 
-    # --- 工具 ---
     def _primary_translate(self):
         for p in self.translate_providers:
             if p.is_primary:
@@ -36,27 +40,43 @@ class BaseStrategy:
                 return p
         return self.ai_providers[0] if self.ai_providers else None
 
+    def _has_translate(self):
+        return bool(self.translate_providers)
 
+    def _has_ai(self):
+        return bool(self.ai_providers)
+
+
+# ============ 离线 ============
+class LocalOnlyStrategy(BaseStrategy):
+    name = '离线'
+
+    def translate(self, text):
+        return '[离线：本地未命中]'
+
+
+# ============ 单翻译 API ============
 class SingleTranslateStrategy(BaseStrategy):
     name = '单翻译 API'
 
     def translate(self, text):
-        p = self._primary_translate()
-        if not p:
+        if not self._has_translate():
             return '[无翻译 API]'
-        r = p.translate(text)
+        primary = self._primary_translate()
+        r = primary.translate(text)
         if r.success and r.text.strip():
             return r.text
         # 兜底：尝试其他翻译 API
         for other in self.translate_providers:
-            if other is p:
+            if other is primary:
                 continue
             r2 = other.translate(text)
             if r2.success and r2.text.strip():
                 return r2.text
-        return f'[翻译失败: {r.error}]'
+        return f'[翻译失败 · {primary.name}: {r.error}]'
 
 
+# ============ 多翻译 API 轮询 ============
 class RoundRobinTranslateStrategy(BaseStrategy):
     name = '多翻译 API 轮询'
 
@@ -66,15 +86,18 @@ class RoundRobinTranslateStrategy(BaseStrategy):
             return '[无翻译 API]'
         with self._rr_lock:
             start = self._rr_index % n
-            self._rr_index += 1
+            self._rr_index = (self._rr_index + 1) % max(1, n)
+        last_err = ''
         for i in range(n):
             p = self.translate_providers[(start + i) % n]
             r = p.translate(text)
             if r.success and r.text.strip():
                 return r.text
-        return '[所有翻译 API 失败]'
+            last_err = f'{p.name}: {r.error}'
+        return f'[所有翻译 API 失败 · {last_err}]'
 
 
+# ============ 翻译 API + AI 混合 ============
 class HybridStrategy(BaseStrategy):
     name = '翻译 API + AI 混合'
 
@@ -89,42 +112,38 @@ class HybridStrategy(BaseStrategy):
         return self._translate_first(text)
 
     def _translate_first(self, text):
-        p = self._primary_translate()
-        if p:
-            r = p.translate(text)
+        if self._has_translate():
+            r = self._primary_translate().translate(text)
             if r.success and r.text.strip():
                 return r.text
-        ai = self._primary_ai()
-        if ai:
-            r = ai.translate(text)
+        if self._has_ai():
+            r = self._primary_ai().translate(text)
             if r.success and r.text.strip():
                 return r.text
         return '[混合翻译失败]'
 
     def _ai_first(self, text):
-        ai = self._primary_ai()
-        if ai:
-            r = ai.translate(text)
+        if self._has_ai():
+            r = self._primary_ai().translate(text)
             if r.success and r.text.strip():
                 return r.text
-        p = self._primary_translate()
-        if p:
-            r = p.translate(text)
+        if self._has_translate():
+            r = self._primary_translate().translate(text)
             if r.success and r.text.strip():
                 return r.text
         return '[混合翻译失败]'
 
     def _concurrent(self, text):
         candidates = []
-        p1 = self._primary_translate()
-        p2 = self._primary_ai()
-        if p1:
-            candidates.append(p1)
-        if p2:
-            candidates.append(p2)
+        if self._has_translate():
+            candidates.append(self._primary_translate())
+        if self._has_ai():
+            candidates.append(self._primary_ai())
         if not candidates:
             return '[无可用 API]'
-        with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+
+        ex = ThreadPoolExecutor(max_workers=len(candidates))
+        try:
             futures = [ex.submit(p.translate, text) for p in candidates]
             for fut in as_completed(futures):
                 try:
@@ -133,44 +152,63 @@ class HybridStrategy(BaseStrategy):
                         return r.text
                 except Exception:
                     continue
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         return '[混合翻译失败]'
 
 
+# ============ 单 AI ============
 class SingleAIStrategy(BaseStrategy):
     name = '单 AI 翻译'
 
     def translate(self, text):
-        ai = self._primary_ai()
-        if not ai:
+        if not self._has_ai():
             return '[无 AI 模型]'
-        r = ai.translate(text)
+        primary = self._primary_ai()
+        r = primary.translate(text)
         if r.success and r.text.strip():
             return r.text
         for other in self.ai_providers:
-            if other is ai:
+            if other is primary:
                 continue
             r2 = other.translate(text)
             if r2.success and r2.text.strip():
                 return r2.text
-        return f'[AI 翻译失败: {r.error}]'
+        return f'[AI 失败 · {primary.name}: {r.error}]'
 
 
+# ============ 多 AI 高精度投票 ============
 class MultiAIVoteStrategy(BaseStrategy):
-    """多 AI 高精度投票"""
     name = '多 AI 高精度投票'
 
     def translate(self, text):
-        if not self.ai_providers:
+        if not self._has_ai():
             return '[无 AI 模型]'
-        vote_count = max(1, int(self.options.get('vote_count', 3)))
+
+        enabled = [p for p in self.ai_providers if p.enabled]
+
+        # 降级：只有一个 AI 时直接用它
+        if len(enabled) == 1:
+            r = enabled[0].translate(text)
+            return r.text if r.success else f'[AI 失败: {r.error}]'
+
+        vote_count = max(2, int(self.options.get('vote_count', 3)))
         vote_strategy = self.options.get('vote_strategy', 'similarity')
 
-        sources = self._collect_sources(vote_count)
-        if not sources:
-            return '[无可用 AI]'
+        sources = []
+        idx = 0
+        while len(sources) < vote_count:
+            sources.append(enabled[idx % len(enabled)])
+            idx += 1
+            if idx > vote_count * 3:
+                break
 
         results = []
-        with ThreadPoolExecutor(max_workers=min(len(sources), 6)) as ex:
+        ex = ThreadPoolExecutor(max_workers=min(len(sources), 6))
+        try:
             futures = [ex.submit(p.translate, text) for p in sources]
             for fut in as_completed(futures):
                 try:
@@ -179,6 +217,11 @@ class MultiAIVoteStrategy(BaseStrategy):
                         results.append(r.text.strip())
                 except Exception:
                     continue
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
         if not results:
             return '[所有 AI 翻译失败]'
@@ -190,7 +233,6 @@ class MultiAIVoteStrategy(BaseStrategy):
         if vote_strategy == 'shortest':
             return min(results, key=len)
 
-        # 默认：相似度居中
         best, best_score = results[0], -1.0
         for cand in results:
             scores = [_similarity(cand, o) for o in results if o is not cand]
@@ -199,19 +241,9 @@ class MultiAIVoteStrategy(BaseStrategy):
                 best_score, best = avg, cand
         return best
 
-    def _collect_sources(self, count):
-        enabled = [p for p in self.ai_providers if p.enabled]
-        if not enabled:
-            return []
-        sources = list(enabled[:count])
-        idx = 0
-        while len(sources) < count:
-            sources.append(enabled[idx % len(enabled)])
-            idx += 1
-        return sources
-
 
 STRATEGY_REGISTRY = {
+    'local_only':          LocalOnlyStrategy,
     'single_translate':    SingleTranslateStrategy,
     'multi_translate_rr':  RoundRobinTranslateStrategy,
     'hybrid':              HybridStrategy,
@@ -220,11 +252,24 @@ STRATEGY_REGISTRY = {
 }
 
 STRATEGY_LABELS = {
+    'local_only':          '离线',
     'single_translate':    '单翻译 API',
     'multi_translate_rr':  '多翻译 API 轮询',
     'hybrid':              '翻译 API + AI 混合',
     'single_ai':           '单 AI 翻译',
     'multi_ai_vote':       '多 AI 高精度投票',
+}
+
+HYBRID_ORDER_LABELS = {
+    'translate_first': '翻译优先',
+    'ai_first':        'AI 优先',
+    'concurrent':      '并发取快',
+}
+
+VOTE_STRATEGY_LABELS = {
+    'similarity': '相似度居中',
+    'longest':    '选最长',
+    'shortest':   '选最短',
 }
 
 

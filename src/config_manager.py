@@ -33,13 +33,16 @@ DEFAULT_USER_CONFIG = {
     # 加速模式
     "accel_mode": "",
 
+    # CPU 引擎数（可调）
+    "cpu_engine_count": 2,
+
     # 译文模式
     "follow_mode": "follow",
 
     # 显示模式
     "display_mode": "overlay",
 
-    # 译文颜色（全模式通用）
+    # 译文颜色
     "fg_color": "auto",
 
     # 优化开关
@@ -49,7 +52,7 @@ DEFAULT_USER_CONFIG = {
     "enable_async_translate": True,
     "enable_window_pool": True,
 
-    # 快速响应层（本地词典 + 短语缓存）
+    # 快速响应层
     "enable_fast_lookup": True,
 
     # 显示设置
@@ -73,25 +76,14 @@ DEFAULT_USER_CONFIG = {
     },
 
     # 窗口
-    "window_geometry": "740x820+50+50",
-    # 背景修复开关
+    "window_geometry": "760x800+80+40",
     "enable_fine_text": False,
-    # 异步覆盖
     "enable_async_overlay": False,
-    # 通用过滤
     "enable_general_filter": True,
-    # 本地词典
     "local_dict_path": "",
 
     # 翻译策略
     "translation_strategy": "single_translate",
-
-    # GPU 引擎分配
-    "gpu_engine_counts": [],
-    "gpu_device_names": [],
-
-    # 小窗口位置和大小
-    "caption_geometry": "",
 }
 
 
@@ -133,7 +125,7 @@ class ConfigManager:
             else:
                 self._data[key] = val
 
-        # 迁移 1：旧 translation_mode → 新 translation_strategy
+        # 迁移：旧 translation_mode → 新 translation_strategy
         if 'translation_strategy' not in loaded:
             old = loaded.get('translation_mode')
             if old in ('local', 'hybrid', 'online'):
@@ -144,13 +136,13 @@ class ConfigManager:
                 }
                 self._data['translation_strategy'] = migrate[old]
 
-        # 迁移 2：旧 enable_phrase_cache → 新 enable_fast_lookup
+        # 迁移：旧 enable_phrase_cache → 新 enable_fast_lookup
         if 'enable_fast_lookup' not in loaded:
             old_flag = loaded.get('enable_phrase_cache')
             if old_flag is not None:
                 self._data['enable_fast_lookup'] = bool(old_flag)
 
-        # 迁移 3：旧 bilingual_fg → 新 fg_color
+        # 迁移：旧 bilingual_fg → 新 fg_color
         if 'fg_color' not in loaded:
             old_fg = loaded.get('bilingual_fg')
             if old_fg:

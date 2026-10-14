@@ -31,10 +31,9 @@ from config import (
     DEFAULT_ENABLE_FRAME_DIFF, DEFAULT_ENABLE_FILTER,
     DEFAULT_ENABLE_BLOCK_OCR,
     DEFAULT_ENABLE_ASYNC_TRANSLATE, DEFAULT_ENABLE_WINDOW_POOL,
-    MULTITHREAD_OCR_POOL_SIZE,
-    DIRECTML_ENGINE_COUNT_MIN,
-    DIRECTML_ENGINE_COUNT_MAX,
-    DIRECTML_ENGINE_COUNT_DEFAULT,
+    CPU_ENGINE_COUNT_MIN,
+    CPU_ENGINE_COUNT_MAX,
+    CPU_ENGINE_COUNT_DEFAULT,
     TRANSLATION_STRATEGIES,
     TRANSLATION_STRATEGY_DESC,
     DEFAULT_TRANSLATION_STRATEGY,
@@ -59,6 +58,9 @@ from version import get_window_title, __version__, APP_NAME
 from cuda_setup import (
     check_onnxruntime_variant, check_cuda_ready, check_directml_ready,
     is_frozen, list_gpu_devices,
+)
+from translation.strategies import (
+    HYBRID_ORDER_LABELS, VOTE_STRATEGY_LABELS,
 )
 
 
@@ -93,7 +95,8 @@ class CollapsibleFrame(ctk.CTkFrame):
         )
         self.title_btn.pack(fill='x', padx=2, pady=2)
 
-        self.content = ctk.CTkFrame(self, fg_color='transparent')
+        self.content = ctk.CTkFrame(self, fg_color='transparent', height=1)
+        self.content.pack_propagate(True)
         if expanded:
             self.content.pack(fill='x', padx=2, pady=(0, 5))
 
@@ -123,9 +126,9 @@ class TranslatorApp(ctk.CTk):
         self.user_cfg = get_config()
         log.info(f"配置文件：{get_config_path()}")
 
-        geo = self.user_cfg.get('window_geometry', "740x1080+50+50")
+        geo = self.user_cfg.get('window_geometry', "760x800+80+40")
         self.geometry(geo)
-        self.minsize(660, 600)
+        self.minsize(700, 560)
         self.attributes('-topmost', True)
 
         initial_region = self.user_cfg.get_region()
@@ -154,11 +157,32 @@ class TranslatorApp(ctk.CTk):
         saved_wpool = self.user_cfg.get('enable_window_pool',
                                         DEFAULT_ENABLE_WINDOW_POOL)
 
+        # CPU 引擎数
+        saved_cpu_engine = self.user_cfg.get(
+            'cpu_engine_count', CPU_ENGINE_COUNT_DEFAULT)
+        try:
+            saved_cpu_engine = int(saved_cpu_engine)
+        except Exception:
+            saved_cpu_engine = CPU_ENGINE_COUNT_DEFAULT
+        saved_cpu_engine = max(CPU_ENGINE_COUNT_MIN,
+                               min(CPU_ENGINE_COUNT_MAX, saved_cpu_engine))
+        self.cpu_engine_count = saved_cpu_engine
+
         # 翻译策略
         saved_translation_strategy = self.user_cfg.get(
             'translation_strategy', DEFAULT_TRANSLATION_STRATEGY)
         if saved_translation_strategy not in TRANSLATION_STRATEGIES:
             saved_translation_strategy = DEFAULT_TRANSLATION_STRATEGY
+
+        try:
+            from translation import load_strategy, save_strategy
+            _st = load_strategy()
+            if _st.get('mode') != saved_translation_strategy:
+                _st['mode'] = saved_translation_strategy
+                save_strategy(_st)
+                log.info(f"[启动] 策略同步为 {saved_translation_strategy}")
+        except Exception as e:
+            log.exception(f"[启动] 策略同步失败：{e}")
 
         # 显示模式
         saved_display_mode = self.user_cfg.get(
@@ -187,11 +211,8 @@ class TranslatorApp(ctk.CTk):
         if saved_follow_mode not in ('default', 'follow', 'pin'):
             saved_follow_mode = 'follow'
 
-        # GPU 枚举 & 引擎分配
+        # GPU 枚举（用于显示）
         self.gpu_devices = list_gpu_devices()
-        saved_counts = self.user_cfg.get('gpu_engine_counts', []) or []
-        self.gpu_engine_counts = self._merge_gpu_counts(
-            self.gpu_devices, saved_counts)
 
         log.info(f"========== 启动 v{__version__} ==========")
         if is_frozen():
@@ -220,11 +241,10 @@ class TranslatorApp(ctk.CTk):
 
         variant = self.ocr_engine.init(
             mode=init_mode,
-            pool_size=MULTITHREAD_OCR_POOL_SIZE,
-            gpu_engine_counts=self.gpu_engine_counts,
+            pool_size=self.cpu_engine_count,
         )
-        log.info(f"OCR 引擎初始化：{variant} × {len(self.ocr_engine.engines)}"
-                 f" devices={self.ocr_engine.engine_device_ids}")
+        log.info(f"OCR 引擎初始化：{variant} × "
+                 f"{len(self.ocr_engine.engines)}")
 
         self.cache = ParagraphCache(
             min_overlap=REUSE_MIN_OVERLAP,
@@ -276,7 +296,6 @@ class TranslatorApp(ctk.CTk):
         self.overlay.set_pool_enabled(saved_wpool)
         self.overlay.set_async_enabled(saved_async_overlay)
 
-        # 小窗口模式
         self.caption_window = CaptionWindow(
             self, font_name=FONT_NAME,
             on_close=self._on_caption_closed,
@@ -304,14 +323,14 @@ class TranslatorApp(ctk.CTk):
         self._border_visible = True
         self._current_mode = saved_mode
 
-        # GPU 引擎 UI 引用
-        self.gpu_engine_sliders = {}
-        self.gpu_engine_labels = {}
-
         # 翻译策略 UI 引用
         self._strategy_labels = list(TRANSLATION_STRATEGIES.values())
         self._strategy_label_to_key = {
             v: k for k, v in TRANSLATION_STRATEGIES.items()
+        }
+        self._hybrid_order_rev = {v: k for k, v in HYBRID_ORDER_LABELS.items()}
+        self._vote_strategy_rev = {
+            v: k for k, v in VOTE_STRATEGY_LABELS.items()
         }
 
         # 显示模式 UI 引用
@@ -343,41 +362,6 @@ class TranslatorApp(ctk.CTk):
         self._ui_ready = True
         self.after(TICK_MS, self._tick)
 
-    # ================= GPU 引擎数合并 =================
-
-    @staticmethod
-    def _merge_gpu_counts(devices, saved):
-        n = len(devices)
-        if n <= 0:
-            return [DIRECTML_ENGINE_COUNT_DEFAULT]
-
-        result = [DIRECTML_ENGINE_COUNT_DEFAULT] * n
-
-        if isinstance(saved, dict):
-            for i in range(n):
-                if i in saved:
-                    try:
-                        result[i] = int(saved[i])
-                    except Exception:
-                        pass
-        elif isinstance(saved, (list, tuple)):
-            for i in range(min(n, len(saved))):
-                try:
-                    result[i] = int(saved[i])
-                except Exception:
-                    pass
-
-        result = [
-            max(DIRECTML_ENGINE_COUNT_MIN,
-                min(DIRECTML_ENGINE_COUNT_MAX, x))
-            for x in result
-        ]
-
-        if sum(result) < 1 and n > 0:
-            result[0] = DIRECTML_ENGINE_COUNT_DEFAULT
-
-        return result
-
     # ================= 恢复 UI =================
 
     def _restore_ui_from_config(self, mode, scan, font, inpaint,
@@ -395,6 +379,10 @@ class TranslatorApp(ctk.CTk):
             self.scan_value_label.configure(text=f"{scan:.2f} s")
             self.font_slider.set(font)
             self.font_value_label.configure(text=str(font))
+
+            # CPU 引擎数滑块
+            self.cpu_count_slider.set(self.cpu_engine_count)
+            self.cpu_count_label.configure(text=str(self.cpu_engine_count))
 
             if inpaint and CV2_AVAILABLE:
                 self.inpaint_switch.select()
@@ -454,19 +442,9 @@ class TranslatorApp(ctk.CTk):
             else:
                 self.auto_clean_switch.deselect()
 
-            # GPU 引擎数滑块
-            for device_id, slider in self.gpu_engine_sliders.items():
-                if device_id < len(self.gpu_engine_counts):
-                    v = self.gpu_engine_counts[device_id]
-                    slider.set(v)
-                    if device_id in self.gpu_engine_labels:
-                        self.gpu_engine_labels[device_id].configure(
-                            text=str(v))
-
             self._update_phrase_count()
             self._update_dict_count()
 
-            # 恢复显示模式对应的小窗口状态
             if getattr(self.app_state, 'display_mode',
                        'overlay') == 'window':
                 self.caption_window.show()
@@ -526,72 +504,123 @@ class TranslatorApp(ctk.CTk):
     # ================= UI 构建 =================
 
     def _build_ui(self):
-        top = ctk.CTkFrame(self)
-        top.pack(fill='x', padx=10, pady=(10, 5))
+        # 顶部状态栏
+        top = ctk.CTkFrame(self, height=1)
+        top.pack(fill='x', padx=10, pady=(8, 4))
+        top.pack_propagate(True)
 
         self.status_label = ctk.CTkLabel(
             top, text="状态：已暂停",
             font=(FONT_NAME, 13, 'bold'), anchor='w',
         )
-        self.status_label.pack(side='left', padx=10)
+        self.status_label.pack(side='left', padx=8)
 
         self.version_label = ctk.CTkLabel(
             top, text=f"{APP_NAME} v{__version__}",
             font=(FONT_NAME, 10), text_color='#3a86ff',
         )
-        self.version_label.pack(side='right', padx=10)
+        self.version_label.pack(side='right', padx=8)
 
         self.hotkey_hint = ctk.CTkLabel(
-            top, text='', font=(FONT_NAME, 10), text_color='gray',
+            top, text='', font=(FONT_NAME, 9), text_color='gray',
         )
-        self.hotkey_hint.pack(side='right', padx=10)
+        self.hotkey_hint.pack(side='right', padx=8)
 
-        # 翻译策略
-        strategy_frame = ctk.CTkFrame(self)
-        strategy_frame.pack(fill='x', padx=10, pady=5)
+        # ===== 翻译策略 =====
+        strategy_frame = ctk.CTkFrame(self, height=1)
+        strategy_frame.pack(fill='x', padx=10, pady=(4, 2))
+        strategy_frame.pack_propagate(True)
+
+        row1 = ctk.CTkFrame(strategy_frame, fg_color='transparent', height=1)
+        row1.pack(fill='x')
+        row1.pack_propagate(True)
 
         ctk.CTkLabel(
-            strategy_frame, text="翻译策略：",
+            row1, text="翻译策略：",
             font=(FONT_NAME, 11, 'bold'),
-        ).pack(side='left', padx=(5, 8))
+        ).pack(side='left', padx=(6, 6))
 
         self.strategy_selector = ctk.CTkOptionMenu(
-            strategy_frame,
+            row1,
             values=self._strategy_labels,
             command=self._on_strategy_change,
             font=(FONT_NAME, 11),
-            width=180,
+            width=170,
         )
         self.strategy_selector.set(
             TRANSLATION_STRATEGIES[DEFAULT_TRANSLATION_STRATEGY])
-        self.strategy_selector.pack(side='left', padx=5)
+        self.strategy_selector.pack(side='left', padx=4)
 
         self.strategy_desc = ctk.CTkLabel(
-            strategy_frame, text="",
+            row1, text="",
             font=(FONT_NAME, 9),
             text_color='#666666', anchor='w',
         )
-        self.strategy_desc.pack(side='left', padx=8)
+        self.strategy_desc.pack(side='left', padx=6)
 
-        # 提示：快速响应层
-        hint_frame = ctk.CTkFrame(self, fg_color='transparent')
-        hint_frame.pack(fill='x', padx=10, pady=(0, 3))
+        # 子参数行
+        self.sub_param_frame = ctk.CTkFrame(
+            strategy_frame, fg_color='transparent', height=1)
+        self.sub_param_frame.pack(fill='x', pady=(2, 0))
+        self.sub_param_frame.pack_propagate(True)
+
+        self.hybrid_order_label = ctk.CTkLabel(
+            self.sub_param_frame, text="混合顺序：",
+            font=(FONT_NAME, 10), text_color='#555555',
+        )
+        self.hybrid_order_selector = ctk.CTkOptionMenu(
+            self.sub_param_frame,
+            values=list(HYBRID_ORDER_LABELS.values()),
+            command=self._on_hybrid_order_change,
+            font=(FONT_NAME, 10), width=110,
+        )
+        self.hybrid_order_selector.set('翻译优先')
+
+        self.vote_count_label = ctk.CTkLabel(
+            self.sub_param_frame, text="投票数：",
+            font=(FONT_NAME, 10), text_color='#555555',
+        )
+        self.vote_count_selector = ctk.CTkOptionMenu(
+            self.sub_param_frame,
+            values=['2', '3', '4', '5'],
+            command=self._on_vote_count_change,
+            font=(FONT_NAME, 10), width=55,
+        )
+        self.vote_count_selector.set('3')
+
+        self.vote_strategy_label = ctk.CTkLabel(
+            self.sub_param_frame, text="投票策略：",
+            font=(FONT_NAME, 10), text_color='#555555',
+        )
+        self.vote_strategy_selector = ctk.CTkOptionMenu(
+            self.sub_param_frame,
+            values=list(VOTE_STRATEGY_LABELS.values()),
+            command=self._on_vote_strategy_change,
+            font=(FONT_NAME, 10), width=110,
+        )
+        self.vote_strategy_selector.set('相似度居中')
+
+        # 提示行
+        hint_frame = ctk.CTkFrame(self, fg_color='transparent', height=1)
+        hint_frame.pack(fill='x', padx=10, pady=(0, 2))
+        hint_frame.pack_propagate(True)
         ctk.CTkLabel(
             hint_frame,
             text="💡 所有策略都会先查快速响应层（本地词典 + 短语缓存），"
                  "仅处理单词和词组，未命中才按策略走网络",
             font=(FONT_NAME, 9),
             text_color='#888888', anchor='w',
-        ).pack(side='left', padx=(13, 0))
+        ).pack(side='left', padx=6)
 
-        # 译文模式
-        follow_frame = ctk.CTkFrame(self)
-        follow_frame.pack(fill='x', padx=10, pady=5)
+        # ===== 译文模式 =====
+        follow_frame = ctk.CTkFrame(self, height=1)
+        follow_frame.pack(fill='x', padx=10, pady=3)
+        follow_frame.pack_propagate(True)
 
         ctk.CTkLabel(
             follow_frame, text="译文模式：",
             font=(FONT_NAME, 11, 'bold'),
-        ).pack(side='left', padx=(5, 8))
+        ).pack(side='left', padx=(6, 6))
 
         self.follow_selector = ctk.CTkSegmentedButton(
             follow_frame,
@@ -599,22 +628,23 @@ class TranslatorApp(ctk.CTk):
             command=self._on_follow_mode_change,
             font=(FONT_NAME, 11),
         )
-        self.follow_selector.pack(side='left', fill='x', expand=True, padx=5)
+        self.follow_selector.pack(side='left', padx=4)
 
         self.follow_desc_label = ctk.CTkLabel(
             follow_frame, text="", font=(FONT_NAME, 9),
-            text_color='#666666', width=260, anchor='w',
+            text_color='#666666', anchor='w',
         )
         self.follow_desc_label.pack(side='left', padx=8)
 
-        # 显示模式
-        display_frame = ctk.CTkFrame(self)
-        display_frame.pack(fill='x', padx=10, pady=5)
+        # ===== 显示模式 =====
+        display_frame = ctk.CTkFrame(self, height=1)
+        display_frame.pack(fill='x', padx=10, pady=3)
+        display_frame.pack_propagate(True)
 
         ctk.CTkLabel(
             display_frame, text="显示模式：",
             font=(FONT_NAME, 11, 'bold'),
-        ).pack(side='left', padx=(5, 8))
+        ).pack(side='left', padx=(6, 6))
 
         self.display_selector = ctk.CTkSegmentedButton(
             display_frame,
@@ -623,102 +653,106 @@ class TranslatorApp(ctk.CTk):
             font=(FONT_NAME, 11),
         )
         self.display_selector.set(DISPLAY_MODES[DEFAULT_DISPLAY_MODE])
-        self.display_selector.pack(
-            side='left', fill='x', expand=True, padx=5)
+        self.display_selector.pack(side='left', padx=4)
 
         self.display_desc_label = ctk.CTkLabel(
             display_frame, text="", font=(FONT_NAME, 9),
-            text_color='#666666', width=260, anchor='w',
+            text_color='#666666', anchor='w',
         )
         self.display_desc_label.pack(side='left', padx=8)
 
-        # 按钮行 1
-        btn_frame = ctk.CTkFrame(self)
-        btn_frame.pack(fill='x', padx=10, pady=5)
+        # ===== 按钮行 1 =====
+        btn_frame = ctk.CTkFrame(self, height=1)
+        btn_frame.pack(fill='x', padx=10, pady=(4, 2))
+        btn_frame.pack_propagate(True)
 
         self.btn_toggle = ctk.CTkButton(
-            btn_frame, text="▶ 开始", width=90,
+            btn_frame, text="▶ 开始", width=90, height=30,
             command=self.toggle_running,
         )
-        self.btn_toggle.pack(side='left', padx=3, pady=10)
+        self.btn_toggle.pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="清空译文", width=80,
+            btn_frame, text="清空译文", width=80, height=30,
             command=self.clear_overlay,
         ).pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="修改区域", width=80,
+            btn_frame, text="修改区域", width=80, height=30,
             command=self.open_config,
         ).pack(side='left', padx=3)
 
         self.btn_border = ctk.CTkButton(
-            btn_frame, text="隐藏边框", width=80,
+            btn_frame, text="隐藏边框", width=80, height=30,
             command=self.toggle_border,
         )
         self.btn_border.pack(side='left', padx=3)
 
-        # 按钮行 2
-        btn_frame2 = ctk.CTkFrame(self)
-        btn_frame2.pack(fill='x', padx=10, pady=5)
+        # ===== 按钮行 2 =====
+        btn_frame2 = ctk.CTkFrame(self, height=1)
+        btn_frame2.pack(fill='x', padx=10, pady=2)
+        btn_frame2.pack_propagate(True)
 
         ctk.CTkButton(
-            btn_frame2, text="API 设置", width=85,
+            btn_frame2, text="API 设置", width=80, height=28,
             fg_color='#6c757d', hover_color='#5a6268',
             command=self.open_api_config,
-        ).pack(side='left', padx=3, pady=6)
+        ).pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame2, text="打开日志", width=85,
+            btn_frame2, text="打开日志", width=80, height=28,
             fg_color='#17a2b8', hover_color='#138496',
             command=self.open_logs,
         ).pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame2, text="清空日志", width=85,
+            btn_frame2, text="清空日志", width=80, height=28,
             fg_color='#dc3545', hover_color='#c82333',
             command=self.clear_logs_ui,
         ).pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame2, text="打开配置", width=85,
+            btn_frame2, text="打开配置", width=80, height=28,
             fg_color='#6f42c1', hover_color='#5a35a0',
             command=self.open_config_dir_ui,
         ).pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame2, text="关于", width=70,
+            btn_frame2, text="关于", width=60, height=28,
             fg_color='#495057', hover_color='#343a40',
             command=self.open_about,
         ).pack(side='left', padx=3)
 
+        # ===== 区域标签 =====
         self.region_label = ctk.CTkLabel(
-            self, text='', font=(FONT_NAME, 10), text_color='gray',
+            self, text='', font=(FONT_NAME, 9), text_color='gray',
         )
-        self.region_label.pack(pady=(0, 5))
+        self.region_label.pack(pady=(0, 3))
         self._update_region_label()
 
+        # ===== 设置面板 =====
         self.scroll_frame = ctk.CTkScrollableFrame(
             self, fg_color='transparent',
         )
-        self.scroll_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        self.scroll_frame.pack(fill='both', expand=True, padx=5, pady=3)
 
         self.display_panel = CollapsibleFrame(
             self.scroll_frame, title="显示设置", expanded=True,
         )
-        self.display_panel.pack(fill='x', padx=5, pady=(5, 3))
+        self.display_panel.pack(fill='x', padx=5, pady=(3, 2))
         self._build_display_tab(self.display_panel.content)
 
         self.hotkey_panel = CollapsibleFrame(
             self.scroll_frame, title="热键设置", expanded=False,
         )
-        self.hotkey_panel.pack(fill='x', padx=5, pady=3)
+        self.hotkey_panel.pack(fill='x', padx=5, pady=2)
         self._build_hotkey_tab(self.hotkey_panel.content)
 
+        # ===== 底部状态 =====
         self.bottom_label = ctk.CTkLabel(
             self, text="准备就绪", font=(FONT_NAME, 10), text_color='gray',
         )
-        self.bottom_label.pack(side='bottom', pady=5)
+        self.bottom_label.pack(side='bottom', pady=4)
 
         self._refresh_hotkey_hint()
         self._sync_strategy_ui()
@@ -729,7 +763,7 @@ class TranslatorApp(ctk.CTk):
         # ===== 性能模式 =====
         ctk.CTkLabel(
             parent, text="性能模式：", font=(FONT_NAME, 11, 'bold'),
-        ).grid(row=0, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+        ).grid(row=0, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
 
         self.mode_selector = ctk.CTkSegmentedButton(
             parent,
@@ -740,7 +774,7 @@ class TranslatorApp(ctk.CTk):
         self.mode_selector.set(PERFORMANCE_MODES[DEFAULT_MODE]['name'])
         self.mode_selector.grid(
             row=0, column=1, columnspan=2,
-            sticky='ew', padx=10, pady=(15, 8),
+            sticky='ew', padx=10, pady=(12, 6),
         )
 
         self.mode_desc_label = ctk.CTkLabel(
@@ -750,7 +784,7 @@ class TranslatorApp(ctk.CTk):
         )
         self.mode_desc_label.grid(
             row=1, column=0, columnspan=3,
-            sticky='w', padx=(15, 15), pady=(0, 10),
+            sticky='w', padx=(15, 15), pady=(0, 8),
         )
         self._update_mode_desc(DEFAULT_MODE)
 
@@ -759,7 +793,7 @@ class TranslatorApp(ctk.CTk):
             parent, text="加速方式（运行时切换）：",
             font=(FONT_NAME, 11, 'bold'),
         ).grid(row=2, column=0, columnspan=3,
-               sticky='w', padx=(15, 5), pady=(8, 4))
+               sticky='w', padx=(15, 5), pady=(6, 4))
 
         self.ort_variant_label = ctk.CTkLabel(
             parent, text="当前引擎：检测中...",
@@ -768,17 +802,17 @@ class TranslatorApp(ctk.CTk):
         )
         self.ort_variant_label.grid(
             row=3, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 6))
+            sticky='w', padx=(25, 15), pady=(0, 4))
 
-        accel_btns = ctk.CTkFrame(parent, fg_color='transparent')
+        accel_btns = ctk.CTkFrame(parent, fg_color='transparent', height=1)
         accel_btns.grid(
             row=4, column=0, columnspan=3,
-            sticky='ew', padx=(15, 15), pady=(0, 6))
+            sticky='ew', padx=(15, 15), pady=(0, 4))
+        accel_btns.pack_propagate(True)
 
         self.btn_cpu_multi = ctk.CTkButton(
-            accel_btns,
-            text=f"多线程 CPU\n({MULTITHREAD_OCR_POOL_SIZE} 引擎)",
-            width=140, height=50,
+            accel_btns, text="多线程 CPU",
+            width=140, height=48,
             font=(FONT_NAME, 10),
             fg_color='#6c757d', hover_color='#5a6268',
             command=lambda: self.switch_accel_mode('cpu_multi'),
@@ -786,8 +820,8 @@ class TranslatorApp(ctk.CTk):
         self.btn_cpu_multi.pack(side='left', padx=3)
 
         self.btn_directml = ctk.CTkButton(
-            accel_btns, text="DirectML GPU",
-            width=140, height=50,
+            accel_btns, text="DirectML GPU\n(单引擎)",
+            width=140, height=48,
             font=(FONT_NAME, 10),
             fg_color='#3a86ff', hover_color='#2a6fd8',
             command=lambda: self.switch_accel_mode('directml'),
@@ -796,76 +830,49 @@ class TranslatorApp(ctk.CTk):
 
         self.btn_cuda = ctk.CTkButton(
             accel_btns, text="NVIDIA CUDA\n(单引擎)",
-            width=140, height=50,
+            width=140, height=48,
             font=(FONT_NAME, 10),
             fg_color='#28a745', hover_color='#1e7e34',
             command=lambda: self.switch_accel_mode('cuda'),
         )
         self.btn_cuda.pack(side='left', padx=3)
 
-        # ===== GPU 引擎分配 =====
-        gpu_box = ctk.CTkFrame(parent, fg_color='transparent')
-        gpu_box.grid(
+        # ===== CPU 引擎数 =====
+        cpu_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
+        cpu_row.grid(
             row=5, column=0, columnspan=3,
-            sticky='ew', padx=(25, 15), pady=(4, 6))
+            sticky='ew', padx=(25, 15), pady=(6, 4))
+        cpu_row.pack_propagate(True)
 
         ctk.CTkLabel(
-            gpu_box, text="GPU 引擎分配（每块独立）：",
-            font=(FONT_NAME, 9), text_color='#444444', anchor='w',
-        ).pack(anchor='w')
+            cpu_row, text="CPU 引擎数：",
+            font=(FONT_NAME, 10), text_color='#333333', anchor='w',
+        ).pack(side='left')
 
-        if not self.gpu_devices:
-            ctk.CTkLabel(
-                gpu_box, text="（未检测到 GPU 设备）",
-                font=(FONT_NAME, 9), text_color='#999999',
-            ).pack(anchor='w', pady=2)
-        else:
-            for device_id, name, vram in self.gpu_devices:
-                row = ctk.CTkFrame(gpu_box, fg_color='transparent')
-                row.pack(fill='x', pady=2)
+        self.cpu_count_label = ctk.CTkLabel(
+            cpu_row, text=str(CPU_ENGINE_COUNT_DEFAULT), width=26,
+            font=(FONT_NAME, 10, 'bold'), text_color='#3a86ff',
+        )
+        self.cpu_count_label.pack(side='right')
 
-                label_text = name
-                if len(label_text) > 42:
-                    label_text = label_text[:39] + "..."
-                if vram > 0:
-                    label_text += f"（{vram}MB）"
+        self.cpu_count_slider = ctk.CTkSlider(
+            cpu_row,
+            from_=CPU_ENGINE_COUNT_MIN,
+            to=CPU_ENGINE_COUNT_MAX,
+            number_of_steps=CPU_ENGINE_COUNT_MAX - CPU_ENGINE_COUNT_MIN,
+            command=self._on_cpu_count_change,
+            height=14, width=160,
+        )
+        self.cpu_count_slider.set(CPU_ENGINE_COUNT_DEFAULT)
+        self.cpu_count_slider.pack(side='right', padx=4)
 
-                ctk.CTkLabel(
-                    row, text=f"[{device_id}] {label_text}",
-                    font=(FONT_NAME, 9), text_color='#333333',
-                    anchor='w', width=280,
-                ).pack(side='left')
-
-                val_lbl = ctk.CTkLabel(
-                    row, text="0", width=20,
-                    font=(FONT_NAME, 10, 'bold'),
-                    text_color='#3a86ff',
-                )
-                val_lbl.pack(side='right')
-
-                slider = ctk.CTkSlider(
-                    row,
-                    from_=DIRECTML_ENGINE_COUNT_MIN,
-                    to=DIRECTML_ENGINE_COUNT_MAX,
-                    number_of_steps=(
-                        DIRECTML_ENGINE_COUNT_MAX -
-                        DIRECTML_ENGINE_COUNT_MIN),
-                    command=lambda v, d=device_id:
-                        self._on_gpu_engine_change(d, v),
-                    height=14, width=140,
-                )
-                if device_id < len(self.gpu_engine_counts):
-                    slider.set(self.gpu_engine_counts[device_id])
-                    val_lbl.configure(
-                        text=str(self.gpu_engine_counts[device_id]))
-                else:
-                    slider.set(DIRECTML_ENGINE_COUNT_DEFAULT)
-                    val_lbl.configure(
-                        text=str(DIRECTML_ENGINE_COUNT_DEFAULT))
-                slider.pack(side='right', padx=(4, 6))
-
-                self.gpu_engine_sliders[device_id] = slider
-                self.gpu_engine_labels[device_id] = val_lbl
+        ctk.CTkLabel(
+            parent,
+            text="💡 CPU 引擎数仅在「多线程 CPU」模式生效；"
+                 "DirectML / CUDA 固定单引擎",
+            font=(FONT_NAME, 9), text_color='#888888', anchor='w',
+        ).grid(row=6, column=0, columnspan=3,
+               sticky='w', padx=(25, 15), pady=(0, 6))
 
         # ===== 加速状态 =====
         self.accel_status_label = ctk.CTkLabel(
@@ -875,13 +882,13 @@ class TranslatorApp(ctk.CTk):
             wraplength=600,
         )
         self.accel_status_label.grid(
-            row=6, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 10))
+            row=7, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 8))
 
         # ===== 优化功能 =====
         ctk.CTkLabel(
             parent, text="优化功能：", font=(FONT_NAME, 11, 'bold'),
-        ).grid(row=7, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
+        ).grid(row=8, column=0, sticky='w', padx=(15, 5), pady=(6, 4))
 
         self.frame_diff_switch = ctk.CTkSwitch(
             parent, text="帧差检测（静止时跳过）",
@@ -892,8 +899,8 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_FRAME_DIFF:
             self.frame_diff_switch.select()
         self.frame_diff_switch.grid(
-            row=8, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4))
+            row=9, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.block_ocr_switch = ctk.CTkSwitch(
             parent, text="分块 OCR（只识别变化的区域）",
@@ -904,8 +911,8 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_BLOCK_OCR:
             self.block_ocr_switch.select()
         self.block_ocr_switch.grid(
-            row=9, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4))
+            row=10, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.filter_switch = ctk.CTkSwitch(
             parent, text="文字过滤（过滤异常框）",
@@ -916,8 +923,8 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_FILTER:
             self.filter_switch.select()
         self.filter_switch.grid(
-            row=10, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4))
+            row=11, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.general_filter_switch = ctk.CTkSwitch(
             parent, text="通用过滤（艺术字/数字/单位）",
@@ -928,8 +935,8 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_GENERAL_FILTER:
             self.general_filter_switch.select()
         self.general_filter_switch.grid(
-            row=11, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4))
+            row=12, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.fast_lookup_switch = ctk.CTkSwitch(
             parent, text="快速响应层（本地词典 + 短语缓存，只处理单词和词组）",
@@ -940,14 +947,15 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_FAST_LOOKUP:
             self.fast_lookup_switch.select()
         self.fast_lookup_switch.grid(
-            row=12, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4))
+            row=13, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
 
         # 短语表按钮
-        phrase_btns = ctk.CTkFrame(parent, fg_color='transparent')
+        phrase_btns = ctk.CTkFrame(parent, fg_color='transparent', height=1)
         phrase_btns.grid(
-            row=13, column=0, columnspan=3,
-            sticky='ew', padx=(45, 15), pady=(0, 8))
+            row=14, column=0, columnspan=3,
+            sticky='ew', padx=(45, 15), pady=(0, 6))
+        phrase_btns.pack_propagate(True)
 
         ctk.CTkButton(
             phrase_btns, text="选择短语表", width=110, height=26,
@@ -979,12 +987,13 @@ class TranslatorApp(ctk.CTk):
         # 本地词典
         ctk.CTkLabel(
             parent, text="本地词典：", font=(FONT_NAME, 11, 'bold'),
-        ).grid(row=14, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
+        ).grid(row=15, column=0, sticky='w', padx=(15, 5), pady=(6, 4))
 
-        dict_btns = ctk.CTkFrame(parent, fg_color='transparent')
+        dict_btns = ctk.CTkFrame(parent, fg_color='transparent', height=1)
         dict_btns.grid(
-            row=15, column=0, columnspan=3,
-            sticky='ew', padx=(25, 15), pady=(0, 8))
+            row=16, column=0, columnspan=3,
+            sticky='ew', padx=(25, 15), pady=(0, 6))
+        dict_btns.pack_propagate(True)
 
         ctk.CTkButton(
             dict_btns, text="选择词典", width=100, height=26,
@@ -1023,8 +1032,8 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_ASYNC_TRANSLATE:
             self.async_translate_switch.select()
         self.async_translate_switch.grid(
-            row=16, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 4))
+            row=17, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
 
         # 窗口池
         self.window_pool_switch = ctk.CTkSwitch(
@@ -1036,20 +1045,20 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_WINDOW_POOL:
             self.window_pool_switch.select()
         self.window_pool_switch.grid(
-            row=17, column=0, columnspan=3,
-            sticky='w', padx=(25, 15), pady=(0, 10))
+            row=18, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 8))
 
         # 刷新间隔
         ctk.CTkLabel(
             parent, text="刷新间隔 (秒)：", font=(FONT_NAME, 11),
-        ).grid(row=18, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=19, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.scan_value_label = ctk.CTkLabel(
             parent,
             text=f"{PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval']:.2f} s",
             width=60, font=(FONT_NAME, 11),
         )
-        self.scan_value_label.grid(row=18, column=2, sticky='e', padx=(5, 15))
+        self.scan_value_label.grid(row=19, column=2, sticky='e', padx=(5, 15))
 
         n_steps = int((SCAN_MAX - SCAN_MIN) / 0.05)
         self.scan_slider = ctk.CTkSlider(
@@ -1058,18 +1067,18 @@ class TranslatorApp(ctk.CTk):
             command=self._on_scan_change,
         )
         self.scan_slider.set(PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval'])
-        self.scan_slider.grid(row=18, column=1, sticky='ew', padx=10)
+        self.scan_slider.grid(row=19, column=1, sticky='ew', padx=10)
 
         # 文字大小
         ctk.CTkLabel(
             parent, text="文字大小：", font=(FONT_NAME, 11),
-        ).grid(row=19, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=20, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.font_value_label = ctk.CTkLabel(
             parent, text=str(INITIAL_FONT_SIZE), width=60,
             font=(FONT_NAME, 11),
         )
-        self.font_value_label.grid(row=19, column=2, sticky='e', padx=(5, 15))
+        self.font_value_label.grid(row=20, column=2, sticky='e', padx=(5, 15))
 
         self.font_slider = ctk.CTkSlider(
             parent, from_=FONT_MIN, to=FONT_MAX,
@@ -1077,12 +1086,12 @@ class TranslatorApp(ctk.CTk):
             command=self._on_font_change,
         )
         self.font_slider.set(INITIAL_FONT_SIZE)
-        self.font_slider.grid(row=19, column=1, sticky='ew', padx=10)
+        self.font_slider.grid(row=20, column=1, sticky='ew', padx=10)
 
         # 译文颜色
         ctk.CTkLabel(
             parent, text="译文颜色：", font=(FONT_NAME, 11),
-        ).grid(row=20, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=21, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.fg_color_selector = ctk.CTkOptionMenu(
             parent,
@@ -1093,13 +1102,13 @@ class TranslatorApp(ctk.CTk):
         )
         self.fg_color_selector.set(FG_COLOR_PRESETS[DEFAULT_FG_COLOR])
         self.fg_color_selector.grid(
-            row=20, column=1, columnspan=2,
-            sticky='w', padx=10, pady=8)
+            row=21, column=1, columnspan=2,
+            sticky='w', padx=10, pady=6)
 
         # 图像修复
         ctk.CTkLabel(
             parent, text="图像修复（整框）：", font=(FONT_NAME, 11),
-        ).grid(row=21, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+        ).grid(row=22, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
 
         self.inpaint_switch = ctk.CTkSwitch(
             parent, text="",
@@ -1108,7 +1117,7 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_USE_INPAINTING and CV2_AVAILABLE:
             self.inpaint_switch.select()
-        self.inpaint_switch.grid(row=21, column=1, sticky='w', padx=10)
+        self.inpaint_switch.grid(row=22, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.inpaint_switch.configure(state='disabled')
@@ -1117,7 +1126,7 @@ class TranslatorApp(ctk.CTk):
         ctk.CTkLabel(
             parent, text="精细文字替换（保留背景）：",
             font=(FONT_NAME, 11),
-        ).grid(row=22, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
+        ).grid(row=23, column=0, sticky='w', padx=(15, 5), pady=(8, 6))
 
         self.fine_text_switch = ctk.CTkSwitch(
             parent, text="",
@@ -1126,7 +1135,7 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_ENABLE_FINE_TEXT and CV2_AVAILABLE:
             self.fine_text_switch.select()
-        self.fine_text_switch.grid(row=22, column=1, sticky='w', padx=10)
+        self.fine_text_switch.grid(row=23, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.fine_text_switch.configure(state='disabled')
@@ -1135,7 +1144,7 @@ class TranslatorApp(ctk.CTk):
         ctk.CTkLabel(
             parent, text="异步覆盖（逐字显示）：",
             font=(FONT_NAME, 11),
-        ).grid(row=23, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
+        ).grid(row=24, column=0, sticky='w', padx=(15, 5), pady=(8, 6))
 
         self.async_overlay_switch = ctk.CTkSwitch(
             parent, text="",
@@ -1144,12 +1153,12 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_ENABLE_ASYNC_OVERLAY:
             self.async_overlay_switch.select()
-        self.async_overlay_switch.grid(row=23, column=1, sticky='w', padx=10)
+        self.async_overlay_switch.grid(row=24, column=1, sticky='w', padx=10)
 
         # 自动清理
         ctk.CTkLabel(
             parent, text="自动清理缓存：", font=(FONT_NAME, 11),
-        ).grid(row=24, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+        ).grid(row=25, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
 
         self.auto_clean_switch = ctk.CTkSwitch(
             parent, text="",
@@ -1157,18 +1166,18 @@ class TranslatorApp(ctk.CTk):
             onvalue=True, offvalue=False,
         )
         self.auto_clean_switch.select()
-        self.auto_clean_switch.grid(row=24, column=1, sticky='w', padx=10)
+        self.auto_clean_switch.grid(row=25, column=1, sticky='w', padx=10)
 
         # 缓存上限
         ctk.CTkLabel(
             parent, text="缓存上限：", font=(FONT_NAME, 11),
-        ).grid(row=25, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=26, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.cache_limit_label = ctk.CTkLabel(
             parent, text=str(CACHE_DEFAULT), width=60,
             font=(FONT_NAME, 11),
         )
-        self.cache_limit_label.grid(row=25, column=2, sticky='e', padx=(5, 15))
+        self.cache_limit_label.grid(row=26, column=2, sticky='e', padx=(5, 15))
 
         self.cache_limit_slider = ctk.CTkSlider(
             parent, from_=CACHE_MIN, to=CACHE_MAX,
@@ -1176,11 +1185,12 @@ class TranslatorApp(ctk.CTk):
             command=self._on_cache_limit_change,
         )
         self.cache_limit_slider.set(CACHE_DEFAULT)
-        self.cache_limit_slider.grid(row=25, column=1, sticky='ew', padx=10)
+        self.cache_limit_slider.grid(row=26, column=1, sticky='ew', padx=10)
 
-        cache_row = ctk.CTkFrame(parent, fg_color='transparent')
-        cache_row.grid(row=26, column=0, columnspan=3,
-                       sticky='ew', padx=(15, 15), pady=(5, 15))
+        cache_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
+        cache_row.grid(row=27, column=0, columnspan=3,
+                       sticky='ew', padx=(15, 15), pady=(4, 12))
+        cache_row.pack_propagate(True)
 
         self.cache_size_label = ctk.CTkLabel(
             cache_row, text="缓存条目：0",
@@ -1203,25 +1213,54 @@ class TranslatorApp(ctk.CTk):
         for i, (key, label) in enumerate(HOTKEY_LABELS.items()):
             ctk.CTkLabel(
                 parent, text=f"{label}：", font=(FONT_NAME, 11),
-            ).grid(row=i, column=0, sticky='w', padx=(15, 5), pady=8)
+            ).grid(row=i, column=0, sticky='w', padx=(15, 5), pady=6)
 
             entry = ctk.CTkEntry(parent, width=180)
             entry.insert(0, self.hotkeys[key])
-            entry.grid(row=i, column=1, sticky='w', padx=5, pady=8)
+            entry.grid(row=i, column=1, sticky='w', padx=5, pady=6)
             self.hotkey_entries[key] = entry
 
             ctk.CTkButton(
                 parent, text="捕获", width=70,
                 command=lambda k=key: self._capture_hotkey(k),
-            ).grid(row=i, column=2, sticky='w', padx=5, pady=8)
+            ).grid(row=i, column=2, sticky='w', padx=5, pady=6)
 
         ctk.CTkButton(
             parent, text="应用所有热键", width=140,
             command=self._apply_hotkeys,
         ).grid(row=len(HOTKEY_LABELS), column=0, columnspan=3,
-               pady=(15, 10))
+               pady=(12, 8))
 
         parent.grid_columnconfigure(1, weight=1)
+
+    # ================= CPU 引擎数 =================
+
+    def _on_cpu_count_change(self, value):
+        v = int(round(float(value)))
+        v = max(CPU_ENGINE_COUNT_MIN, min(CPU_ENGINE_COUNT_MAX, v))
+        self.cpu_count_label.configure(text=str(v))
+
+        if not getattr(self, '_ui_ready', False):
+            return
+
+        if v == self.cpu_engine_count:
+            return
+
+        self.cpu_engine_count = v
+        self.user_cfg.set('cpu_engine_count', v)
+        self.user_cfg.save()
+
+        # 当前是 CPU 模式 → 立即重载
+        if self.ocr_engine.mode == 'cpu_multi':
+            self.bottom_label.configure(
+                text=f"CPU 引擎数改为 {v}，正在重新加载...")
+            self.after(
+                200,
+                lambda: self.switch_accel_mode('cpu_multi', force=True),
+            )
+        else:
+            self.bottom_label.configure(
+                text=f"CPU 引擎数设为 {v}（切到 CPU 模式时生效）")
 
     # ================= 翻译策略 =================
 
@@ -1230,12 +1269,34 @@ class TranslatorApp(ctk.CTk):
             label, DEFAULT_TRANSLATION_STRATEGY)
         self.app_state.translation_strategy = key
         self._sync_strategy_ui()
+        self._update_sub_params()
 
         self.user_cfg.set('translation_strategy', key)
         self.user_cfg.save()
 
-        log.info(f"[翻译策略] 切换为 {key}")
-        self.bottom_label.configure(text=f"翻译策略：{label}")
+        try:
+            from translation import load_strategy, save_strategy
+            cfg = load_strategy()
+            cfg['mode'] = key
+            save_strategy(cfg)
+            self.translator.reload_config()
+            log.info(f"[翻译策略] 已同步到 manager：mode={key}")
+        except Exception as e:
+            log.exception(f"[翻译策略] 同步失败：{e}")
+
+        self.overlay.clear()
+        try:
+            self.caption_window.clear()
+        except Exception:
+            pass
+        self.app_state.reset_signature()
+
+        try:
+            status = self.translator._manager.get_status_text()
+        except Exception:
+            status = label
+        log.info(f"[翻译策略] 切换为 {key} | {status}")
+        self.bottom_label.configure(text=f"翻译策略：{label} | {status}")
 
     def _sync_strategy_ui(self):
         key = getattr(self.app_state, 'translation_strategy',
@@ -1251,6 +1312,87 @@ class TranslatorApp(ctk.CTk):
         except Exception:
             pass
 
+        try:
+            self._sync_subparams_from_cfg()
+        except Exception:
+            pass
+        try:
+            self._update_sub_params()
+        except Exception:
+            pass
+
+    def _update_sub_params(self):
+        mode = getattr(self.app_state, 'translation_strategy',
+                       DEFAULT_TRANSLATION_STRATEGY)
+        for w in (self.hybrid_order_label, self.hybrid_order_selector,
+                  self.vote_count_label, self.vote_count_selector,
+                  self.vote_strategy_label, self.vote_strategy_selector):
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+
+        if mode == 'hybrid':
+            self.hybrid_order_label.pack(side='left', padx=(30, 4))
+            self.hybrid_order_selector.pack(side='left', padx=2)
+        elif mode == 'multi_ai_vote':
+            self.vote_count_label.pack(side='left', padx=(30, 4))
+            self.vote_count_selector.pack(side='left', padx=2)
+            self.vote_strategy_label.pack(side='left', padx=(12, 4))
+            self.vote_strategy_selector.pack(side='left', padx=2)
+
+    def _sync_subparams_from_cfg(self):
+        from translation import load_strategy
+        cfg = load_strategy()
+        order = cfg.get('hybrid_order', 'translate_first')
+        try:
+            self.hybrid_order_selector.set(
+                HYBRID_ORDER_LABELS.get(order, '翻译优先'))
+        except Exception:
+            pass
+        try:
+            self.vote_count_selector.set(str(cfg.get('vote_count', 3)))
+        except Exception:
+            self.vote_count_selector.set('3')
+        vs = cfg.get('vote_strategy', 'similarity')
+        try:
+            self.vote_strategy_selector.set(
+                VOTE_STRATEGY_LABELS.get(vs, '相似度居中'))
+        except Exception:
+            pass
+
+    def _save_strategy_subparams(self):
+        try:
+            from translation import load_strategy, save_strategy
+            cfg = load_strategy()
+            cfg['mode'] = getattr(self.app_state, 'translation_strategy',
+                                  'single_translate')
+            cfg['hybrid_order'] = self._hybrid_order_rev.get(
+                self.hybrid_order_selector.get(), 'translate_first')
+            try:
+                cfg['vote_count'] = int(self.vote_count_selector.get())
+            except Exception:
+                cfg['vote_count'] = 3
+            cfg['vote_strategy'] = self._vote_strategy_rev.get(
+                self.vote_strategy_selector.get(), 'similarity')
+            save_strategy(cfg)
+            self.translator.reload_config()
+            log.info(f"[策略子参数] 已保存：{cfg}")
+        except Exception as e:
+            log.exception(f"[策略子参数] 保存失败：{e}")
+
+    def _on_hybrid_order_change(self, label):
+        self._save_strategy_subparams()
+        self.bottom_label.configure(text=f"混合顺序：{label}")
+
+    def _on_vote_count_change(self, label):
+        self._save_strategy_subparams()
+        self.bottom_label.configure(text=f"投票数：{label}")
+
+    def _on_vote_strategy_change(self, label):
+        self._save_strategy_subparams()
+        self.bottom_label.configure(text=f"投票策略：{label}")
+
     # ================= 显示模式 =================
 
     def _on_display_mode_change(self, label):
@@ -1262,8 +1404,6 @@ class TranslatorApp(ctk.CTk):
         self.user_cfg.set('display_mode', key)
         self.user_cfg.save()
 
-        # 覆盖/双语 → 清空浮动译文
-        # 小窗口   → 清空贴屏译文 + 显示浮窗
         self.overlay.clear()
         if key == 'window':
             self.caption_window.show()
@@ -1288,7 +1428,6 @@ class TranslatorApp(ctk.CTk):
             pass
 
     def _on_caption_closed(self):
-        """用户手动关闭小窗口 → 切回覆盖模式"""
         if self.app_state.display_mode != 'window':
             return
         self.app_state.display_mode = 'overlay'
@@ -1298,7 +1437,7 @@ class TranslatorApp(ctk.CTk):
         self.bottom_label.configure(
             text="小窗口已关闭，显示模式切回覆盖")
 
-    # ================= 译文颜色（全模式） =================
+    # ================= 译文颜色 =================
 
     def _on_fg_color_change(self, label):
         key = self._fg_label_to_key.get(label, DEFAULT_FG_COLOR)
@@ -1637,18 +1776,15 @@ class TranslatorApp(ctk.CTk):
             text=f"⏳ 正在切换到 {mode}...", text_color='#666666')
         self.bottom_label.configure(text=f"切换到 {mode}...")
         self.update_idletasks()
-        log.info(f"[加速] 切换：{self.ocr_engine.mode} → {mode}"
-                 f"（GPU 引擎分配：{self.gpu_engine_counts}）")
+        log.info(f"[加速] 切换：{self.ocr_engine.mode} → {mode}")
 
         try:
             actual = self.ocr_engine.init(
                 mode=mode,
-                pool_size=MULTITHREAD_OCR_POOL_SIZE,
-                gpu_engine_counts=self.gpu_engine_counts,
+                pool_size=self.cpu_engine_count,
             )
             log.info(f"[加速] 切换完成：{actual} "
-                     f"× {len(self.ocr_engine.engines)}"
-                     f" devices={self.ocr_engine.engine_device_ids}")
+                     f"× {len(self.ocr_engine.engines)}")
 
             self.cache.clear()
             if hasattr(self.pipeline, 'inpaint_cache'):
@@ -1691,8 +1827,8 @@ class TranslatorApp(ctk.CTk):
 
             mode_map = {
                 'cpu_multi': f'多线程 CPU（{n_engines} 引擎）',
-                'directml': f'DirectML GPU（{n_engines} 引擎）',
-                'cuda': 'NVIDIA CUDA',
+                'directml': 'DirectML GPU（单引擎）',
+                'cuda': 'NVIDIA CUDA（单引擎）',
             }
             self.ort_variant_label.configure(
                 text=f"当前引擎：{mode_map.get(current_mode, current_mode)}")
@@ -1710,9 +1846,8 @@ class TranslatorApp(ctk.CTk):
             elif current_mode == 'directml':
                 ok, msg = check_directml_ready()
                 if ok:
-                    detail = self.ocr_engine.get_mode_text()
                     self.accel_status_label.configure(
-                        text=f"✅ DirectML 运行中：{detail}",
+                        text="✅ DirectML 运行中（单引擎）",
                         text_color='#00a000')
                 else:
                     self.accel_status_label.configure(
@@ -1748,55 +1883,6 @@ class TranslatorApp(ctk.CTk):
                     fg_color='#adb5bd', state='disabled')
         except Exception:
             pass
-
-    # ================= GPU 引擎数 =================
-
-    def _on_gpu_engine_change(self, device_id, value):
-        v = int(round(float(value)))
-        v = max(DIRECTML_ENGINE_COUNT_MIN,
-                min(DIRECTML_ENGINE_COUNT_MAX, v))
-
-        if device_id in self.gpu_engine_labels:
-            self.gpu_engine_labels[device_id].configure(text=str(v))
-
-        if not getattr(self, '_ui_ready', False):
-            return
-
-        while len(self.gpu_engine_counts) <= device_id:
-            self.gpu_engine_counts.append(0)
-        if self.gpu_engine_counts[device_id] == v:
-            return
-        self.gpu_engine_counts[device_id] = v
-
-        if sum(self.gpu_engine_counts) < 1:
-            self.gpu_engine_counts[device_id] = DIRECTML_ENGINE_COUNT_DEFAULT
-            if device_id in self.gpu_engine_sliders:
-                self.gpu_engine_sliders[device_id].set(
-                    DIRECTML_ENGINE_COUNT_DEFAULT)
-            if device_id in self.gpu_engine_labels:
-                self.gpu_engine_labels[device_id].configure(
-                    text=str(DIRECTML_ENGINE_COUNT_DEFAULT))
-            self.bottom_label.configure(
-                text="⚠️ 至少需要 1 个引擎")
-            return
-
-        self.user_cfg.set('gpu_engine_counts', list(self.gpu_engine_counts))
-        self.user_cfg.set('gpu_device_names',
-                          [d[1] for d in self.gpu_devices])
-        self.user_cfg.save()
-
-        if self.ocr_engine.mode == 'directml':
-            self.bottom_label.configure(
-                text=f"GPU 引擎分配已更新，正在重新加载...")
-            self.after(
-                300,
-                lambda: self.switch_accel_mode('directml', force=True),
-            )
-        else:
-            total = sum(self.gpu_engine_counts)
-            self.bottom_label.configure(
-                text=f"GPU 引擎分配：{self.gpu_engine_counts}"
-                     f"（共 {total} 引擎，切到 DirectML 时生效）")
 
     # ================= 性能模式 =================
 
@@ -1997,25 +2083,45 @@ class TranslatorApp(ctk.CTk):
             pass
 
     def open_api_config(self):
-        from api_setup_dialog import APISetupDialog
-        dlg = APISetupDialog()
-        dlg.mainloop()
-        if dlg.result:
-            self.translator.reload_config()
-            self.overlay.clear()
-            self.app_state.reset_signature()
+        try:
+            from api_setup_dialog import APISetupDialog
+            dlg = APISetupDialog()
+            dlg.mainloop()
+            result = dlg.result
+        except Exception as e:
+            log.exception(f"[API] 对话框异常：{e}")
+            return
+
+        if not result:
             try:
-                from translation import load_strategy
-                strategy_cfg = load_strategy()
-                mode = strategy_cfg.get('mode', 'single_translate')
-                self.app_state.translation_strategy = mode
-                self._sync_strategy_ui()
+                self.bottom_label.configure(text="API 配置未更改")
             except Exception:
                 pass
+            return
+
+        try:
+            self.translator.reload_config()
+        except Exception as e:
+            log.exception(f"[API] translator 重载失败：{e}")
+
+        try:
+            self.overlay.clear()
+        except Exception:
+            pass
+        try:
+            self.caption_window.clear()
+        except Exception:
+            pass
+        try:
+            self.app_state.reset_signature()
+        except Exception:
+            pass
+
+        try:
             self.bottom_label.configure(text="✅ API 配置已更新")
-            log.info("[API] 配置已更新")
-        else:
-            self.bottom_label.configure(text="API 配置未更改")
+        except Exception:
+            pass
+        log.info("[API] 配置已更新")
 
     # ================= 热键 =================
 
@@ -2143,7 +2249,6 @@ class TranslatorApp(ctk.CTk):
             if not is_follow:
                 self.app_state.scroll_boost = False
 
-            # 消费译文队列
             try:
                 while True:
                     msg = self.pipeline.result_queue.get_nowait()
@@ -2162,7 +2267,6 @@ class TranslatorApp(ctk.CTk):
             except queue.Empty:
                 pass
 
-            # 覆盖/双语模式：动画 + 边界裁剪
             if not is_pin and not is_window_mode:
                 try:
                     self.overlay.tick_animation()

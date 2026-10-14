@@ -74,12 +74,18 @@ DEFAULT_ENABLE_ASYNC_TRANSLATE = True
 DEFAULT_ENABLE_WINDOW_POOL = True
 DEFAULT_ENABLE_MULTITHREAD_OCR = False
 
-MULTITHREAD_OCR_POOL_SIZE = 2
+# CPU 多线程引擎数范围
+CPU_ENGINE_COUNT_MIN = 1
+CPU_ENGINE_COUNT_MAX = 8
+CPU_ENGINE_COUNT_DEFAULT = 2
 
-DIRECTML_ENGINE_COUNT_MIN = 0
-DIRECTML_ENGINE_COUNT_MAX = 4
-DIRECTML_ENGINE_COUNT_DEFAULT = 2
+# 兼容旧常量
+MULTITHREAD_OCR_POOL_SIZE = CPU_ENGINE_COUNT_DEFAULT
 
+# DirectML 引擎数（固定单引擎，多引擎会触发 onnxruntime 崩溃）
+DIRECTML_ENGINE_COUNT = 1
+
+# 精细文字替换
 DEFAULT_ENABLE_FINE_TEXT = False
 
 # ==================== GPU 加速 ====================
@@ -132,21 +138,21 @@ DEFAULT_LOCAL_DICT_PATH = ""
 
 # ==================== 翻译策略 ====================
 TRANSLATION_STRATEGIES = {
-    'local_only':         '离线',
-    'single_translate':   '单翻译 API',
-    'multi_translate_rr': '多翻译 API 轮询',
-    'hybrid':             '翻译 API + AI 混合',
-    'single_ai':          '单 AI 翻译',
-    'multi_ai_vote':      '多 AI 高精度投票',
+    'local_only':          '离线',
+    'single_translate':    '单翻译 API',
+    'multi_translate_rr':  '多翻译 API 轮询',
+    'hybrid':              '翻译 API + AI 混合',
+    'single_ai':           '单 AI 翻译',
+    'multi_ai_vote':       '多 AI 高精度投票',
 }
 
 TRANSLATION_STRATEGY_DESC = {
-    'local_only':         '纯离线：本地词典/短语未命中则跳过，不联网',
-    'single_translate':   '主翻译 API，失败自动尝试其他翻译 API',
-    'multi_translate_rr': '多个翻译 API 轮流使用，均衡负载',
-    'hybrid':             '翻译 API 与 AI 混合（顺序可在 API 设置里配置）',
-    'single_ai':          '主 AI 大语言模型翻译',
-    'multi_ai_vote':      '多个 AI 并发翻译，相似度/长度投票',
+    'local_only':          '纯离线：本地词典/短语未命中则跳过，不联网',
+    'single_translate':    '主翻译 API，失败自动尝试其他翻译 API',
+    'multi_translate_rr':  '多个翻译 API 轮流使用，均衡负载',
+    'hybrid':              '翻译 API 与 AI 混合（顺序可在 API 设置里配置）',
+    'single_ai':           '主 AI 大语言模型翻译',
+    'multi_ai_vote':       '多个 AI 并发翻译，相似度/长度投票',
 }
 
 DEFAULT_TRANSLATION_STRATEGY = 'single_translate'
@@ -171,7 +177,6 @@ DISPLAY_MODE_DESC = {
 
 DEFAULT_DISPLAY_MODE = 'overlay'
 
-# 双语模式下译文字号相对原文的缩放
 BILINGUAL_FONT_SCALE = 0.75
 BILINGUAL_PADDING = 4
 

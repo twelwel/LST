@@ -66,7 +66,34 @@ class OpenAICompatProvider(BaseProvider):
         "3. 专业术语保持准确"
     )
 
+    # ---------- 参数安全解析 ----------
+    @staticmethod
+    def _safe_float(v, default):
+        try:
+            if v is None or str(v).strip() == '':
+                return default
+            return float(v)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_int(v, default):
+        try:
+            if v is None or str(v).strip() == '':
+                return default
+            return int(v)
+        except (ValueError, TypeError):
+            return default
+
+    # ---------- 端点拼接 ----------
     def _endpoint(self):
+        """
+        base_url 兼容多种写法：
+        - https://api.deepseek.com         → /chat/completions
+        - https://api.deepseek.com/v1      → /v1/chat/completions
+        - https://api.deepseek.com/v1/     → /v1/chat/completions
+        - 已经带 /chat/completions 的完整路径 → 直接用
+        """
         base = (self.params.get('base_url') or '').strip().rstrip('/')
         if not base:
             return ''
@@ -74,6 +101,7 @@ class OpenAICompatProvider(BaseProvider):
             return base
         return base + '/chat/completions'
 
+    # ---------- 翻译 ----------
     def translate(self, text, from_lang='en', to_lang='zh'):
         t0 = time.time()
         url = self._endpoint()
@@ -95,24 +123,54 @@ class OpenAICompatProvider(BaseProvider):
                 {'role': 'system', 'content': system},
                 {'role': 'user', 'content': text},
             ],
-            'temperature': float(self.params.get('temperature', 0.2)),
+            'temperature': self._safe_float(
+                self.params.get('temperature'), 0.2),
             'stream': False,
         }
 
+        timeout = self._safe_int(self.params.get('timeout'), 30)
+
         try:
             r = requests.post(
-                url, json=body, headers=headers,
-                timeout=int(self.params.get('timeout', 30)))
-            data = r.json()
-            if 'error' in data:
-                return self._err(str(data['error'])[:200])
-            content = data['choices'][0]['message']['content'].strip()
-            return ProviderResult(
-                True, text=content, provider_id=self.id,
-                provider_name=self.name,
-                elapsed_ms=int((time.time() - t0) * 1000))
+                url, json=body, headers=headers, timeout=timeout)
+        except requests.exceptions.Timeout:
+            return self._err(f'请求超时（{timeout}s）')
+        except requests.exceptions.ConnectionError as e:
+            return self._err(f'连接失败：{str(e)[:150]}')
         except Exception as e:
-            return self._err(str(e)[:200])
+            return self._err(f'请求异常：{str(e)[:150]}')
+
+        # HTTP 状态检查
+        if r.status_code != 200:
+            snippet = ''
+            try:
+                snippet = r.text[:200]
+            except Exception:
+                pass
+            return self._err(f'HTTP {r.status_code}：{snippet}')
+
+        try:
+            data = r.json()
+        except Exception as e:
+            return self._err(f'响应解析失败：{str(e)[:150]}')
+
+        if 'error' in data:
+            err = data['error']
+            if isinstance(err, dict):
+                msg = err.get('message') or str(err)
+            else:
+                msg = str(err)
+            return self._err(msg[:200])
+
+        try:
+            content = data['choices'][0]['message']['content'].strip()
+        except (KeyError, IndexError, AttributeError) as e:
+            return self._err(f'响应结构异常：{str(e)[:150]}')
+
+        return ProviderResult(
+            True, text=content, provider_id=self.id,
+            provider_name=self.name,
+            elapsed_ms=int((time.time() - t0) * 1000))
 
     def _err(self, msg):
         return ProviderResult(False, error=msg,

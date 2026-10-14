@@ -335,7 +335,6 @@ def list_gpu_devices(force=False):
 
     devices = []
 
-    # 方式 1：PowerShell + CIM（不依赖第三方库）
     try:
         import json as _json
         cmd = [
@@ -362,7 +361,6 @@ def list_gpu_devices(force=False):
     except Exception as e:
         log.warning(f"[GPU] PowerShell 枚举失败：{e}")
 
-    # 方式 2：兜底 wmic
     if not devices:
         try:
             cmd = [
@@ -390,3 +388,92 @@ def list_gpu_devices(force=False):
 def clear_gpu_cache():
     global _gpu_cache
     _gpu_cache = None
+
+
+# ==================== 显存检测 ====================
+
+def query_gpu_vram():
+    """
+    查询所有 GPU 的显存情况
+    返回: [(device_index, total_mb, free_mb), ...]
+    - NVIDIA: nvidia-smi 精确查询
+    - 其他: 总显存 × 0.75 作为可用估计（无法精确查询实时占用）
+
+    如果查询失败，返回空列表 []，调用方应回退到保守策略
+    """
+    result = []
+
+    # ---------- 方式 1：NVIDIA nvidia-smi ----------
+    try:
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ]
+        out = subprocess.check_output(
+            cmd, text=True, timeout=5,
+            creationflags=_no_window_flag() if sys.platform == 'win32' else 0,
+        ).strip()
+
+        for i, line in enumerate(out.splitlines()):
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 2:
+                try:
+                    total_mb = int(parts[0])
+                    free_mb = int(parts[1])
+                    result.append((i, total_mb, free_mb))
+                    log.info(f"[显存] NVIDIA GPU {i}: "
+                             f"总 {total_mb}MB, 剩 {free_mb}MB")
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        log.info("[显存] nvidia-smi 不存在（非 NVIDIA 显卡）")
+    except Exception as e:
+        log.warning(f"[显存] nvidia-smi 查询失败：{e}")
+
+    # ---------- 方式 2：WMI 查询非 NVIDIA 显卡总显存 ----------
+    try:
+        import json as _json
+        cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Get-CimInstance Win32_VideoController | "
+            "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"
+        ]
+        out = subprocess.check_output(
+            cmd, text=True, timeout=8,
+            creationflags=_no_window_flag() if sys.platform == 'win32' else 0,
+        ).strip()
+        if out:
+            data = _json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            for i, gpu in enumerate(data):
+                if i < len(result):
+                    continue
+                vram = gpu.get("AdapterRAM")
+                try:
+                    total_mb = int(vram) // (1024 * 1024) if vram else 0
+                except Exception:
+                    total_mb = 0
+                if total_mb <= 0:
+                    total_mb = 2048
+                free_mb = int(total_mb * 0.75)
+                result.append((i, total_mb, free_mb))
+                log.info(f"[显存] GPU {i} ({gpu.get('Name', '?')}): "
+                         f"总 {total_mb}MB, 估计可用 {free_mb}MB")
+    except Exception as e:
+        log.warning(f"[显存] WMI 查询失败：{e}")
+
+    return result
+
+
+def estimate_max_engines_for_vram(free_mb, per_engine=350, reserve=800):
+    """
+    根据剩余显存估算单 GPU 能创建几个引擎
+    - 保留 reserve MB 给系统和显示器
+    - 每个引擎占 per_engine MB
+    """
+    usable = free_mb - reserve
+    if usable <= 0:
+        return 0
+    return max(0, usable // per_engine)
