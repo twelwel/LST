@@ -1,0 +1,29 @@
+cd D:\code\LST
+
+@'
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+
+# ---------- PyInstaller ----------
+build/
+dist/
+*.spec.bak
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+
+# ---------- 用户数据 ----------
+*.log
+.screen_translator/
+'@ | Out-File -Encoding utf8 .gitignore
