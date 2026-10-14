@@ -40,7 +40,7 @@ PERFORMANCE_MODES = {
         'bbox_padding': 80,
         'max_ocr_width': 1600,
         'max_ocr_height': 700,
-        'fast_mode': True,          # 分段翻译 + 事件驱动
+        'fast_mode': True,
     },
     'medium': {
         'name': '中',
@@ -74,8 +74,13 @@ DEFAULT_ENABLE_ASYNC_TRANSLATE = True
 DEFAULT_ENABLE_WINDOW_POOL = True
 DEFAULT_ENABLE_MULTITHREAD_OCR = False
 
-# 多线程 OCR
+# 多线程 OCR（CPU 模式引擎数）
 MULTITHREAD_OCR_POOL_SIZE = 2
+
+# DirectML 每块 GPU 的引擎数范围
+DIRECTML_ENGINE_COUNT_MIN = 0
+DIRECTML_ENGINE_COUNT_MAX = 4
+DIRECTML_ENGINE_COUNT_DEFAULT = 2
 
 # 精细文字替换
 DEFAULT_ENABLE_FINE_TEXT = False
@@ -120,13 +125,13 @@ POSITION_QUANTIZE = 10
 
 DEFAULT_USE_INPAINTING = False
 
-DEFAULT_ENABLE_ASYNC_OVERLAY = False   # 异步覆盖（逐字显示）
+DEFAULT_ENABLE_ASYNC_OVERLAY = False
 
-DEFAULT_ENABLE_GENERAL_FILTER = True   # 通用过滤（艺术字/数字/单位等）
+DEFAULT_ENABLE_GENERAL_FILTER = True
 
-DEFAULT_ENABLE_PHRASE_CACHE = True    # 短语缓存池
+DEFAULT_ENABLE_PHRASE_CACHE = True
 
-DEFAULT_PHRASE_TABLE_PATH = ""       # 外部短语表路径（用户指定）
+DEFAULT_PHRASE_TABLE_PATH = ""
 
-DEFAULT_TRANSLATION_MODE = "hybrid"     # 'local' / 'hybrid' / 'online'
-DEFAULT_LOCAL_DICT_PATH = ""            # 本地词典路径
+DEFAULT_TRANSLATION_MODE = "hybrid"
+DEFAULT_LOCAL_DICT_PATH = ""

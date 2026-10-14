@@ -31,6 +31,9 @@ from config import (
     DEFAULT_ENABLE_BLOCK_OCR,
     DEFAULT_ENABLE_ASYNC_TRANSLATE, DEFAULT_ENABLE_WINDOW_POOL,
     MULTITHREAD_OCR_POOL_SIZE,
+    DIRECTML_ENGINE_COUNT_MIN,
+    DIRECTML_ENGINE_COUNT_MAX,
+    DIRECTML_ENGINE_COUNT_DEFAULT,
 )
 from ocr_engine import OCREngine
 from cache import ParagraphCache
@@ -46,7 +49,7 @@ from config_manager import get_config, open_config_dir, get_config_path
 from version import get_window_title, __version__, APP_NAME
 from cuda_setup import (
     check_onnxruntime_variant, check_cuda_ready, check_directml_ready,
-    is_frozen,
+    is_frozen, list_gpu_devices,
 )
 
 
@@ -105,6 +108,8 @@ class TranslatorApp(ctk.CTk):
         super().__init__()
         self.title(get_window_title())
 
+        self._ui_ready = False
+
         # ============ 配置 ============
         self.user_cfg = get_config()
         log.info(f"配置文件：{get_config_path()}")
@@ -158,6 +163,12 @@ class TranslatorApp(ctk.CTk):
         if saved_follow_mode not in ('default', 'follow', 'pin'):
             saved_follow_mode = 'follow'
 
+        # ===== GPU 枚举 & 引擎分配 =====
+        self.gpu_devices = list_gpu_devices()
+        saved_counts = self.user_cfg.get('gpu_engine_counts', []) or []
+        self.gpu_engine_counts = self._merge_gpu_counts(
+            self.gpu_devices, saved_counts)
+
         log.info(f"========== 启动 v{__version__} ==========")
         if is_frozen():
             log.info("[启动] 打包模式（exe）")
@@ -186,8 +197,10 @@ class TranslatorApp(ctk.CTk):
         variant = self.ocr_engine.init(
             mode=init_mode,
             pool_size=MULTITHREAD_OCR_POOL_SIZE,
+            gpu_engine_counts=self.gpu_engine_counts,
         )
-        log.info(f"OCR 引擎初始化：{variant} × {len(self.ocr_engine.engines)}")
+        log.info(f"OCR 引擎初始化：{variant} × {len(self.ocr_engine.engines)}"
+                 f" devices={self.ocr_engine.engine_device_ids}")
 
         self.cache = ParagraphCache(
             min_overlap=REUSE_MIN_OVERLAP,
@@ -225,7 +238,6 @@ class TranslatorApp(ctk.CTk):
         )
         self.pipeline.start()
 
-        # 应用用户指定的短语表路径
         try:
             self.pipeline.phrase_cache.set_external_path(
                 saved_phrase_table_path)
@@ -260,6 +272,10 @@ class TranslatorApp(ctk.CTk):
         self._border_visible = True
         self._current_mode = saved_mode
 
+        # ===== GPU 引擎 UI 引用 =====
+        self.gpu_engine_sliders = {}
+        self.gpu_engine_labels = {}
+
         # UI
         self._build_ui()
 
@@ -274,7 +290,44 @@ class TranslatorApp(ctk.CTk):
             saved_frame_diff, saved_block, saved_filter, saved_async,
             saved_wpool, saved_cache_max, saved_auto_clean,
         )
+
+        self._ui_ready = True
         self.after(TICK_MS, self._tick)
+
+    # ================= GPU 引擎数合并 =================
+
+    @staticmethod
+    def _merge_gpu_counts(devices, saved):
+        n = len(devices)
+        if n <= 0:
+            return [DIRECTML_ENGINE_COUNT_DEFAULT]
+
+        result = [DIRECTML_ENGINE_COUNT_DEFAULT] * n
+
+        if isinstance(saved, dict):
+            for i in range(n):
+                if i in saved:
+                    try:
+                        result[i] = int(saved[i])
+                    except Exception:
+                        pass
+        elif isinstance(saved, (list, tuple)):
+            for i in range(min(n, len(saved))):
+                try:
+                    result[i] = int(saved[i])
+                except Exception:
+                    pass
+
+        result = [
+            max(DIRECTML_ENGINE_COUNT_MIN,
+                min(DIRECTML_ENGINE_COUNT_MAX, x))
+            for x in result
+        ]
+
+        if sum(result) < 1 and n > 0:
+            result[0] = DIRECTML_ENGINE_COUNT_DEFAULT
+
+        return result
 
     # ================= 恢复 UI =================
 
@@ -319,7 +372,6 @@ class TranslatorApp(ctk.CTk):
             else:
                 self.phrase_cache_switch.deselect()
 
-            # 翻译模式
             mode_map = {
                 'local': '本地',
                 'hybrid': '混合',
@@ -356,6 +408,15 @@ class TranslatorApp(ctk.CTk):
                 self.auto_clean_switch.select()
             else:
                 self.auto_clean_switch.deselect()
+
+            # GPU 引擎数滑块
+            for device_id, slider in self.gpu_engine_sliders.items():
+                if device_id < len(self.gpu_engine_counts):
+                    v = self.gpu_engine_counts[device_id]
+                    slider.set(v)
+                    if device_id in self.gpu_engine_labels:
+                        self.gpu_engine_labels[device_id].configure(
+                            text=str(v))
 
             self._update_phrase_count()
             self._update_dict_count()
@@ -573,7 +634,7 @@ class TranslatorApp(ctk.CTk):
         self._sync_trans_mode_ui()
 
     def _build_display_tab(self, parent):
-        # 性能模式
+        # ===== 性能模式 =====
         ctk.CTkLabel(
             parent, text="性能模式：", font=(FONT_NAME, 11, 'bold'),
         ).grid(row=0, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
@@ -601,7 +662,7 @@ class TranslatorApp(ctk.CTk):
         )
         self._update_mode_desc(DEFAULT_MODE)
 
-        # 加速方式
+        # ===== 加速方式 =====
         ctk.CTkLabel(
             parent, text="加速方式（运行时切换）：",
             font=(FONT_NAME, 11, 'bold'),
@@ -633,7 +694,7 @@ class TranslatorApp(ctk.CTk):
         self.btn_cpu_multi.pack(side='left', padx=3)
 
         self.btn_directml = ctk.CTkButton(
-            accel_btns, text="DirectML GPU\n(单引擎)",
+            accel_btns, text="DirectML GPU",
             width=140, height=50,
             font=(FONT_NAME, 10),
             fg_color='#3a86ff', hover_color='#2a6fd8',
@@ -650,6 +711,71 @@ class TranslatorApp(ctk.CTk):
         )
         self.btn_cuda.pack(side='left', padx=3)
 
+        # ===== GPU 引擎分配（多行） =====
+        gpu_box = ctk.CTkFrame(parent, fg_color='transparent')
+        gpu_box.grid(
+            row=5, column=0, columnspan=3,
+            sticky='ew', padx=(25, 15), pady=(4, 6))
+
+        ctk.CTkLabel(
+            gpu_box, text="GPU 引擎分配（每块独立）：",
+            font=(FONT_NAME, 9), text_color='#444444', anchor='w',
+        ).pack(anchor='w')
+
+        if not self.gpu_devices:
+            ctk.CTkLabel(
+                gpu_box, text="（未检测到 GPU 设备）",
+                font=(FONT_NAME, 9), text_color='#999999',
+            ).pack(anchor='w', pady=2)
+        else:
+            for device_id, name, vram in self.gpu_devices:
+                row = ctk.CTkFrame(gpu_box, fg_color='transparent')
+                row.pack(fill='x', pady=2)
+
+                label_text = name
+                if len(label_text) > 42:
+                    label_text = label_text[:39] + "..."
+                if vram > 0:
+                    label_text += f"（{vram}MB）"
+
+                ctk.CTkLabel(
+                    row, text=f"[{device_id}] {label_text}",
+                    font=(FONT_NAME, 9), text_color='#333333',
+                    anchor='w', width=280,
+                ).pack(side='left')
+
+                val_lbl = ctk.CTkLabel(
+                    row, text="0", width=20,
+                    font=(FONT_NAME, 10, 'bold'),
+                    text_color='#3a86ff',
+                )
+                val_lbl.pack(side='right')
+
+                slider = ctk.CTkSlider(
+                    row,
+                    from_=DIRECTML_ENGINE_COUNT_MIN,
+                    to=DIRECTML_ENGINE_COUNT_MAX,
+                    number_of_steps=(
+                        DIRECTML_ENGINE_COUNT_MAX -
+                        DIRECTML_ENGINE_COUNT_MIN),
+                    command=lambda v, d=device_id:
+                        self._on_gpu_engine_change(d, v),
+                    height=14, width=140,
+                )
+                if device_id < len(self.gpu_engine_counts):
+                    slider.set(self.gpu_engine_counts[device_id])
+                    val_lbl.configure(
+                        text=str(self.gpu_engine_counts[device_id]))
+                else:
+                    slider.set(DIRECTML_ENGINE_COUNT_DEFAULT)
+                    val_lbl.configure(
+                        text=str(DIRECTML_ENGINE_COUNT_DEFAULT))
+                slider.pack(side='right', padx=(4, 6))
+
+                self.gpu_engine_sliders[device_id] = slider
+                self.gpu_engine_labels[device_id] = val_lbl
+
+        # ===== 加速状态 =====
         self.accel_status_label = ctk.CTkLabel(
             parent, text="",
             font=(FONT_NAME, 9), text_color='#666666',
@@ -657,13 +783,13 @@ class TranslatorApp(ctk.CTk):
             wraplength=600,
         )
         self.accel_status_label.grid(
-            row=5, column=0, columnspan=3,
+            row=6, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 10))
 
-        # 优化功能
+        # ===== 优化功能 =====
         ctk.CTkLabel(
             parent, text="优化功能：", font=(FONT_NAME, 11, 'bold'),
-        ).grid(row=6, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
+        ).grid(row=7, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
 
         # 1. 帧差
         self.frame_diff_switch = ctk.CTkSwitch(
@@ -675,7 +801,7 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_FRAME_DIFF:
             self.frame_diff_switch.select()
         self.frame_diff_switch.grid(
-            row=7, column=0, columnspan=3,
+            row=8, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
         # 2. 分块 OCR
@@ -688,7 +814,7 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_BLOCK_OCR:
             self.block_ocr_switch.select()
         self.block_ocr_switch.grid(
-            row=8, column=0, columnspan=3,
+            row=9, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
         # 3. 文字过滤
@@ -701,7 +827,7 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_FILTER:
             self.filter_switch.select()
         self.filter_switch.grid(
-            row=9, column=0, columnspan=3,
+            row=10, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
         # 4. 通用过滤
@@ -714,7 +840,7 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_GENERAL_FILTER:
             self.general_filter_switch.select()
         self.general_filter_switch.grid(
-            row=10, column=0, columnspan=3,
+            row=11, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
         # 5. 短语缓存
@@ -727,13 +853,13 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_PHRASE_CACHE:
             self.phrase_cache_switch.select()
         self.phrase_cache_switch.grid(
-            row=11, column=0, columnspan=3,
+            row=12, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
         # 短语表按钮
         phrase_btns = ctk.CTkFrame(parent, fg_color='transparent')
         phrase_btns.grid(
-            row=12, column=0, columnspan=3,
+            row=13, column=0, columnspan=3,
             sticky='ew', padx=(45, 15), pady=(0, 8))
 
         ctk.CTkButton(
@@ -766,11 +892,11 @@ class TranslatorApp(ctk.CTk):
         # 本地词典
         ctk.CTkLabel(
             parent, text="本地词典：", font=(FONT_NAME, 11, 'bold'),
-        ).grid(row=13, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
+        ).grid(row=14, column=0, sticky='w', padx=(15, 5), pady=(8, 4))
 
         dict_btns = ctk.CTkFrame(parent, fg_color='transparent')
         dict_btns.grid(
-            row=14, column=0, columnspan=3,
+            row=15, column=0, columnspan=3,
             sticky='ew', padx=(25, 15), pady=(0, 8))
 
         ctk.CTkButton(
@@ -810,7 +936,7 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_ASYNC_TRANSLATE:
             self.async_translate_switch.select()
         self.async_translate_switch.grid(
-            row=15, column=0, columnspan=3,
+            row=16, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 4))
 
         # 7. 窗口池
@@ -823,20 +949,20 @@ class TranslatorApp(ctk.CTk):
         if DEFAULT_ENABLE_WINDOW_POOL:
             self.window_pool_switch.select()
         self.window_pool_switch.grid(
-            row=16, column=0, columnspan=3,
+            row=17, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 10))
 
         # 刷新间隔
         ctk.CTkLabel(
             parent, text="刷新间隔 (秒)：", font=(FONT_NAME, 11),
-        ).grid(row=17, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=18, column=0, sticky='w', padx=(15, 5), pady=8)
 
         self.scan_value_label = ctk.CTkLabel(
             parent,
             text=f"{PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval']:.2f} s",
             width=60, font=(FONT_NAME, 11),
         )
-        self.scan_value_label.grid(row=17, column=2, sticky='e', padx=(5, 15))
+        self.scan_value_label.grid(row=18, column=2, sticky='e', padx=(5, 15))
 
         n_steps = int((SCAN_MAX - SCAN_MIN) / 0.05)
         self.scan_slider = ctk.CTkSlider(
@@ -845,17 +971,17 @@ class TranslatorApp(ctk.CTk):
             command=self._on_scan_change,
         )
         self.scan_slider.set(PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval'])
-        self.scan_slider.grid(row=17, column=1, sticky='ew', padx=10)
+        self.scan_slider.grid(row=18, column=1, sticky='ew', padx=10)
 
         ctk.CTkLabel(
             parent, text="文字大小：", font=(FONT_NAME, 11),
-        ).grid(row=18, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=19, column=0, sticky='w', padx=(15, 5), pady=8)
 
         self.font_value_label = ctk.CTkLabel(
             parent, text=str(INITIAL_FONT_SIZE), width=60,
             font=(FONT_NAME, 11),
         )
-        self.font_value_label.grid(row=18, column=2, sticky='e', padx=(5, 15))
+        self.font_value_label.grid(row=19, column=2, sticky='e', padx=(5, 15))
 
         self.font_slider = ctk.CTkSlider(
             parent, from_=FONT_MIN, to=FONT_MAX,
@@ -863,12 +989,12 @@ class TranslatorApp(ctk.CTk):
             command=self._on_font_change,
         )
         self.font_slider.set(INITIAL_FONT_SIZE)
-        self.font_slider.grid(row=18, column=1, sticky='ew', padx=10)
+        self.font_slider.grid(row=19, column=1, sticky='ew', padx=10)
 
         # 图像修复
         ctk.CTkLabel(
             parent, text="图像修复（整框）：", font=(FONT_NAME, 11),
-        ).grid(row=19, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+        ).grid(row=20, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
 
         self.inpaint_switch = ctk.CTkSwitch(
             parent, text="",
@@ -877,7 +1003,7 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_USE_INPAINTING and CV2_AVAILABLE:
             self.inpaint_switch.select()
-        self.inpaint_switch.grid(row=19, column=1, sticky='w', padx=10)
+        self.inpaint_switch.grid(row=20, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.inpaint_switch.configure(state='disabled')
@@ -886,7 +1012,7 @@ class TranslatorApp(ctk.CTk):
         ctk.CTkLabel(
             parent, text="精细文字替换（保留背景）：",
             font=(FONT_NAME, 11),
-        ).grid(row=20, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
+        ).grid(row=21, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
 
         self.fine_text_switch = ctk.CTkSwitch(
             parent, text="",
@@ -895,7 +1021,7 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_ENABLE_FINE_TEXT and CV2_AVAILABLE:
             self.fine_text_switch.select()
-        self.fine_text_switch.grid(row=20, column=1, sticky='w', padx=10)
+        self.fine_text_switch.grid(row=21, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.fine_text_switch.configure(state='disabled')
@@ -904,7 +1030,7 @@ class TranslatorApp(ctk.CTk):
         ctk.CTkLabel(
             parent, text="异步覆盖（逐字显示）：",
             font=(FONT_NAME, 11),
-        ).grid(row=21, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
+        ).grid(row=22, column=0, sticky='w', padx=(15, 5), pady=(10, 8))
 
         self.async_overlay_switch = ctk.CTkSwitch(
             parent, text="",
@@ -913,12 +1039,12 @@ class TranslatorApp(ctk.CTk):
         )
         if DEFAULT_ENABLE_ASYNC_OVERLAY:
             self.async_overlay_switch.select()
-        self.async_overlay_switch.grid(row=21, column=1, sticky='w', padx=10)
+        self.async_overlay_switch.grid(row=22, column=1, sticky='w', padx=10)
 
         # 自动清理
         ctk.CTkLabel(
             parent, text="自动清理缓存：", font=(FONT_NAME, 11),
-        ).grid(row=22, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
+        ).grid(row=23, column=0, sticky='w', padx=(15, 5), pady=(15, 8))
 
         self.auto_clean_switch = ctk.CTkSwitch(
             parent, text="",
@@ -926,18 +1052,18 @@ class TranslatorApp(ctk.CTk):
             onvalue=True, offvalue=False,
         )
         self.auto_clean_switch.select()
-        self.auto_clean_switch.grid(row=22, column=1, sticky='w', padx=10)
+        self.auto_clean_switch.grid(row=23, column=1, sticky='w', padx=10)
 
         # 缓存上限
         ctk.CTkLabel(
             parent, text="缓存上限：", font=(FONT_NAME, 11),
-        ).grid(row=23, column=0, sticky='w', padx=(15, 5), pady=8)
+        ).grid(row=24, column=0, sticky='w', padx=(15, 5), pady=8)
 
         self.cache_limit_label = ctk.CTkLabel(
             parent, text=str(CACHE_DEFAULT), width=60,
             font=(FONT_NAME, 11),
         )
-        self.cache_limit_label.grid(row=23, column=2, sticky='e', padx=(5, 15))
+        self.cache_limit_label.grid(row=24, column=2, sticky='e', padx=(5, 15))
 
         self.cache_limit_slider = ctk.CTkSlider(
             parent, from_=CACHE_MIN, to=CACHE_MAX,
@@ -945,10 +1071,10 @@ class TranslatorApp(ctk.CTk):
             command=self._on_cache_limit_change,
         )
         self.cache_limit_slider.set(CACHE_DEFAULT)
-        self.cache_limit_slider.grid(row=23, column=1, sticky='ew', padx=10)
+        self.cache_limit_slider.grid(row=24, column=1, sticky='ew', padx=10)
 
         cache_row = ctk.CTkFrame(parent, fg_color='transparent')
-        cache_row.grid(row=24, column=0, columnspan=3,
+        cache_row.grid(row=25, column=0, columnspan=3,
                        sticky='ew', padx=(15, 15), pady=(5, 15))
 
         self.cache_size_label = ctk.CTkLabel(
@@ -1206,11 +1332,9 @@ class TranslatorApp(ctk.CTk):
     # ================= 本地词典 =================
 
     def select_dict_file(self):
-        """让用户选择词典文件 或 文件夹"""
         from tkinter import messagebox, filedialog
 
         try:
-            # 询问用户要选文件还是文件夹
             choice = messagebox.askyesnocancel(
                 "选择方式",
                 "点【是】选择文件夹（自动扫描所有词典文件）\n"
@@ -1222,7 +1346,6 @@ class TranslatorApp(ctk.CTk):
                 return
 
             if choice:
-                # 选文件夹
                 current = self.pipeline.local_dict.get_path()
                 init_dir = current if os.path.isdir(current) else ''
 
@@ -1231,7 +1354,6 @@ class TranslatorApp(ctk.CTk):
                     initialdir=init_dir or None,
                 )
             else:
-                # 选文件
                 current = self.pipeline.local_dict.get_path()
                 init_dir = os.path.dirname(current) if current else ''
 
@@ -1250,7 +1372,6 @@ class TranslatorApp(ctk.CTk):
             if not path:
                 return
 
-            # 加载
             self.pipeline.local_dict.set_path(path)
             count = self.pipeline.local_dict.load(path)
 
@@ -1307,7 +1428,6 @@ class TranslatorApp(ctk.CTk):
             log.exception(f"[本地词典] 清除失败：{e}")
 
     def _update_dict_count(self):
-        """更新本地词典计数显示"""
         try:
             n = self.pipeline.local_dict.size()
             path = self.pipeline.local_dict.get_path()
@@ -1336,7 +1456,7 @@ class TranslatorApp(ctk.CTk):
 
     # ================= 加速方式 =================
 
-    def switch_accel_mode(self, mode):
+    def switch_accel_mode(self, mode, force=False):
         current_variant = check_onnxruntime_variant() or 'cpu'
 
         if mode == 'directml' and current_variant != 'directml':
@@ -1345,7 +1465,8 @@ class TranslatorApp(ctk.CTk):
         if mode == 'cuda' and current_variant != 'gpu':
             self._show_need_install('NVIDIA CUDA', 'onnxruntime-gpu', '1.6GB')
             return
-        if self.ocr_engine.mode == mode:
+
+        if self.ocr_engine.mode == mode and not force:
             self.bottom_label.configure(text="已经是该模式")
             return
 
@@ -1356,12 +1477,18 @@ class TranslatorApp(ctk.CTk):
             text=f"⏳ 正在切换到 {mode}...", text_color='#666666')
         self.bottom_label.configure(text=f"切换到 {mode}...")
         self.update_idletasks()
-        log.info(f"[加速] 切换：{self.ocr_engine.mode} → {mode}")
+        log.info(f"[加速] 切换：{self.ocr_engine.mode} → {mode}"
+                 f"（GPU 引擎分配：{self.gpu_engine_counts}）")
 
         try:
             actual = self.ocr_engine.init(
-                mode=mode, pool_size=MULTITHREAD_OCR_POOL_SIZE)
-            log.info(f"[加速] 切换完成：{actual}")
+                mode=mode,
+                pool_size=MULTITHREAD_OCR_POOL_SIZE,
+                gpu_engine_counts=self.gpu_engine_counts,
+            )
+            log.info(f"[加速] 切换完成：{actual} "
+                     f"× {len(self.ocr_engine.engines)}"
+                     f" devices={self.ocr_engine.engine_device_ids}")
 
             self.cache.clear()
             if hasattr(self.pipeline, 'inpaint_cache'):
@@ -1377,7 +1504,9 @@ class TranslatorApp(ctk.CTk):
             self.user_cfg.save()
 
             self._sync_accel_ui()
-            self.bottom_label.configure(text=f"✅ 已切换到 {actual}")
+            n = len(self.ocr_engine.engines)
+            self.bottom_label.configure(
+                text=f"✅ 已切换到 {actual}（{n} 引擎）")
         except Exception as e:
             log.exception(f"[加速] 切换失败")
             self.bottom_label.configure(text=f"切换失败：{e}")
@@ -1398,10 +1527,11 @@ class TranslatorApp(ctk.CTk):
         try:
             current_variant = check_onnxruntime_variant() or 'cpu'
             current_mode = self.ocr_engine.mode
+            n_engines = len(self.ocr_engine.engines)
 
             mode_map = {
-                'cpu_multi': '多线程 CPU',
-                'directml': 'DirectML GPU',
+                'cpu_multi': f'多线程 CPU（{n_engines} 引擎）',
+                'directml': f'DirectML GPU（{n_engines} 引擎）',
                 'cuda': 'NVIDIA CUDA',
             }
             self.ort_variant_label.configure(
@@ -1420,16 +1550,16 @@ class TranslatorApp(ctk.CTk):
             elif current_mode == 'directml':
                 ok, msg = check_directml_ready()
                 if ok:
+                    detail = self.ocr_engine.get_mode_text()
                     self.accel_status_label.configure(
-                        text="✅ DirectML 加速运行中（支持所有显卡）",
+                        text=f"✅ DirectML 运行中：{detail}",
                         text_color='#00a000')
                 else:
                     self.accel_status_label.configure(
                         text=f"⚠️ {msg}", text_color='#cc6600')
             else:
-                n = len(self.ocr_engine.engines)
                 self.accel_status_label.configure(
-                    text=f"✅ CPU 多线程运行中（{n} 引擎）",
+                    text=f"✅ CPU 多线程运行中（{n_engines} 引擎）",
                     text_color='#00a000')
         except Exception as e:
             log.exception("[加速] 状态刷新失败")
@@ -1458,6 +1588,55 @@ class TranslatorApp(ctk.CTk):
                     fg_color='#adb5bd', state='disabled')
         except Exception:
             pass
+
+    # ================= GPU 引擎数 =================
+
+    def _on_gpu_engine_change(self, device_id, value):
+        v = int(round(float(value)))
+        v = max(DIRECTML_ENGINE_COUNT_MIN,
+                min(DIRECTML_ENGINE_COUNT_MAX, v))
+
+        if device_id in self.gpu_engine_labels:
+            self.gpu_engine_labels[device_id].configure(text=str(v))
+
+        if not getattr(self, '_ui_ready', False):
+            return
+
+        while len(self.gpu_engine_counts) <= device_id:
+            self.gpu_engine_counts.append(0)
+        if self.gpu_engine_counts[device_id] == v:
+            return
+        self.gpu_engine_counts[device_id] = v
+
+        if sum(self.gpu_engine_counts) < 1:
+            self.gpu_engine_counts[device_id] = DIRECTML_ENGINE_COUNT_DEFAULT
+            if device_id in self.gpu_engine_sliders:
+                self.gpu_engine_sliders[device_id].set(
+                    DIRECTML_ENGINE_COUNT_DEFAULT)
+            if device_id in self.gpu_engine_labels:
+                self.gpu_engine_labels[device_id].configure(
+                    text=str(DIRECTML_ENGINE_COUNT_DEFAULT))
+            self.bottom_label.configure(
+                text="⚠️ 至少需要 1 个引擎")
+            return
+
+        self.user_cfg.set('gpu_engine_counts', list(self.gpu_engine_counts))
+        self.user_cfg.set('gpu_device_names',
+                          [d[1] for d in self.gpu_devices])
+        self.user_cfg.save()
+
+        if self.ocr_engine.mode == 'directml':
+            self.bottom_label.configure(
+                text=f"GPU 引擎分配已更新，正在重新加载...")
+            self.after(
+                300,
+                lambda: self.switch_accel_mode('directml', force=True),
+            )
+        else:
+            total = sum(self.gpu_engine_counts)
+            self.bottom_label.configure(
+                text=f"GPU 引擎分配：{self.gpu_engine_counts}"
+                     f"（共 {total} 引擎，切到 DirectML 时生效）")
 
     # ================= 性能模式 =================
 

@@ -31,9 +31,9 @@ DEFAULT_USER_CONFIG = {
     "performance_mode": "medium",
 
     # 加速模式
-    "accel_mode": "",        # 'cpu_multi' / 'directml' / 'cuda' 或空（自动）
+    "accel_mode": "",
 
-    # 译文模式：'default'（默认）/ 'follow'（跟随）/ 'pin'（钉住）
+    # 译文模式
     "follow_mode": "follow",
 
     # 优化开关
@@ -54,6 +54,7 @@ DEFAULT_USER_CONFIG = {
 
     "enable_phrase_cache": True,
     "phrase_table_path": "",
+
     # 热键
     "hotkeys": {
         "toggle": "ctrl+alt+t",
@@ -65,15 +66,21 @@ DEFAULT_USER_CONFIG = {
 
     # 窗口
     "window_geometry": "740x820+50+50",
-    #背景修复开关
+    # 背景修复开关
     "enable_fine_text": False,
-    #异步覆盖
+    # 异步覆盖
     "enable_async_overlay": False,
-    #通用过滤
+    # 通用过滤
     "enable_general_filter": True,
-    #本地词典
+    # 本地词典
     "translation_mode": "hybrid",
     "local_dict_path": "",
+
+    # GPU 引擎分配：list[int]，按 GPU 设备顺序
+    # 例如 [2, 1] 表示设备 0 用 2 引擎，设备 1 用 1 引擎
+    "gpu_engine_counts": [],
+    # 上次枚举到的 GPU 名称（仅用于参考）
+    "gpu_device_names": [],
 }
 
 

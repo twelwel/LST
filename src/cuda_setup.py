@@ -43,11 +43,7 @@ def is_frozen():
 
 
 def _check_not_frozen():
-    """
-    打包环境中禁止 pip 安装
-    否则 subprocess.run([sys.executable, ...]) 会启动 LST.exe 自身，
-    导致无限递归弹出新窗口
-    """
+    """打包环境中禁止 pip 安装"""
     if is_frozen():
         raise RuntimeError(
             "当前是打包版本（exe），无法自动安装加速环境。\n\n"
@@ -320,3 +316,77 @@ def install_cpu_onnxruntime(progress_cb=None, done_cb=None):
                 done_cb(False, str(e))
 
     threading.Thread(target=_worker, daemon=True).start()
+
+
+# ==================== GPU 设备枚举 ====================
+
+_gpu_cache = None
+
+
+def list_gpu_devices(force=False):
+    """
+    枚举系统中的 GPU，返回 [(index, name, vram_mb), ...]
+    顺序对应 DirectML 的 device_id（通常：0=核显, 1=独显）。
+    结果会缓存，force=True 时重新查询。
+    """
+    global _gpu_cache
+    if _gpu_cache is not None and not force:
+        return _gpu_cache
+
+    devices = []
+
+    # 方式 1：PowerShell + CIM（不依赖第三方库）
+    try:
+        import json as _json
+        cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Get-CimInstance Win32_VideoController | "
+            "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"
+        ]
+        out = subprocess.check_output(
+            cmd, text=True, timeout=8,
+            creationflags=_no_window_flag() if sys.platform == 'win32' else 0,
+        ).strip()
+        if out:
+            data = _json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            for i, gpu in enumerate(data):
+                name = (gpu.get("Name") or "Unknown GPU").strip()
+                vram = gpu.get("AdapterRAM")
+                try:
+                    vram_mb = int(vram) // (1024 * 1024) if vram else 0
+                except Exception:
+                    vram_mb = 0
+                devices.append((i, name, vram_mb))
+    except Exception as e:
+        log.warning(f"[GPU] PowerShell 枚举失败：{e}")
+
+    # 方式 2：兜底 wmic
+    if not devices:
+        try:
+            cmd = [
+                "wmic", "path", "win32_VideoController",
+                "get", "name", "/format:list"
+            ]
+            out = subprocess.check_output(
+                cmd, text=True, timeout=8,
+                creationflags=_no_window_flag() if sys.platform == 'win32' else 0,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if line.lower().startswith("name="):
+                    name = line.split("=", 1)[1].strip()
+                    if name:
+                        devices.append((len(devices), name, 0))
+        except Exception:
+            pass
+
+    _gpu_cache = devices
+    log.info(f"[GPU] 检测到 {len(devices)} 个设备：{devices}")
+    return devices
+
+
+def clear_gpu_cache():
+    global _gpu_cache
+    _gpu_cache = None

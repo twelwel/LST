@@ -1,5 +1,5 @@
 """OCR 引擎池
-- DirectML / CPU 双模式切换（同一个包，无需重装）
+- DirectML 支持单 GPU 多引擎 / 多 GPU 并行
 - 支持多线程 CPU 并行
 """
 
@@ -19,56 +19,71 @@ class OCREngine:
         self.variant = 'cpu'      # 'cpu' / 'directml' / 'gpu'
         self.mode = 'cpu_multi'   # 'cpu_multi' / 'directml' / 'cuda'
         self.last_error = ''
+        # 每个引擎对应的 GPU device_id（仅 directml 有意义）
+        self.engine_device_ids = []
+        # 本次生效的 gpu_engine_counts（列表）
+        self.gpu_engine_counts = []
 
     # ================= 初始化 =================
 
-    def init(self, mode='cpu_multi', pool_size=2):
+    def init(self, mode='cpu_multi', pool_size=2, gpu_engine_counts=None):
         """
         初始化 OCR 引擎池
         mode:
           - 'cpu_multi'：多线程 CPU 并行
-          - 'directml' ：DirectML GPU 单引擎
-          - 'cuda'     ：NVIDIA CUDA 单引擎（需 onnxruntime-gpu）
+          - 'directml' ：DirectML GPU（支持单 GPU 多引擎 / 多 GPU 并行）
+          - 'cuda'     ：NVIDIA CUDA 单引擎
+        gpu_engine_counts:
+          - list[int]，按 device_id 顺序的引擎数，如 [2, 1]
+          - 也接受 dict {device_id: count}
+          - None 时默认 [2]
         返回：实际使用的模式
         """
         self.last_error = ''
         self.engines = []
+        self.engine_device_ids = []
         self.mode = mode
 
-        # 检测已装的 onnxruntime 变体
+        # 归一化 gpu_engine_counts
+        if mode == 'directml':
+            self.gpu_engine_counts = self._normalize_gpu_counts(
+                gpu_engine_counts)
+        else:
+            self.gpu_engine_counts = []
+
+        # 检测 onnxruntime 变体
         try:
             self.variant = check_onnxruntime_variant() or 'cpu'
         except Exception:
             self.variant = 'cpu'
 
-        # 校验：DirectML 模式需要 directml 包
         if mode == 'directml' and self.variant != 'directml':
             self.last_error = "需要安装 onnxruntime-directml"
             mode = 'cpu_multi'
             self.mode = mode
-
-        # 校验：CUDA 模式需要 gpu 包
         if mode == 'cuda' and self.variant != 'gpu':
             self.last_error = "需要安装 onnxruntime-gpu"
             mode = 'cpu_multi'
             self.mode = mode
 
-        # CUDA 模式加载 DLL
         if mode == 'cuda':
             try:
                 load_cuda_dlls()
             except Exception as e:
                 print(f"[OCR] CUDA DLL 加载失败：{e}")
 
-        # 引擎池大小
-        if mode in ('directml', 'cuda'):
+        # 计算 pool_size
+        if mode == 'cuda':
             self.pool_size = 1
+        elif mode == 'directml':
+            self.pool_size = max(1, sum(self.gpu_engine_counts))
         else:
             self.pool_size = max(1, pool_size)
 
         try:
             self._init_engines()
-            print(f"[OCR] 使用 {mode}，引擎数 {len(self.engines)}")
+            print(f"[OCR] 使用 {mode}，引擎数 {len(self.engines)}，"
+                  f"设备分配 {self.engine_device_ids}")
             return mode
         except Exception as e:
             self.last_error = str(e)
@@ -76,6 +91,7 @@ class OCREngine:
             if mode != 'cpu_multi':
                 self.mode = 'cpu_multi'
                 self.pool_size = max(1, pool_size)
+                self.engine_device_ids = []
                 try:
                     self._init_engines()
                     return 'cpu_multi'
@@ -84,21 +100,73 @@ class OCREngine:
                     self.engines = []
             return 'cpu_multi'
 
+    @staticmethod
+    def _normalize_gpu_counts(raw):
+        """把各种形式的入参归一化成 list[int]"""
+        from config import (
+            DIRECTML_ENGINE_COUNT_MIN,
+            DIRECTML_ENGINE_COUNT_MAX,
+            DIRECTML_ENGINE_COUNT_DEFAULT,
+        )
+        if raw is None:
+            return [DIRECTML_ENGINE_COUNT_DEFAULT]
+
+        if isinstance(raw, dict):
+            max_id = max(raw.keys()) if raw else 0
+            out = [0] * (max_id + 1)
+            for k, v in raw.items():
+                out[int(k)] = int(v)
+        elif isinstance(raw, (list, tuple)):
+            out = [int(x) for x in raw]
+        else:
+            out = [DIRECTML_ENGINE_COUNT_DEFAULT]
+
+        # 裁剪
+        out = [max(DIRECTML_ENGINE_COUNT_MIN,
+                   min(DIRECTML_ENGINE_COUNT_MAX, x)) for x in out]
+
+        # 至少有一个引擎
+        if sum(out) < 1:
+            out = [DIRECTML_ENGINE_COUNT_DEFAULT]
+        return out
+
     def _init_engines(self):
         """按模式创建引擎"""
         from rapidocr import RapidOCR
 
         if self.mode == 'directml':
-            params = {
-                "EngineConfig.onnxruntime.use_dml": True,
-                "Det.use_dml": True,
-                "Rec.use_dml": True,
-                "Cls.use_dml": False,
-            }
-            engine = RapidOCR(params=params)
-            dummy = np.zeros((32, 128, 3), dtype=np.uint8)
-            _ = engine(dummy)
-            self.engines = [engine]
+            self.engines = []
+            self.engine_device_ids = []
+            for device_id, count in enumerate(self.gpu_engine_counts):
+                if count <= 0:
+                    continue
+                params = {
+                    "EngineConfig.onnxruntime.use_dml": True,
+                    # 指定 GPU（不同 RapidOCR 版本参数路径可能不同，
+                    # 若无效请参考其文档 / 源码调整）
+                    "EngineConfig.onnxruntime.dml_ep_cfg.device_id":
+                        device_id,
+                    "Det.use_dml": True,
+                    "Rec.use_dml": True,
+                    "Cls.use_dml": False,
+                }
+                for i in range(count):
+                    try:
+                        engine = RapidOCR(params=params)
+                        dummy = np.zeros((32, 128, 3), dtype=np.uint8)
+                        _ = engine(dummy)
+                        self.engines.append(engine)
+                        self.engine_device_ids.append(device_id)
+                        print(f"[OCR] DirectML 设备 {device_id} "
+                              f"引擎 {i+1}/{count} 就绪")
+                    except Exception as e:
+                        print(f"[OCR] DirectML 设备 {device_id} "
+                              f"引擎 {i+1} 创建失败：{e}")
+                        if not self.engines:
+                            raise
+                        break
+            if not self.engines:
+                raise RuntimeError("DirectML 引擎全部创建失败")
 
         elif self.mode == 'cuda':
             params = {
@@ -182,12 +250,16 @@ class OCREngine:
     def get_mode_text(self):
         if not self.engines:
             return "未初始化"
-        mode_map = {
-            'cpu_multi': f'CPU × {len(self.engines)}',
-            'directml': 'DirectML',
-            'cuda': 'CUDA',
-        }
-        return mode_map.get(self.mode, self.mode)
+        n = len(self.engines)
+        if self.mode == 'directml':
+            detail = {}
+            for d in self.engine_device_ids:
+                detail[d] = detail.get(d, 0) + 1
+            parts = [f"GPU{d}×{c}" for d, c in sorted(detail.items())]
+            return f"DirectML [{', '.join(parts)}]"
+        if self.mode == 'cuda':
+            return 'CUDA'
+        return f'CPU × {n}'
 
     def check_gpu_available(self):
         return self.mode in ('directml', 'cuda')
