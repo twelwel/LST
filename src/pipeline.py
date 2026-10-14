@@ -78,7 +78,8 @@ class AppState:
                  enable_block_ocr=True,
                  enable_async_translate=True,
                  enable_window_pool=True,
-                 enable_multithread_ocr=False):
+                 enable_multithread_ocr=False,
+                 enable_ocr_speed_opt=True):
         self.running = False
         self.region = dict(initial_region)
         self.base_font_size = 15
@@ -88,6 +89,8 @@ class AppState:
 
         # 快速响应层开关
         self.enable_fast_lookup = enable_fast_lookup
+        # OCR 加速优化开关（控制 cv2 缩放）
+        self.enable_ocr_speed_opt = enable_ocr_speed_opt
 
         # 翻译策略（6 种）
         self.translation_strategy = 'single_translate'
@@ -335,6 +338,9 @@ class Pipeline:
         scale = min(max_w / w, max_h / h)
         new_w = int(w * scale)
         new_h = int(h * scale)
+        if _CV2_OK and self.state.enable_ocr_speed_opt:
+            return cv2.resize(crop, (new_w, new_h),
+                              interpolation=cv2.INTER_LINEAR), scale
         pil = PILImage.fromarray(crop).resize(
             (new_w, new_h), PILImage.Resampling.BILINEAR,
         )

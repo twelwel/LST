@@ -35,6 +35,14 @@ DEFAULT_USER_CONFIG = {
 
     # CPU 引擎数（可调）
     "cpu_engine_count": 2,
+    # OCR 模型大小（'server' / 'mobile'）
+    "ocr_model_size": "server",
+
+    # 高精度 OCR（多引擎投票）
+    "enable_high_accuracy_ocr": False,
+
+    # DirectML 多进程 worker 数
+    "dml_worker_count": 2,
 
     # 译文模式
     "follow_mode": "follow",

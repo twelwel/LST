@@ -9,23 +9,25 @@ datas = []
 binaries = []
 hiddenimports = []
 
-# 收集包
 for pkg in ['rapidocr', 'onnxruntime', 'customtkinter', 'keyboard']:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
 
-# 手动声明关键模块
 hiddenimports += [
     'onnxruntime.capi._pybind_state',
     'onnxruntime.capi.onnxruntime_pybind11_state',
+    'multiprocessing',
+    'multiprocessing.spawn',
+    'multiprocessing.pool',
     'translation',
     'translation.base',
     'translation.providers',
     'translation.strategies',
     'translation.manager',
     'translation.api_config',
+    'ocr_worker',
 ]
 
 a = Analysis(
@@ -57,8 +59,6 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    # icon=os.path.join(SRC, 'icon.ico'),        # 不需要图标
-    # version=os.path.join(ROOT, 'version_info.txt'),  # 不需要版本信息文件
 )
 
 coll = COLLECT(

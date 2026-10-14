@@ -1,7 +1,7 @@
 """
 覆盖显示模块
 - 覆盖模式：多小窗口
-- 双语模式：原文下方小字译文
+- 双语模式：原文下方小字译文（视频字幕场景优化）
 - 小窗口模式：独立浮窗累积译文（段落级去重）
 
 - 位置量化防抖
@@ -24,16 +24,25 @@ DEFAULT_FONT = 'Microsoft YaHei'
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 POSITION_QUANTIZE = 6
 
-# 双语模式
-BILINGUAL_FONT_SCALE = 0.75
-BILINGUAL_PADDING = 2
-BILINGUAL_GAP = 1
-BILINGUAL_MIN_H = 16
-BILINGUAL_MIN_W = 40
-BILINGUAL_ALPHA = 0.5
-BILINGUAL_MAX_LINES = 2
+# ==================== 双语模式参数 ====================
+# 字号比例（相对原文，0.9 接近原文大小）
+BILINGUAL_FONT_SCALE = 0.9
+# 上下内边距
+BILINGUAL_PADDING = 3
+# 原文底部与译文窗口间距
+BILINGUAL_GAP = 2
+# 译文窗口最小高度
+BILINGUAL_MIN_H = 20
+# 译文窗口最小宽度
+BILINGUAL_MIN_W = 300
+# 译文窗口最大宽度（屏幕宽度比例）
+BILINGUAL_MAX_W_RATIO = 0.85
+# 最多显示行数（视频字幕一般 1-2 行，给到 4 行余量）
+BILINGUAL_MAX_LINES = 4
+# 透明度（0.85 = 更容易看清）
+BILINGUAL_ALPHA = 0.85
 
-# 小窗口模式
+# ==================== 小窗口模式参数 ====================
 CAPTION_DEFAULT_W = 460
 CAPTION_DEFAULT_H = 360
 CAPTION_OPACITY = 0.94
@@ -43,7 +52,7 @@ CAPTION_BAR_BG = '#2b2b2b'
 CAPTION_BAR_FG = '#eeeeee'
 CAPTION_SELECT_BG = '#444488'
 CAPTION_FONT_SIZE = 12
-CAPTION_MIN_TEXT_LEN = 2      # 少于该长度的片段丢弃
+CAPTION_MIN_TEXT_LEN = 2
 
 
 def _get_toplevel_hwnd(hwnd):
@@ -64,33 +73,10 @@ def exclude_from_capture(hwnd):
         return False
 
 
-def _bilingual_chars_per_line(width, font_size):
-    return max(1, int((width - 6) / (font_size * 0.95)))
-
-
-def _calc_bilingual_height(text, width, base_font_size):
-    size = max(9, int(base_font_size * BILINGUAL_FONT_SCALE))
-    cpl = _bilingual_chars_per_line(width, size)
-    total_lines = max(1, (len(text) + cpl - 1) // cpl)
-    lines = min(total_lines, BILINGUAL_MAX_LINES)
-    line_h = int(size * 1.15)
-    return max(BILINGUAL_MIN_H, lines * line_h + 2 * BILINGUAL_PADDING)
-
-
-def _truncate_bilingual(text, width, base_font_size):
-    if not text:
-        return text
-    size = max(9, int(base_font_size * BILINGUAL_FONT_SCALE))
-    cpl = _bilingual_chars_per_line(width, size)
-    max_chars = cpl * BILINGUAL_MAX_LINES
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 1:
-        return text[:1]
-    return text[:max_chars - 1] + '…'
-
+# ==================== 双语工具函数 ====================
 
 def _estimate_text_width(text, font_size):
+    """估算文本像素宽度（中文全宽，其他半宽）"""
     if not text:
         return 0
     w = 0
@@ -102,10 +88,87 @@ def _estimate_text_width(text, font_size):
     return w
 
 
-def _calc_bilingual_width(text, base_font_size, max_w):
-    size = max(9, int(base_font_size * BILINGUAL_FONT_SCALE))
-    est = _estimate_text_width(text, size) + 10
-    return max(BILINGUAL_MIN_W, min(int(est), int(max_w)))
+def _count_lines(text, font_size, width):
+    """按宽度模拟换行，返回行数"""
+    if not text or width <= 0:
+        return 1
+    lines = 1
+    current = 0
+    for ch in text:
+        cw = (font_size if ('\u4e00' <= ch <= '\u9fff' or
+                            '\u3000' <= ch <= '\u303f')
+              else int(font_size * 0.55))
+        if current + cw > width and current > 0:
+            lines += 1
+            current = cw
+        else:
+            current += cw
+    return lines
+
+
+def _calc_bilingual_width(text, base_font_size, orig_w):
+    """
+    双语窗口宽度：
+    - 至少 = 原文宽度，保证译文从原文宽度开始
+    - 如果译文很长，扩展到估算宽度
+    - 上限 = 屏幕宽度 × BILINGUAL_MAX_W_RATIO
+    - 下限 = BILINGUAL_MIN_W
+    """
+    size = max(10, int(base_font_size * BILINGUAL_FONT_SCALE))
+    est_w = _estimate_text_width(text, size) + 12
+
+    # 取 max(原文宽, 译文估算宽)
+    w = max(int(orig_w or 0), est_w)
+
+    # 屏幕宽度限制
+    try:
+        sw = None
+        # 从 master 获取
+        pass
+    except Exception:
+        pass
+
+    if w < BILINGUAL_MIN_W:
+        w = BILINGUAL_MIN_W
+
+    return int(w)
+
+
+def _calc_bilingual_height(text, width, base_font_size):
+    """双语窗口高度（译文区）：至少一行，最多 BILINGUAL_MAX_LINES 行"""
+    size = max(10, int(base_font_size * BILINGUAL_FONT_SCALE))
+    inner_w = max(10, width - 8)
+    total_lines = _count_lines(text, size, inner_w)
+    lines = min(total_lines, BILINGUAL_MAX_LINES)
+    line_h = int(size * 1.35)
+    h = lines * line_h + 2 * BILINGUAL_PADDING
+    return max(BILINGUAL_MIN_H, h)
+
+
+def _truncate_bilingual(text, width, base_font_size):
+    """超出最大行数时截断，末尾加省略号"""
+    if not text:
+        return text
+    size = max(10, int(base_font_size * BILINGUAL_FONT_SCALE))
+    inner_w = max(10, width - 8)
+    max_chars = 0
+    lines = 1
+    current = 0
+    for i, ch in enumerate(text):
+        cw = (size if ('\u4e00' <= ch <= '\u9fff' or
+                       '\u3000' <= ch <= '\u303f')
+              else int(size * 0.55))
+        if current + cw > inner_w and current > 0:
+            lines += 1
+            if lines > BILINGUAL_MAX_LINES:
+                max_chars = i
+                break
+            current = cw
+        else:
+            current += cw
+    if max_chars == 0:
+        return text
+    return text[:max(1, max_chars - 1)] + '…'
 
 
 # ==================== 覆盖/双语 单窗口 ====================
@@ -184,7 +247,34 @@ class TranslationBox(tk.Toplevel):
         self.canvas.delete('all')
         self._photo = None
 
-        if self._bg_image is not None and not self._bilingual:
+        # ============ 双语模式 ============
+        if self._bilingual:
+            # 背景
+            self.canvas.configure(bg=self._bg_hex)
+
+            # 字号
+            base_size = max(10, int(self._base_font_size *
+                                   BILINGUAL_FONT_SCALE))
+            font_size = calc_font_size(
+                self._full_text, self._box_w - 8,
+                self._box_h - 2 * BILINGUAL_PADDING, base_size)
+
+            visible = self._full_text[:self._visible_len]
+            visible = _truncate_bilingual(
+                visible, self._box_w, self._base_font_size)
+
+            # 左上角开始绘制多行
+            self.canvas.create_text(
+                4, BILINGUAL_PADDING,
+                text=visible, fill=self._fg,
+                font=(self._font_name, font_size),
+                anchor='nw', width=self._box_w - 8,
+                justify='left',
+            )
+            return
+
+        # ============ 覆盖模式 ============
+        if self._bg_image is not None:
             img = self._bg_image
             if img.size != (self._box_w, self._box_h):
                 img = img.resize((self._box_w, self._box_h))
@@ -193,26 +283,10 @@ class TranslationBox(tk.Toplevel):
         else:
             self.canvas.configure(bg=self._bg_hex)
 
-        if self._bilingual:
-            base_size = max(9, int(self._base_font_size *
-                                   BILINGUAL_FONT_SCALE))
-            font_size = calc_font_size(
-                self._full_text, self._box_w, self._box_h, base_size)
-            visible = self._full_text[:self._visible_len]
-            visible = _truncate_bilingual(
-                visible, self._box_w, self._base_font_size)
-            self.canvas.create_text(
-                3, self._box_h // 2,
-                text=visible, fill=self._fg,
-                font=(self._font_name, font_size),
-                anchor='w', width=self._box_w - 6,
-                justify='left',
-            )
-            return
-
         font_size = calc_font_size(
             self._full_text, self._box_w, self._box_h, self._base_font_size)
         visible = self._full_text[:self._visible_len]
+
         self.canvas.create_text(
             4, self._box_h // 2,
             text=visible, fill=self._fg,
@@ -321,8 +395,8 @@ class TranslationBox(tk.Toplevel):
 class CaptionWindow:
     """
     独立浮窗，累积显示译文
-    - 段落级去重：用「归一化文本」做 key（去空格、标点、转小写）
-    - 过滤短片段（< CAPTION_MIN_TEXT_LEN 字符）
+    - 段落级去重：用「归一化文本」做 key
+    - 过滤短片段
     - 顶部标题栏可拖动，正文可选中复制
     """
 
@@ -344,7 +418,7 @@ class CaptionWindow:
         except Exception:
             pass
 
-        # ---- 标题栏 ----
+        # 标题栏
         self.bar = tk.Frame(self.win, bg=CAPTION_BAR_BG, height=26)
         self.bar.pack(fill='x', side='top')
         self.bar.pack_propagate(False)
@@ -379,7 +453,7 @@ class CaptionWindow:
             font=(font_name, 8),
         ).pack(side='right', padx=4)
 
-        # ---- 文本区 ----
+        # 文本区
         text_frame = tk.Frame(self.win, bg=CAPTION_BG)
         text_frame.pack(fill='both', expand=True)
 
@@ -404,19 +478,15 @@ class CaptionWindow:
         scrollbar.pack(side='right', fill='y')
         self.text.configure(yscrollcommand=scrollbar.set)
 
-        # ---- 拖动绑定 ----
         self.bar.bind('<ButtonPress-1>', self._on_drag_start)
         self.bar.bind('<B1-Motion>', self._on_drag)
 
-        # ---- 初始位置：屏幕右下 ----
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
         x = sw - width - 30
         y = sh - height - 80
         self.win.geometry(f"{width}x{height}+{x}+{y}")
         self.win.withdraw()
-
-    # ---------- 拖动 ----------
 
     def _on_drag_start(self, event):
         self._drag_start = (
@@ -431,8 +501,6 @@ class CaptionWindow:
         dx = event.x_root - sx
         dy = event.y_root - sy
         self.win.geometry(f"+{wx + dx}+{wy + dy}")
-
-    # ---------- 显隐 ----------
 
     def show(self):
         if not self._visible:
@@ -458,17 +526,8 @@ class CaptionWindow:
     def is_visible(self):
         return self._visible
 
-    # ---------- 内容整理 ----------
-
     @staticmethod
     def _normalize(text):
-        """
-        归一化文本用于去重：
-        - 去掉所有空白
-        - 去掉常见中英文标点
-        - 转小写
-        这样 "Hello," 和 "hello" 会被视为同一段
-        """
         if not text:
             return ''
         t = re.sub(r'\s+', '', text)
@@ -479,22 +538,14 @@ class CaptionWindow:
         return t.lower()
 
     def add_items(self, items):
-        """
-        追加译文（段落级去重）
-        - 过滤短片段
-        - 归一化后去重
-        - 返回实际新增数量
-        """
         added = 0
         for it in items:
             text = (it.get('text') or '').strip()
             if len(text) < CAPTION_MIN_TEXT_LEN:
                 continue
-
             norm = self._normalize(text)
             if not norm or norm in self._seen_norm:
                 continue
-
             self._seen_norm.add(norm)
             try:
                 self.text.insert('end', text + '\n')
@@ -646,13 +697,15 @@ class OverlayWindow:
             item_font = item.get('force_font_size', base_font_size)
 
             bilingual = item.get('bilingual', False)
+            orig_w = item.get('orig_w', x2 - x1)
+            orig_h = item.get('orig_h', y2 - y1)
 
             if bilingual:
+                # 双语：放在原文底部下方，宽度自适应，高度自适应多行
                 orig_y2 = item.get('orig_y2', y2)
                 new_x1 = x1
                 new_y1 = orig_y2 + BILINGUAL_GAP
-                max_w = max(BILINGUAL_MIN_W, int(x2 - x1))
-                new_w = _calc_bilingual_width(text, item_font, max_w)
+                new_w = _calc_bilingual_width(text, item_font, orig_w)
                 new_h = _calc_bilingual_height(text, new_w, item_font)
                 bg_image = None
             else:

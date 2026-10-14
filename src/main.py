@@ -2,6 +2,7 @@
 只负责：初始化日志 → 启动 UI
 """
 
+import multiprocessing
 import sys
 
 
@@ -18,8 +19,6 @@ def main():
     from version import APP_NAME, __version__
     log.info(f"===== {APP_NAME} v{__version__} 启动 =====")
 
-    # 不再强制检查 API 配置，直接启动主窗口
-    # 用户可在主界面点"API 设置"按钮自行配置
     from ui import TranslatorApp
 
     app = TranslatorApp()
@@ -29,4 +28,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # ⚠️ PyInstaller 打包 + multiprocessing 必须
+    multiprocessing.freeze_support()
+
     main()

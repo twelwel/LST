@@ -82,8 +82,13 @@ CPU_ENGINE_COUNT_DEFAULT = 2
 # 兼容旧常量
 MULTITHREAD_OCR_POOL_SIZE = CPU_ENGINE_COUNT_DEFAULT
 
-# DirectML 引擎数（固定单引擎，多引擎会触发 onnxruntime 崩溃）
+# DirectML 单进程内的引擎数（固定 1）
 DIRECTML_ENGINE_COUNT = 1
+
+# DirectML 多进程 worker 数
+DML_WORKER_COUNT_MIN = 1
+DML_WORKER_COUNT_MAX = 4
+DML_WORKER_COUNT_DEFAULT = 2
 
 # 精细文字替换
 DEFAULT_ENABLE_FINE_TEXT = False
@@ -204,3 +209,18 @@ FG_COLOR_PRESETS = {
 }
 
 DEFAULT_FG_COLOR = 'auto'
+
+# OCR 模型大小
+# - 'server'：精度高，慢
+# - 'mobile'：速度快，精度略低（约 2-4 倍加速）
+OCR_MODEL_SIZE_SERVER = 'server'
+OCR_MODEL_SIZE_MOBILE = 'mobile'
+OCR_MODEL_SIZE_DEFAULT = OCR_MODEL_SIZE_SERVER
+
+# 高精度 OCR（多引擎投票）
+DEFAULT_ENABLE_HIGH_ACCURACY_OCR = False
+# 融合时位置对齐的 IoU 阈值
+HIGH_ACCURACY_IOU_THRESHOLD = 0.5
+
+# OCR 加速优化（关方向分类 + det 限长 + cv2 缩放，一个开关统一控制）
+DEFAULT_ENABLE_OCR_SPEED_OPT = True
