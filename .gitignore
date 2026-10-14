@@ -1,0 +1,22 @@
+@'
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.vscode/
+.idea/
+build/
+dist/
+*.spec.bak
+*.zip
+*.7z
+*.rar
+LST-v*/
+LST-*/
+LST_*/
+.DS_Store
+Thumbs.db
+*.log
+.screen_translator/
+'@ | Out-File -Encoding utf8 .gitignore
