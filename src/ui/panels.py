@@ -16,6 +16,7 @@ from config import (
     DEFAULT_ENABLE_GENERAL_FILTER,
     DEFAULT_ENABLE_ENGLISH_ONLY,
     DEFAULT_ENABLE_TITLE_FILTER,
+    DEFAULT_ENABLE_OCR_VERIFY,
     DEFAULT_ENABLE_FAST_LOOKUP,
     DEFAULT_ENABLE_ASYNC_TRANSLATE,
     DEFAULT_ENABLE_WINDOW_POOL,
@@ -248,6 +249,19 @@ class DisplayPanelMixin:
             self.title_filter_switch.select()
         self.title_filter_switch.grid(
             row=16, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
+        # ===== 二次 OCR 验证 =====
+        self.ocr_verify_switch = ctk.CTkSwitch(
+            parent,
+            text="二次 OCR 验证（防一闪而过，慢约 1 倍）",
+            command=self._on_ocr_verify_toggle,
+            onvalue=True, offvalue=False,
+            font=(FONT_NAME, 10),
+        )
+        if DEFAULT_ENABLE_OCR_VERIFY:
+            self.ocr_verify_switch.select()
+        self.ocr_verify_switch.grid(
+            row=99, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 3))
         
         if DEFAULT_ENABLE_ENGLISH_ONLY:
@@ -527,6 +541,35 @@ class DisplayPanelMixin:
             cache_row, text="立即清理", width=80,
             command=self._manual_clear_cache,
         ).pack(side='right')
+
+        # ===== 双语距离 =====
+        ctk.CTkLabel(
+            parent, text="双语距离 (px)：", font=(FONT_NAME, 11),
+        ).grid(row=97, column=0, sticky='w', padx=(15, 5), pady=6)
+
+        self.bilingual_gap_value_label = ctk.CTkLabel(
+            parent, text="2", width=60, font=(FONT_NAME, 11),
+        )
+        self.bilingual_gap_value_label.grid(
+            row=97, column=2, sticky='e', padx=(5, 15))
+
+        self.bilingual_gap_slider = ctk.CTkSlider(
+            parent,
+            from_=-30, to=100,
+            number_of_steps=130,
+            command=self._on_bilingual_gap_change,
+        )
+        self.bilingual_gap_slider.set(2)
+        self.bilingual_gap_slider.grid(
+            row=97, column=1, sticky='ew', padx=10)
+
+        ctk.CTkLabel(
+            parent,
+            text="💡 正数：译文在原文下方；负数：译文覆盖原文部分",
+            font=(FONT_NAME, 9), text_color='#888888',
+            anchor='w',
+        ).grid(row=98, column=0, columnspan=3,
+               sticky='w', padx=(25, 15), pady=(0, 6))
 
         parent.grid_columnconfigure(1, weight=1)
 

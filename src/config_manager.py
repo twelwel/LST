@@ -46,7 +46,8 @@ DEFAULT_USER_CONFIG = {
 
     # 译文模式
     "follow_mode": "follow",
-
+    "bilingual_gap": 2,
+    
     # 显示模式
     "display_mode": "overlay",
 
@@ -96,6 +97,8 @@ DEFAULT_USER_CONFIG = {
     "enable_english_only": False,
 
     "enable_title_filter": False,
+
+    "enable_ocr_verify": False,
 }
 
 

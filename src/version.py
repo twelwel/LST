@@ -2,8 +2,8 @@
 所有版本号统一在这里修改
 """
 
-__version__ = "1.30.4"
-__version_tuple__ = (1, 30, 4)
+__version__ = "1.30.5"
+__version_tuple__ = (1, 30, 5)
 __author__ = "twelwel"
 __email__ = "2033697674@qq.com"
 __license__ = "MIT"
@@ -15,6 +15,8 @@ REPO_URL = "https://github.com/twelwel/LST"
 RELEASE_URL = REPO_URL + "/releases"
 
 VERSION_INFO = {
+    "1.30.5": "v1.30.5：新增二次 OCR 验证；标题/Logo 过滤；"
+              "双语距离滑块；修复旧译文消除慢 + 重复输出",
     "1.30.4": "v1.30.4：PP-OCRv6 tiny；通用/英语特化/标题过滤；"
               "位置匹配防堆叠；帧差连通域 + 分块 OCR 修复",
     "1.30.3": "v1.30.3：CUDA 支持多引擎并行；DML 单引擎稳定",

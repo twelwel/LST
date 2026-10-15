@@ -39,7 +39,7 @@ class EmitDebouncer:
     POS_BLEND = 0.35
 
     # 消失容忍帧数 —— 字幕短暂识别失败不立即消失
-    MISS_TOLERANCE = 6
+    MISS_TOLERANCE = 2
 
     # 文本相似度阈值 —— 用于投票聚类
     TEXT_SIMILARITY = 0.7

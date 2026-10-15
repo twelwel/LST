@@ -6,8 +6,11 @@
 译文颜色：全模式通用
 OCR 模型：server / PP-OCRv6 tiny，可选高精度多引擎投票
 通用过滤：只过滤数字、单位、图像
-英文模式：只识别包含英文字母的文本
-输出防抖：切换时先 reset_debouncer 再 clear overlay（防串扰）
+英语特化：只识别字母主导的英文段落
+标题/Logo 过滤：全大写 / 超大字号
+二次 OCR 验证：防一闪而过
+输出防抖：切换时先 reset_debouncer 再 clear overlay
+双语距离：可调滑块
 """
 
 import os
@@ -30,6 +33,7 @@ from config import (
     DEFAULT_ENABLE_GENERAL_FILTER,
     DEFAULT_ENABLE_ENGLISH_ONLY,
     DEFAULT_ENABLE_TITLE_FILTER,
+    DEFAULT_ENABLE_OCR_VERIFY,
     DEFAULT_ENABLE_FAST_LOOKUP,
     DEFAULT_PHRASE_TABLE_PATH,
     DEFAULT_LOCAL_DICT_PATH,
@@ -78,7 +82,6 @@ from translation.strategies import (
     HYBRID_ORDER_LABELS, VOTE_STRATEGY_LABELS,
 )
 
-# ---- 本包内部依赖 ----
 from .constants import (
     TICK_MS, BOUNDARY_PADDING, CACHE_DEFAULT,
     CACHE_MIN, CACHE_MAX
@@ -125,6 +128,8 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             'enable_english_only', DEFAULT_ENABLE_ENGLISH_ONLY)
         saved_title_filter = self.user_cfg.get(
             'enable_title_filter', DEFAULT_ENABLE_TITLE_FILTER)
+        saved_ocr_verify = self.user_cfg.get(
+            'enable_ocr_verify', DEFAULT_ENABLE_OCR_VERIFY)
         saved_fast_lookup = self.user_cfg.get(
             'enable_fast_lookup', DEFAULT_ENABLE_FAST_LOOKUP)
         saved_phrase_table_path = self.user_cfg.get(
@@ -158,7 +163,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                                 min(DML_WORKER_COUNT_MAX, saved_dml_workers))
         self.dml_worker_count = saved_dml_workers
 
-        # OCR 模型大小（server / tiny）
+        # OCR 模型大小
         saved_ocr_model = self.user_cfg.get(
             'ocr_model_size', OCR_MODEL_SIZE_DEFAULT)
         if saved_ocr_model not in (OCR_MODEL_SIZE_SERVER,
@@ -271,6 +276,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             enable_general_filter=saved_general_filter,
             enable_english_only=saved_english_only,
             enable_title_filter=saved_title_filter,
+            enable_ocr_verify=saved_ocr_verify,
             enable_fast_lookup=saved_fast_lookup,
             local_dict_path=saved_local_dict_path,
             mode_cfg=default_cfg,
@@ -307,6 +313,13 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.overlay = OverlayWindow(self, font_name=FONT_NAME)
         self.overlay.set_pool_enabled(saved_wpool)
         self.overlay.set_async_enabled(saved_async_overlay)
+
+        # 从配置恢复双语距离
+        try:
+            bg = int(self.user_cfg.get('bilingual_gap', 2))
+            self.overlay.set_bilingual_gap(bg)
+        except Exception:
+            pass
 
         self.caption_window = CaptionWindow(
             self, font_name=FONT_NAME,
@@ -357,10 +370,12 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
         self.after(100, self._sync_accel_ui)
         self.after(100, self._sync_follow_mode_ui)
+
         self._restore_ui_from_config(
             saved_mode, saved_scan, initial_font, saved_inpaint,
             saved_fine_text, saved_async_overlay,
             saved_general_filter, saved_english_only,
+            saved_title_filter, saved_ocr_verify,
             saved_fast_lookup,
             saved_phrase_table_path,
             saved_translation_strategy, saved_local_dict_path,
@@ -377,6 +392,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
     def _restore_ui_from_config(self, mode, scan, font, inpaint,
                                 fine_text, async_overlay,
                                 general_filter, english_only,
+                                title_filter, ocr_verify,
                                 fast_lookup,
                                 phrase_table_path,
                                 translation_strategy, local_dict_path,
@@ -424,11 +440,18 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                 self.english_only_switch.deselect()
 
             try:
-                if self.user_cfg.get('enable_title_filter',
-                                     DEFAULT_ENABLE_TITLE_FILTER):
+                if title_filter:
                     self.title_filter_switch.select()
                 else:
                     self.title_filter_switch.deselect()
+            except Exception:
+                pass
+
+            try:
+                if ocr_verify:
+                    self.ocr_verify_switch.select()
+                else:
+                    self.ocr_verify_switch.deselect()
             except Exception:
                 pass
 
@@ -497,6 +520,15 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self._update_phrase_count()
             self._update_dict_count()
 
+            # 双语距离：从配置读取
+            try:
+                bg = int(self.user_cfg.get('bilingual_gap', 2))
+                self.bilingual_gap_slider.set(bg)
+                self.bilingual_gap_value_label.configure(text=str(bg))
+                self.overlay.set_bilingual_gap(bg)
+            except Exception:
+                pass
+
             if getattr(self.app_state, 'display_mode',
                        'overlay') == 'window':
                 self.caption_window.show()
@@ -516,13 +548,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         if self.app_state.follow_mode != 'follow':
             return
         self.app_state.scroll_boost = True
-
-        # ⭐ 标记滚动状态（0.5s 有效），让 pipeline 用文本 hash key
         try:
             self.app_state.mark_scroll()
         except Exception:
             pass
-
         try:
             self.after(0, lambda: self._apply_scroll(dy))
         except Exception:
@@ -999,12 +1028,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         except Exception as e:
             log.exception(f"[翻译策略] 同步失败：{e}")
 
-        # ⭐ 先 reset pipeline（清空 known + 队列 + generation+1）
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         try:
             self.caption_window.clear()
@@ -1125,12 +1152,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.user_cfg.set('display_mode', key)
         self.user_cfg.save()
 
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         if key == 'window':
             self.caption_window.show()
@@ -1172,12 +1197,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.user_cfg.set('fg_color', key)
         self.user_cfg.save()
 
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         self.app_state.reset_signature()
 
@@ -1214,12 +1237,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.app_state.scroll_boost = False
 
         if mode != 'pin':
-            # ⭐ 先 reset pipeline（同时清空 result_queue）
             try:
                 self.pipeline.reset_debouncer()
             except Exception:
                 pass
-            # 再清 overlay
             self.overlay.clear()
             self.app_state.reset_signature()
 
@@ -1542,12 +1563,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             if hasattr(self.pipeline, 'color_cache'):
                 self.pipeline.color_cache.clear()
             self.app_state.reset_signature()
-            # ⭐ 先 reset pipeline
             try:
                 self.pipeline.reset_debouncer()
             except Exception:
                 pass
-            # 再清 overlay
             self.overlay.clear()
 
             self.user_cfg.set('accel_mode', actual)
@@ -1668,12 +1687,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.scan_value_label.configure(text=f"{cfg['scan_interval']:.2f} s")
         self._update_mode_desc(mode_key)
         self.app_state.reset_signature()
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
 
         fast_tag = "（分段翻译）" if cfg.get('fast_mode') else "（批量翻译）"
@@ -1732,12 +1749,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         enabled = bool(self.general_filter_switch.get())
         self.app_state.enable_general_filter = enabled
         self.app_state.reset_signature()
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         msg = "通用过滤：已开启" if enabled else "通用过滤：已关闭"
         self.bottom_label.configure(text=msg)
@@ -1749,12 +1764,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         enabled = bool(self.english_only_switch.get())
         self.app_state.enable_english_only = enabled
         self.app_state.reset_signature()
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         msg = "英语特化：已开启" if enabled else "英语特化：已关闭"
         self.bottom_label.configure(text=msg)
@@ -1775,6 +1788,21 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.bottom_label.configure(text=msg)
         log.info(f"[开关] {msg}")
         self.user_cfg.set('enable_title_filter', enabled)
+        self.user_cfg.save()
+
+    def _on_ocr_verify_toggle(self):
+        enabled = bool(self.ocr_verify_switch.get())
+        self.app_state.enable_ocr_verify = enabled
+        self.app_state.reset_signature()
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
+        self.overlay.clear()
+        msg = "二次 OCR 验证：已开启" if enabled else "二次 OCR 验证：已关闭"
+        self.bottom_label.configure(text=msg)
+        log.info(f"[开关] {msg}")
+        self.user_cfg.set('enable_ocr_verify', enabled)
         self.user_cfg.save()
 
     def _on_fast_lookup_toggle(self):
@@ -1810,12 +1838,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         enabled = bool(self.fine_text_switch.get())
         self.app_state.enable_fine_text = enabled
         self.app_state.reset_signature()
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         msg = ("精细文字替换：已启用" if enabled
                else "精细文字替换：已关闭")
@@ -1852,16 +1878,30 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.user_cfg.set('font_size', value)
         self.user_cfg.save()
 
-    def _on_inpaint_toggle(self):
-        enabled = bool(self.inpaint_switch.get())
-        self.app_state.use_inpainting = enabled
+    def _on_bilingual_gap_change(self, value):
+        value = int(round(value))
+        try:
+            self.bilingual_gap_value_label.configure(text=str(value))
+        except Exception:
+            pass
+        self.overlay.set_bilingual_gap(value)
+        self.overlay.clear()
         self.app_state.reset_signature()
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
+        self.user_cfg.set('bilingual_gap', value)
+        self.user_cfg.save()
+
+    def _on_inpaint_toggle(self):
+        enabled = bool(self.inpaint_switch.get())
+        self.app_state.use_inpainting = enabled
+        self.app_state.reset_signature()
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
         self.overlay.clear()
         msg = "图像修复（整框）：已启用" if enabled else "图像修复（整框）：已关闭"
         self.bottom_label.configure(text=msg)
@@ -1932,12 +1972,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self.app_state.reset_signature()
         except Exception:
             pass
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         try:
             self.overlay.clear()
         except Exception:
@@ -2028,12 +2066,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             log.info("状态：已暂停")
 
     def clear_overlay(self):
-        # ⭐ 先 reset pipeline（同时清空 result_queue + generation+1）
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         try:
             self.caption_window.clear()
@@ -2059,12 +2095,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.app_state.update_region(new_region)
         self.app_state.reset_signature()
         self.scroll_detector.reset()
-        # ⭐ 先 reset pipeline
         try:
             self.pipeline.reset_debouncer()
         except Exception:
             pass
-        # 再清 overlay
         self.overlay.clear()
         self._update_region_label()
         self.bottom_label.configure(text="区域已更新")

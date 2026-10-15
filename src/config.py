@@ -230,3 +230,6 @@ DEFAULT_ENABLE_ENGLISH_ONLY = False
 
 # 标题/Logo 过滤（全大写 + 超大字号）
 DEFAULT_ENABLE_TITLE_FILTER = False
+
+# 二次 OCR 验证（视频场景防一闪而过）
+DEFAULT_ENABLE_OCR_VERIFY = False

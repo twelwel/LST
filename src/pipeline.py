@@ -1,16 +1,4 @@
-"""后台处理管道
-- 6 种翻译策略：离线 / 单翻译 API / 多翻译轮询 / 混合 / 单 AI / 多 AI 投票
-- 快速响应层（本地词典 + 短语缓存）：所有策略共用，只处理单词和词组
-- 显示模式：覆盖 / 双语 / 小窗口
-- 译文颜色：全模式通用
-- 输出防抖：位置匹配复用 key + EmitDebouncer + Generation 保护
-- 通用过滤：只过滤数字、单位、图像
-- 英语特化：只识别字母主导的英文段落
-- 标题过滤：全大写 / 超大字号
-- 帧差检测：连通域过滤 + 动态 padding
-- 分块 OCR：均匀分块 + IoU 去重
-- 性能统计：各阶段平均延迟，定期打印
-"""
+"""后台处理管道"""
 
 import queue
 import re
@@ -39,6 +27,7 @@ from layout import (
     filter_general_content,
     filter_english_only,
     filter_title_logo,
+    text_similarity,
 )
 from inpaint import (
     inpaint_region,
@@ -65,32 +54,27 @@ THUMB_SIZE = 40
 PIXEL_DIFF_THRESHOLD = 20
 INPAINT_CACHE_MAX = 200
 
-# ============ 分块 OCR 参数（修复版）============
-MULTITHREAD_OCR_MIN_AREA = 600 * 150   # 提高门槛，避免小区域分块
-MULTITHREAD_OCR_OVERLAP = 40           # 15 → 40（覆盖一行小字）
-MULTITHREAD_OCR_MIN_CHUNK_H = 400      # 300 → 400
-MULTITHREAD_OCR_MAX_CHUNKS = 4         # 8 → 4（每块更大，减少切字）
+MULTITHREAD_OCR_MIN_AREA = 600 * 150
+MULTITHREAD_OCR_OVERLAP = 40
+MULTITHREAD_OCR_MIN_CHUNK_H = 400
+MULTITHREAD_OCR_MAX_CHUNKS = 4
 
 SLOW_THRESHOLD_MS = 300
 
-MISS_FRAMES_TOLERANCE = 3
-
 PERF_REPORT_INTERVAL = 10.0
 
-# ============ 位置匹配参数 ============
 POSITION_MATCH_TOLERANCE = 40
-TRACKER_TIMEOUT = 2.0
+TRACKER_TIMEOUT = 1.5
 
-# ============ 帧差检测参数（修复版）============
-# 缩略图上的最小连通域面积（像素），忽略小噪声
 FRAME_DIFF_MIN_COMPONENT_AREA = 4
-# 变化区动态 padding = 变化区高度 × 该比例
 FRAME_DIFF_PADDING_RATIO = 0.3
-# 取最大的几个连通域（避免角落噪声拉大 bbox）
 FRAME_DIFF_MAX_COMPONENTS = 5
 
+OCR_VERIFY_PADDING = 8
+OCR_VERIFY_SIMILARITY = 0.6
+OCR_VERIFY_MIN_AREA = 8 * 8
+OCR_VERIFY_FAIL_OPEN = True
 
-# ==================== 性能统计 ====================
 
 class _PerfStats:
     def __init__(self):
@@ -100,10 +84,13 @@ class _PerfStats:
         self.t_ocr = 0.0
         self.t_filter = 0.0
         self.t_merge = 0.0
+        self.t_verify = 0.0
         self.t_emit = 0.0
         self.t_total = 0.0
         self.frames_with_ocr = 0
         self.frames_skipped = 0
+        self.verify_pass = 0
+        self.verify_fail = 0
 
     def add(self, key, ms):
         with self._lock:
@@ -117,6 +104,13 @@ class _PerfStats:
             if skipped:
                 self.frames_skipped += 1
 
+    def verify(self, passed):
+        with self._lock:
+            if passed:
+                self.verify_pass += 1
+            else:
+                self.verify_fail += 1
+
     def summary_and_reset(self):
         with self._lock:
             n = max(1, self.frames)
@@ -129,18 +123,24 @@ class _PerfStats:
                 'ocr': self.t_ocr / no,
                 'filter': self.t_filter / n,
                 'merge': self.t_merge / n,
+                'verify': self.t_verify / n,
                 'emit': self.t_emit / n,
                 'total': self.t_total / n,
+                'verify_pass': self.verify_pass,
+                'verify_fail': self.verify_fail,
             }
             self.frames = 0
             self.t_frame_diff = 0.0
             self.t_ocr = 0.0
             self.t_filter = 0.0
             self.t_merge = 0.0
+            self.t_verify = 0.0
             self.t_emit = 0.0
             self.t_total = 0.0
             self.frames_with_ocr = 0
             self.frames_skipped = 0
+            self.verify_pass = 0
+            self.verify_fail = 0
             return result
 
 
@@ -153,6 +153,7 @@ class AppState:
                  enable_general_filter=True,
                  enable_english_only=False,
                  enable_title_filter=False,
+                 enable_ocr_verify=False,
                  enable_fast_lookup=True,
                  local_dict_path='',
                  mode_cfg=None,
@@ -171,6 +172,7 @@ class AppState:
         self.enable_general_filter = enable_general_filter
         self.enable_english_only = enable_english_only
         self.enable_title_filter = enable_title_filter
+        self.enable_ocr_verify = enable_ocr_verify
         self.enable_fast_lookup = enable_fast_lookup
         self.enable_ocr_speed_opt = enable_ocr_speed_opt
         self.translation_strategy = 'single_translate'
@@ -202,9 +204,7 @@ class AppState:
         self.freeze_overlay = False
         self.scroll_boost = False
         self.pending_change = False
-
         self._scroll_until = 0.0
-
         if mode_cfg:
             self.apply_mode(mode_cfg)
 
@@ -268,7 +268,6 @@ class Pipeline:
 
         self.emit_debouncer = EmitDebouncer()
         self._known_items = {}
-        self._known_miss = {}
         self._known_lock = threading.Lock()
 
         self._generation = 0
@@ -285,7 +284,6 @@ class Pipeline:
     def reset_debouncer(self):
         with self._known_lock:
             self._known_items.clear()
-            self._known_miss.clear()
             self._generation += 1
 
         with self._tracker_lock:
@@ -327,13 +325,19 @@ class Pipeline:
 
     # ==================== 位置 tracker ====================
 
-    def _assign_stable_key(self, para_box, fallback_key):
+    def _assign_stable_key(self, para_box, fallback_key, used_keys=None):
+        """
+        位置匹配复用老 key
+
+        used_keys：本帧已被占用的 key 集合，防止多个段落撞同一个 key
+        """
         now = time.time()
         x1, y1, x2, y2 = para_box
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
 
         with self._tracker_lock:
+            # 清理超时
             expired = [k for k, e in self._tracker_entries.items()
                        if now - e['last_seen'] > TRACKER_TIMEOUT]
             for k in expired:
@@ -342,6 +346,10 @@ class Pipeline:
             best_key = None
             best_dist = float('inf')
             for k, e in self._tracker_entries.items():
+                # ⭐ 跳过本帧已用的 key
+                if used_keys and k in used_keys:
+                    continue
+
                 ex1, ey1, ex2, ey2 = e['box']
                 ecx = (ex1 + ex2) / 2
                 ecy = (ey1 + ey2) / 2
@@ -353,13 +361,25 @@ class Pipeline:
             if best_key is not None and best_dist < POSITION_MATCH_TOLERANCE:
                 self._tracker_entries[best_key]['box'] = (x1, y1, x2, y2)
                 self._tracker_entries[best_key]['last_seen'] = now
+                if used_keys is not None:
+                    used_keys.add(best_key)
                 return best_key
-            else:
-                self._tracker_entries[fallback_key] = {
-                    'box': (x1, y1, x2, y2),
-                    'last_seen': now,
-                }
-                return fallback_key
+
+            # fallback_key 也可能已被本帧用
+            if used_keys and fallback_key in used_keys:
+                # 生成一个带盐的 key
+                fallback_key = hash_text(
+                    f"{fallback_key}|{int(x1)}|{int(y1)}")
+                while used_keys and fallback_key in used_keys:
+                    fallback_key = hash_text(fallback_key + "|salt")
+
+            self._tracker_entries[fallback_key] = {
+                'box': (x1, y1, x2, y2),
+                'last_seen': now,
+            }
+            if used_keys is not None:
+                used_keys.add(fallback_key)
+            return fallback_key
 
     def _dedupe_same_frame(self, cur_items):
         def norm(t):
@@ -430,7 +450,6 @@ class Pipeline:
         return np.asarray(small, dtype=np.int16)
 
     def _get_changed_bbox(self, img):
-        """帧差检测（修复：连通域过滤 + 动态 padding）"""
         full_frame = (0, 0, img.shape[1], img.shape[0])
         if not self.state.enable_frame_diff:
             return full_frame
@@ -459,7 +478,6 @@ class Pipeline:
         if changed_ratio > ffr:
             return full_frame
 
-        # ⭐ 连通域过滤：只取主要变化区，忽略角落小噪声
         if _CV2_OK and changed_ratio < ffr * 0.5:
             try:
                 mask_u8 = (mask.astype(np.uint8) * 255)
@@ -500,7 +518,6 @@ class Pipeline:
                 t_x2 = max(xs_list)
                 t_y2 = max(ys_list)
 
-                # ⭐ 动态 padding：变化区高度 × FRAME_DIFF_PADDING_RATIO
                 change_h = (t_y2 - t_y1) * sy
                 pad = max(base_pad,
                           int(change_h * FRAME_DIFF_PADDING_RATIO))
@@ -513,7 +530,6 @@ class Pipeline:
             except Exception as e:
                 log.debug(f"[帧差] 连通域分析失败：{e}")
 
-        # 回退：直接 bbox
         ys, xs = np.where(mask)
         if len(xs) == 0:
             return None
@@ -577,7 +593,6 @@ class Pipeline:
         return max(1, n)
 
     def _ocr_multithread(self, img, x, y, w, h):
-        """分块 OCR（修复：均匀分块 + 更大重叠 + IoU 去重）"""
         n = self._decide_chunks(h)
         if n <= 1:
             crop = img[y:y+h, x:x+w]
@@ -585,7 +600,6 @@ class Pipeline:
             items = self.ocr.recognize(crop_small)
             return self._remap_items(items, x, y, scale)
 
-        # ⭐ 均匀分块：保证每块高度基本一致
         chunks = []
         for i in range(n):
             cy1 = y + (h * i) // n
@@ -633,10 +647,6 @@ class Pipeline:
         return out
 
     def _dedupe(self, items):
-        """
-        去重（修复版）：
-        - 文本相同 + box IoU > 0.5 → 判为重叠区重复，保留面积大的
-        """
         if not items:
             return []
 
@@ -726,6 +736,57 @@ class Pipeline:
         if zh:
             return zh
         return None
+
+    # ==================== 二次 OCR 验证 ====================
+
+    def _verify_paragraph(self, p, img, region):
+        x1, y1, x2, y2 = p['box']
+        if (x2 - x1) * (y2 - y1) < OCR_VERIFY_MIN_AREA:
+            return True
+
+        pad = OCR_VERIFY_PADDING
+        h, w = img.shape[:2]
+        cx1 = max(0, x1 - pad)
+        cy1 = max(0, y1 - pad)
+        cx2 = min(w, x2 + pad)
+        cy2 = min(h, y2 + pad)
+        if cx2 <= cx1 or cy2 <= cy1:
+            return True
+
+        crop = img[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return True
+
+        crop_small, scale = self._shrink_for_ocr(crop)
+        try:
+            items = self.ocr.recognize(crop_small)
+        except Exception as e:
+            log.debug(f"[验证] OCR 异常：{e}")
+            return OCR_VERIFY_FAIL_OPEN
+
+        if not items:
+            return False
+
+        new_text = ''
+        for it in items:
+            t = it['text'].strip()
+            if t:
+                new_text += t
+
+        if not new_text:
+            return False
+
+        old_text = p['text'].strip()
+        if not old_text:
+            return False
+
+        sim = text_similarity(old_text, new_text)
+        if sim >= OCR_VERIFY_SIMILARITY:
+            return True
+
+        log.debug(f"[验证] 不通过 sim={sim:.2f} | "
+                  f"old={old_text[:30]!r} | new={new_text[:30]!r}")
+        return False
 
     # ==================== 主处理 ====================
 
@@ -938,6 +999,12 @@ class Pipeline:
         if s['frames'] == 0:
             return
 
+        verify_tag = ''
+        if self.state.enable_ocr_verify:
+            verify_tag = (f" | 验证 通过 {s['verify_pass']} / "
+                          f"丢弃 {s['verify_fail']} | "
+                          f"验证 {s['verify']:.1f}ms")
+
         log.info(
             f"[性能] 最近 {PERF_REPORT_INTERVAL:.0f}s | "
             f"帧数 {s['frames']}（OCR {s['frames_with_ocr']} / "
@@ -948,6 +1015,7 @@ class Pipeline:
             f"合并 {s['merge']:.1f}ms | "
             f"推送 {s['emit']:.1f}ms | "
             f"总计 {s['total']:.1f}ms"
+            f"{verify_tag}"
         )
 
     # ==================== 翻译异步 ====================
@@ -995,6 +1063,7 @@ class Pipeline:
         fine_enabled = self.state.enable_fine_text and CV2_AVAILABLE
         base_font = self.state.base_font_size
         display_mode = getattr(self.state, 'display_mode', 'overlay')
+        verify_on = getattr(self.state, 'enable_ocr_verify', False)
 
         try:
             scroll_mode = self.state.is_scrolling()
@@ -1004,6 +1073,11 @@ class Pipeline:
         cur_items = {}
         fine_used = 0
         inpaint_used = 0
+        verify_failed = 0
+        t_verify_total = 0.0
+
+        # ⭐ 本帧已用 key（防重复）
+        used_keys = set()
 
         for p in paragraphs:
             p_hash = hash_paragraph(p)
@@ -1013,9 +1087,19 @@ class Pipeline:
 
             x1, y1, x2, y2 = p['box']
 
+            if verify_on:
+                t_v0 = time.time()
+                passed = self._verify_paragraph(p, img, region)
+                t_v1 = time.time()
+                t_verify_total += (t_v1 - t_v0) * 1000
+                self._perf.verify(passed)
+                if not passed:
+                    verify_failed += 1
+                    continue
+
             fallback_key = paragraph_display_key(p)
             display_key = self._assign_stable_key(
-                (x1, y1, x2, y2), fallback_key)
+                (x1, y1, x2, y2), fallback_key, used_keys)
 
             if display_mode in ('bilingual', 'window'):
                 avg = self._crop_avg_color(img, x1, y1, x2, y2)
@@ -1091,6 +1175,11 @@ class Pipeline:
             item.update(item_extra)
             cur_items[display_key] = item
 
+        self._perf.add('t_verify', t_verify_total)
+
+        if verify_on and verify_failed > 0:
+            log.debug(f"[验证] 丢弃 {verify_failed} 段")
+
         if scroll_mode:
             before = len(cur_items)
             cur_items = self._dedupe_same_frame(cur_items)
@@ -1098,23 +1187,11 @@ class Pipeline:
             if before != after:
                 log.debug(f"[滚动] 同帧去重 {before} → {after}")
 
+        # ⭐ 关键改动：直接替换 known_items（不再做缺帧容忍）
+        # 消失的 key 交给 EmitDebouncer 处理（MISS_TOLERANCE=2）
         with self._known_lock:
             gen_at_start = self._generation
-
-            for key, item in cur_items.items():
-                self._known_items[key] = item
-                self._known_miss[key] = 0
-
-            for key in list(self._known_items.keys()):
-                if key in cur_items:
-                    continue
-                m = self._known_miss.get(key, 0) + 1
-                if m > MISS_FRAMES_TOLERANCE:
-                    del self._known_items[key]
-                    self._known_miss.pop(key, None)
-                else:
-                    self._known_miss[key] = m
-
+            self._known_items = dict(cur_items)
             all_known = list(self._known_items.values())
 
         stable = self.emit_debouncer.process(all_known)

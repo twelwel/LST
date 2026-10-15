@@ -596,6 +596,10 @@ class OverlayWindow:
         self.boxes = {}
         self.base_font_size = 15
 
+        # 双语模式下译文相对原文的额外偏移（像素）
+        # 正数=译文更靠下，负数=译文向上覆盖原文
+        self.bilingual_gap = BILINGUAL_GAP
+
         self.use_pool = True
         self._pool = []
 
@@ -675,6 +679,13 @@ class OverlayWindow:
             except Exception:
                 pass
 
+    def set_bilingual_gap(self, gap):
+        """设置双语模式下译文相对原文的距离（像素）"""
+        try:
+            self.bilingual_gap = int(gap)
+        except Exception:
+            return
+
     def update(self, items, base_font_size=15):
         self.base_font_size = base_font_size
         if not items:
@@ -704,7 +715,7 @@ class OverlayWindow:
                 # 双语：放在原文底部下方，宽度自适应，高度自适应多行
                 orig_y2 = item.get('orig_y2', y2)
                 new_x1 = x1
-                new_y1 = orig_y2 + BILINGUAL_GAP
+                new_y1 = orig_y2 + self.bilingual_gap
                 new_w = _calc_bilingual_width(text, item_font, orig_w)
                 new_h = _calc_bilingual_height(text, new_w, item_font)
                 bg_image = None

@@ -530,3 +530,29 @@ def filter_title_logo(items, debug=False):
             continue
         valid.append(it)
     return valid
+
+# ==================== 文本相似度 ====================
+
+def text_similarity(a, b):
+    """
+    归一化 + 双向包含 + SequenceMatcher
+    - 一方是另一方的子串 → 1.0
+    - 否则算 SequenceMatcher 相似度
+    """
+    if not a or not b:
+        return 0.0
+
+    import re as _re
+    from difflib import SequenceMatcher as _SM
+
+    a_n = _re.sub(r'\s+', '', a).lower()
+    b_n = _re.sub(r'\s+', '', b).lower()
+
+    if not a_n or not b_n:
+        return 0.0
+    if a_n == b_n:
+        return 1.0
+    if a_n in b_n or b_n in a_n:
+        return 1.0
+
+    return _SM(None, a_n, b_n).ratio()
