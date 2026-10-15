@@ -1,8 +1,9 @@
 """
 自动排版模块
 - OCR 异常框过滤
-- 通用内容过滤（艺术字/招牌/数字/单位等）
-- 段落合并
+- 通用过滤（只过滤数字、单位、图像）
+- 英文模式过滤（只保留包含英文字母的文本）
+- 段落合并（三向对齐 + 宽度相似）
 - 自适应字号（像素级估算，中英文区分）
 """
 
@@ -18,19 +19,22 @@ MIN_MERGE_LINE_LENGTH = 15
 MIN_MERGE_LINE_WIDTH = 150
 LENGTH_SIMILAR_RATIO = 0.35
 
+WIDTH_SIMILAR_RATIO = 0.3
+ALIGN_TOLERANCE_RATIO = 2.0
+
+DEBUG_MERGE = False
+
+
 # ==================== OCR 异常框过滤参数 ====================
 MAX_WIDTH_RATIO = 0.98
 MAX_HEIGHT_RATIO = 0.50
 MAX_AREA_RATIO = 0.30
 ABS_MAX_WIDTH = 3000
 ABS_MAX_HEIGHT = 400
-
 MIN_CONFIDENCE_LENGTH = 2
 
 # ==================== 通用过滤参数 ====================
 DIGIT_RATIO_THRESHOLD = 0.6
-SHORT_TEXT_LENGTH = 3
-SYMBOL_RATIO_THRESHOLD = 0.5
 
 UNIT_PATTERN = re.compile(
     r'^\s*[\d\.,]+\s*'
@@ -48,21 +52,23 @@ DECORATIVE_CHARS = set(
     'ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ'
 )
 
+# ==================== 英文模式参数 ====================
+ENGLISH_LETTER_RATIO = 0.3
+
 # ==================== 字号参数 ====================
 MIN_FONT_SIZE = 9
 MAX_FONT_SIZE = 28
 LINE_HEIGHT_RATIO = 1.25
 
-# 字符宽度系数（相对字号）
 WIDTH_CJK = 1.0
 WIDTH_ASCII_WIDE = 0.65
 WIDTH_ASCII = 0.55
 WIDTH_ASCII_NARROW = 0.35
 
-# ==================== 位置量化 ====================
-# 段落 key 里位置的量化粒度（像素）
-# 小于该阈值的抖动视为同一位置
-POSITION_KEY_QUANTIZE = 20
+# ==================== 位置量化（静止模式） ====================
+POSITION_KEY_QUANTIZE = 40
+POSITION_KEY_QUANTIZE_Y = 20
+POSITION_KEY_QUANTIZE_H = 12
 
 
 # ==================== 哈希工具 ====================
@@ -86,38 +92,28 @@ def get_line_hashes(paragraph):
 
 
 def paragraph_display_key(paragraph):
-    """
-    段落显示 key
-    ⚠️ 必须包含位置信息，否则不同位置的相同文本会互相覆盖
-
-    - 用「首行文本 + 位置量化」做 key
-    - 位置量化到 POSITION_KEY_QUANTIZE 像素
-    - 屏幕抖动 <阈值 视为同一位置 → 更新而非叠加
-    """
-    lines = paragraph.get('lines')
-    if not lines:
-        text = (paragraph.get('text') or '').strip()
-        box = paragraph.get('box', (0, 0, 0, 0))
-    else:
-        first = lines[0]
-        text = (first.get('text') or '').strip()
-        box = first.get('box', (0, 0, 0, 0))
-
+    """段落显示 key（位置量化，稳定）"""
+    box = paragraph.get('box', (0, 0, 0, 0))
     try:
-        x1 = int(box[0])
-        y1 = int(box[1])
+        x1, y1, x2, y2 = (int(box[0]), int(box[1]),
+                          int(box[2]), int(box[3]))
     except Exception:
-        x1 = y1 = 0
+        x1 = y1 = x2 = y2 = 0
 
-    q = POSITION_KEY_QUANTIZE
-    key = f"{text}|{x1 // q}|{y1 // q}"
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    h = max(1, y2 - y1)
+
+    qx = POSITION_KEY_QUANTIZE
+    qy = POSITION_KEY_QUANTIZE_Y
+    qh = POSITION_KEY_QUANTIZE_H
+
+    key = f"{cx // qx}|{cy // qy}|{h // qh}"
     return hash_text(key)
-
 
 # ==================== OCR 异常框过滤 ====================
 
 def filter_invalid_items(items, region_w=None, region_h=None):
-    """过滤 OCR 误识别的异常文本框"""
     if not items:
         return []
 
@@ -145,11 +141,7 @@ def filter_invalid_items(items, region_w=None, region_h=None):
         if len(text) < MIN_CONFIDENCE_LENGTH:
             continue
 
-        has_meaningful = any(
-            ch.isalnum() or '\u4e00' <= ch <= '\u9fff'
-            for ch in text
-        )
-        if not has_meaningful:
+        if not any(ch.isalnum() or '\u4e00' <= ch <= '\u9fff' for ch in text):
             continue
 
         if h > 0 and (w / h) > 50:
@@ -161,24 +153,13 @@ def filter_invalid_items(items, region_w=None, region_h=None):
     return valid
 
 
-# ==================== 通用内容过滤 ====================
+# ==================== 通用过滤（只过滤数字/单位/图像） ====================
 
 def _digit_ratio(text):
     if not text:
         return 0
     digits = sum(1 for ch in text if ch.isdigit() or ch in '.,')
     return digits / len(text)
-
-
-def _symbol_ratio(text):
-    if not text:
-        return 0
-    symbols = sum(
-        1 for ch in text
-        if not ch.isalnum() and not ('\u4e00' <= ch <= '\u9fff')
-        and not ch.isspace()
-    )
-    return symbols / len(text)
 
 
 def _is_decorative(text):
@@ -192,71 +173,118 @@ def _is_number_or_unit(text):
     t = text.strip()
     if not t:
         return True
-
     if re.fullmatch(r'[\d\.,]+', t):
         return True
-
     if UNIT_PATTERN.match(t):
         return True
-
     if _digit_ratio(t) >= DIGIT_RATIO_THRESHOLD:
         if not any('\u4e00' <= ch <= '\u9fff' for ch in t):
             return True
-
     return False
 
 
-def _is_too_short(text):
-    t = text.strip()
-    if len(t) <= SHORT_TEXT_LENGTH:
-        if not any('\u4e00' <= ch <= '\u9fff' for ch in t):
-            return True
-    return False
-
-
-def _is_symbol_heavy(text):
-    return _symbol_ratio(text) >= SYMBOL_RATIO_THRESHOLD
+def _is_symbol_only(text):
+    if not text:
+        return True
+    for ch in text:
+        if ch.isalnum():
+            return False
+        if '\u4e00' <= ch <= '\u9fff':
+            return False
+    return True
 
 
 def is_general_content_filtered(text, debug=False):
     if not text or not text.strip():
         return True
-
     t = text.strip()
-
-    if _is_decorative(t):
-        if debug:
-            print(f"[通用过滤] 装饰字符: '{t}'")
-        return True
-
     if _is_number_or_unit(t):
         if debug:
             print(f"[通用过滤] 数字/单位: '{t}'")
         return True
-
-    if _is_too_short(t):
+    if _is_decorative(t):
         if debug:
-            print(f"[通用过滤] 过短: '{t}'")
+            print(f"[通用过滤] 装饰字符: '{t}'")
         return True
-
-    if _is_symbol_heavy(t):
+    if _is_symbol_only(t):
         if debug:
-            print(f"[通用过滤] 符号过多: '{t}'")
+            print(f"[通用过滤] 纯符号: '{t}'")
         return True
-
     return False
 
 
 def filter_general_content(items, debug=False):
     if not items:
         return []
-
     valid = []
     for it in items:
         text = it['text'].strip()
         if not text:
             continue
         if is_general_content_filtered(text, debug=debug):
+            continue
+        valid.append(it)
+    return valid
+
+
+# ==================== 英语特化过滤 ====================
+
+# 英文字母占非空白字符的最低比例
+ENGLISH_LETTER_RATIO = 0.5
+# 中文占非空白字符的最高比例
+ENGLISH_MAX_CHINESE_RATIO = 0.2
+
+
+def is_english_filtered(text, debug=False):
+    """
+    英语特化过滤：
+    - 必须含英文字母
+    - 英文字母占非空白字符 >= 50%
+    - 中文占非空白字符 <= 20%
+    """
+    if not text or not text.strip():
+        return True
+
+    t = text.strip()
+
+    letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
+    if letters == 0:
+        if debug:
+            print(f"[英语特化] 无英文字母: '{t}'")
+        return True
+
+    non_space = sum(1 for ch in t if not ch.isspace())
+    if non_space == 0:
+        return True
+
+    letter_ratio = letters / non_space
+    if letter_ratio < ENGLISH_LETTER_RATIO:
+        if debug:
+            print(f"[英语特化] 字母占比 {letter_ratio:.2f} < "
+                  f"{ENGLISH_LETTER_RATIO}: '{t}'")
+        return True
+
+    cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
+    cn_ratio = cn / non_space
+    if cn_ratio > ENGLISH_MAX_CHINESE_RATIO:
+        if debug:
+            print(f"[英语特化] 中文占比 {cn_ratio:.2f} > "
+                  f"{ENGLISH_MAX_CHINESE_RATIO}: '{t}'")
+        return True
+
+    return False
+
+
+def filter_english_only(items, debug=False):
+    """英语特化过滤（供 pipeline 调用）"""
+    if not items:
+        return []
+    valid = []
+    for it in items:
+        text = it['text'].strip()
+        if not text:
+            continue
+        if is_english_filtered(text, debug=debug):
             continue
         valid.append(it)
     return valid
@@ -280,6 +308,28 @@ def _length_similar(text_a, text_b):
     return min(a, b) / max(a, b) >= LENGTH_SIMILAR_RATIO
 
 
+# ==================== 对齐检测 ====================
+
+def _is_aligned(prev, cur, avg_h):
+    px1, py1, px2, py2 = prev['box']
+    x1, y1, x2, y2 = cur['box']
+
+    left_d   = abs(x1 - px1)
+    right_d  = abs(x2 - px2)
+    center_d = abs((x1 + x2) / 2 - (px1 + px2) / 2)
+    min_align = min(left_d, right_d, center_d)
+
+    return min_align <= avg_h * ALIGN_TOLERANCE_RATIO
+
+
+def _width_similar(prev, cur):
+    pw = prev['box'][2] - prev['box'][0]
+    cw = cur['box'][2] - cur['box'][0]
+    if pw <= 0 or cw <= 0:
+        return False
+    return min(pw, cw) / max(pw, cw) >= WIDTH_SIMILAR_RATIO
+
+
 # ==================== 段落合并 ====================
 
 def merge_lines_to_paragraphs(items):
@@ -296,12 +346,17 @@ def merge_lines_to_paragraphs(items):
         x1, y1, x2, y2 = it['box']
 
         prev_h = max(1, py2 - py1)
-        gap = y1 - py2
+        cur_h = max(1, y2 - y1)
+        avg_h = (prev_h + cur_h) / 2
 
-        same_position = (
-            gap < prev_h * LINE_GAP_RATIO
-            and abs(x1 - px1) < X_TOLERANCE
-        )
+        gap = y1 - py2
+        if gap < -avg_h * 0.5:
+            same_line = True
+        else:
+            same_line = gap < avg_h * LINE_GAP_RATIO
+
+        aligned = _is_aligned(prev, it, avg_h)
+        width_ok = _width_similar(prev, it)
 
         prev_long = _is_long_line(prev)
         cur_long = _is_long_line(it)
@@ -312,7 +367,10 @@ def merge_lines_to_paragraphs(items):
         else:
             length_ok = True
 
-        can_merge = same_position and at_least_one_long and length_ok
+        can_merge = (
+            same_line and aligned and width_ok
+            and at_least_one_long and length_ok
+        )
 
         if can_merge:
             current.append(it)
@@ -322,6 +380,11 @@ def merge_lines_to_paragraphs(items):
 
     if current:
         paragraphs.append(_build(current))
+
+    if DEBUG_MERGE:
+        for i, p in enumerate(paragraphs):
+            print(f"[合并] P{i} box={p['box']} "
+                  f"lines={len(p['lines'])} text={p['text'][:40]!r}")
 
     return paragraphs
 
@@ -342,25 +405,17 @@ def _build(lines):
     x2 = max(it['box'][2] for it in lines)
     y2 = max(it['box'][3] for it in lines)
 
-    return {
-        'text': text,
-        'box': (x1, y1, x2, y2),
-        'lines': lines,
-    }
+    return {'text': text, 'box': (x1, y1, x2, y2), 'lines': lines}
 
 
 # ==================== 字号（像素级估算） ====================
 
-# 窄字符集合（宽 ≈ 0.35）
 _NARROW_CHARS = set("iIl1|!.,;:'\"`^ \t\r\n")
-# 宽 ASCII 集合（宽 ≈ 0.65）
 _WIDE_ASCII = set("MW@%&#")
 
 
 def _char_width(ch, size):
-    """估算单个字符在给定字号下的像素宽度"""
     code = ord(ch)
-    # CJK 统一表意文字、CJK 标点、全角字符、日文假名
     if (0x4E00 <= code <= 0x9FFF or
             0x3000 <= code <= 0x303F or
             0xFF00 <= code <= 0xFFEF or
@@ -374,14 +429,12 @@ def _char_width(ch, size):
 
 
 def estimate_text_width(text, size):
-    """估算整段文本单行显示的像素宽度"""
     if not text:
         return 0
     return sum(_char_width(ch, size) for ch in text)
 
 
 def count_lines(text, size, max_width):
-    """按像素宽度贪心模拟换行，返回所需行数"""
     if not text or max_width <= 0:
         return 1
     lines = 1
@@ -397,15 +450,6 @@ def count_lines(text, size, max_width):
 
 
 def calc_font_size(text, w, h, base_size):
-    """
-    自适应字号：
-    1. 上限 = min(base_size, MAX_FONT_SIZE)，下限 = MIN_FONT_SIZE
-    2. 从大到小尝试：
-       - 先按像素宽度判断能否一行放下
-       - 单行能容纳 → 检查高度
-       - 单行放不下 → 模拟换行后检查高度
-    3. 找到最大的可行字号
-    """
     if not text or w <= 0 or h <= 0:
         return max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, base_size))
 
@@ -431,3 +475,58 @@ def is_chinese_text(text, threshold=0.5):
         return False
     cn = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
     return cn / total >= threshold
+
+# ==================== 标题 / Logo 过滤 ====================
+
+# 框高 > 本帧中位高度 × 该值 → 视为标题/Logo
+TITLE_HEIGHT_RATIO = 1.8
+
+
+def is_title_logo_filtered(text, box, med_height=None, debug=False):
+    """
+    过滤标题 / Logo / 品牌名：
+    1. 全大写字母（≥ 2 个字母且全大写，无小写）
+    2. 字号过大（框高 > 中位高度 × TITLE_HEIGHT_RATIO）
+    """
+    t = text.strip()
+    if not t:
+        return True
+
+    # 规则 1：全大写
+    letters = [ch for ch in t if ch.isascii() and ch.isalpha()]
+    if len(letters) >= 2:
+        has_lower = any(ch.islower() for ch in letters)
+        if not has_lower:
+            if debug:
+                print(f"[标题过滤] 全大写: '{t}'")
+            return True
+
+    # 规则 2：字号过大
+    if med_height is not None and med_height > 0:
+        h = box[3] - box[1]
+        if h > med_height * TITLE_HEIGHT_RATIO:
+            if debug:
+                print(f"[标题过滤] 字号过大 "
+                      f"h={h} > {med_height * TITLE_HEIGHT_RATIO:.0f}: '{t}'")
+            return True
+
+    return False
+
+
+def filter_title_logo(items, debug=False):
+    """过滤标题/Logo（需先算框中位高度）"""
+    if not items:
+        return []
+
+    heights = sorted((it['box'][3] - it['box'][1]) for it in items)
+    med_height = heights[len(heights) // 2] if heights else 0
+
+    valid = []
+    for it in items:
+        text = it['text'].strip()
+        if not text:
+            continue
+        if is_title_logo_filtered(text, it['box'], med_height, debug=debug):
+            continue
+        valid.append(it)
+    return valid

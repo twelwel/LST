@@ -3,6 +3,13 @@
 - 快速响应层（本地词典 + 短语缓存）：所有策略共用，只处理单词和词组
 - 显示模式：覆盖 / 双语 / 小窗口
 - 译文颜色：全模式通用
+- 输出防抖：位置匹配复用 key + EmitDebouncer + Generation 保护
+- 通用过滤：只过滤数字、单位、图像
+- 英语特化：只识别字母主导的英文段落
+- 标题过滤：全大写 / 超大字号
+- 帧差检测：连通域过滤 + 动态 padding
+- 分块 OCR：均匀分块 + IoU 去重
+- 性能统计：各阶段平均延迟，定期打印
 """
 
 import queue
@@ -30,6 +37,8 @@ from layout import (
     is_chinese_text,
     filter_invalid_items,
     filter_general_content,
+    filter_english_only,
+    filter_title_logo,
 )
 from inpaint import (
     inpaint_region,
@@ -46,6 +55,7 @@ from config import (
     LOCAL_LOOKUP_MAX_CHARS,
 )
 from translation.strategies import STRATEGY_LABELS
+from emit_debouncer import EmitDebouncer
 
 
 log = get_logger('pipeline')
@@ -55,12 +65,83 @@ THUMB_SIZE = 40
 PIXEL_DIFF_THRESHOLD = 20
 INPAINT_CACHE_MAX = 200
 
-MULTITHREAD_OCR_MIN_AREA = 400 * 120
-MULTITHREAD_OCR_OVERLAP = 15
-MULTITHREAD_OCR_MIN_CHUNK_H = 300
-MULTITHREAD_OCR_MAX_CHUNKS = 8
+# ============ 分块 OCR 参数（修复版）============
+MULTITHREAD_OCR_MIN_AREA = 600 * 150   # 提高门槛，避免小区域分块
+MULTITHREAD_OCR_OVERLAP = 40           # 15 → 40（覆盖一行小字）
+MULTITHREAD_OCR_MIN_CHUNK_H = 400      # 300 → 400
+MULTITHREAD_OCR_MAX_CHUNKS = 4         # 8 → 4（每块更大，减少切字）
 
 SLOW_THRESHOLD_MS = 300
+
+MISS_FRAMES_TOLERANCE = 3
+
+PERF_REPORT_INTERVAL = 10.0
+
+# ============ 位置匹配参数 ============
+POSITION_MATCH_TOLERANCE = 40
+TRACKER_TIMEOUT = 2.0
+
+# ============ 帧差检测参数（修复版）============
+# 缩略图上的最小连通域面积（像素），忽略小噪声
+FRAME_DIFF_MIN_COMPONENT_AREA = 4
+# 变化区动态 padding = 变化区高度 × 该比例
+FRAME_DIFF_PADDING_RATIO = 0.3
+# 取最大的几个连通域（避免角落噪声拉大 bbox）
+FRAME_DIFF_MAX_COMPONENTS = 5
+
+
+# ==================== 性能统计 ====================
+
+class _PerfStats:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.frames = 0
+        self.t_frame_diff = 0.0
+        self.t_ocr = 0.0
+        self.t_filter = 0.0
+        self.t_merge = 0.0
+        self.t_emit = 0.0
+        self.t_total = 0.0
+        self.frames_with_ocr = 0
+        self.frames_skipped = 0
+
+    def add(self, key, ms):
+        with self._lock:
+            setattr(self, key, getattr(self, key) + ms)
+
+    def tick(self, has_ocr=False, skipped=False):
+        with self._lock:
+            self.frames += 1
+            if has_ocr:
+                self.frames_with_ocr += 1
+            if skipped:
+                self.frames_skipped += 1
+
+    def summary_and_reset(self):
+        with self._lock:
+            n = max(1, self.frames)
+            no = max(1, self.frames_with_ocr)
+            result = {
+                'frames': self.frames,
+                'frames_with_ocr': self.frames_with_ocr,
+                'frames_skipped': self.frames_skipped,
+                'frame_diff': self.t_frame_diff / n,
+                'ocr': self.t_ocr / no,
+                'filter': self.t_filter / n,
+                'merge': self.t_merge / n,
+                'emit': self.t_emit / n,
+                'total': self.t_total / n,
+            }
+            self.frames = 0
+            self.t_frame_diff = 0.0
+            self.t_ocr = 0.0
+            self.t_filter = 0.0
+            self.t_merge = 0.0
+            self.t_emit = 0.0
+            self.t_total = 0.0
+            self.frames_with_ocr = 0
+            self.frames_skipped = 0
+            return result
 
 
 class AppState:
@@ -70,6 +151,8 @@ class AppState:
                  use_inpainting=False,
                  enable_fine_text=False,
                  enable_general_filter=True,
+                 enable_english_only=False,
+                 enable_title_filter=False,
                  enable_fast_lookup=True,
                  local_dict_path='',
                  mode_cfg=None,
@@ -86,32 +169,21 @@ class AppState:
         self.use_inpainting = use_inpainting
         self.enable_fine_text = enable_fine_text
         self.enable_general_filter = enable_general_filter
-
-        # 快速响应层开关
+        self.enable_english_only = enable_english_only
+        self.enable_title_filter = enable_title_filter
         self.enable_fast_lookup = enable_fast_lookup
-        # OCR 加速优化开关（控制 cv2 缩放）
         self.enable_ocr_speed_opt = enable_ocr_speed_opt
-
-        # 翻译策略（6 种）
         self.translation_strategy = 'single_translate'
-
-        # 显示模式：'overlay' / 'bilingual' / 'window'
         self.display_mode = 'overlay'
-
-        # 译文颜色：'auto' 或 '#RRGGBB'
         self.fg_color = 'auto'
-
         self.local_dict_path = local_dict_path
         self.lock = threading.Lock()
-
         self.frame_similarity_threshold = frame_similarity_threshold
         self.position_quantize = position_quantize
         self.last_frame_keys = None
         self.last_frame_pixels = None
-
         self.idle_count = 0
         self.idle_skip_counter = 0
-
         self.performance_mode = 'medium'
         self.scan_interval = 0.30
         self.change_ratio_threshold = 0.03
@@ -120,21 +192,27 @@ class AppState:
         self.max_ocr_width = 1400
         self.max_ocr_height = 600
         self.fast_mode = False
-
         self.enable_frame_diff = enable_frame_diff
         self.enable_filter = enable_filter
         self.enable_block_ocr = enable_block_ocr
         self.enable_async_translate = enable_async_translate
         self.enable_window_pool = enable_window_pool
         self.enable_multithread_ocr = enable_multithread_ocr
-
         self.follow_mode = 'follow'
         self.freeze_overlay = False
         self.scroll_boost = False
         self.pending_change = False
 
+        self._scroll_until = 0.0
+
         if mode_cfg:
             self.apply_mode(mode_cfg)
+
+    def mark_scroll(self):
+        self._scroll_until = time.time() + 0.5
+
+    def is_scrolling(self):
+        return time.time() < self._scroll_until
 
     def apply_mode(self, cfg):
         self.scan_interval = cfg['scan_interval']
@@ -177,9 +255,7 @@ class Pipeline:
         self.inpaint_cache_max = INPAINT_CACHE_MAX
         self._inpaint_lock = threading.Lock()
 
-        # 短语缓存
         self.phrase_cache = PhraseCache()
-        # 本地词典
         self.local_dict = LocalDictionary()
         if state.local_dict_path:
             try:
@@ -190,8 +266,42 @@ class Pipeline:
         self.translate_pool = ThreadPoolExecutor(max_workers=4)
         self._pending_translates = set()
 
+        self.emit_debouncer = EmitDebouncer()
+        self._known_items = {}
+        self._known_miss = {}
+        self._known_lock = threading.Lock()
+
+        self._generation = 0
+
+        self._tracker_entries = {}
+        self._tracker_lock = threading.Lock()
+
+        self._perf = _PerfStats()
+        self._perf_last_report = time.time()
+
     def start(self):
         threading.Thread(target=self._process_loop, daemon=True).start()
+
+    def reset_debouncer(self):
+        with self._known_lock:
+            self._known_items.clear()
+            self._known_miss.clear()
+            self._generation += 1
+
+        with self._tracker_lock:
+            self._tracker_entries.clear()
+
+        self.emit_debouncer.reset()
+
+        try:
+            while True:
+                self.result_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def reset_perf(self):
+        self._perf = _PerfStats()
+        self._perf_last_report = time.time()
 
     def submit(self, img):
         try:
@@ -215,10 +325,72 @@ class Pipeline:
             except Exception as e:
                 log.exception(f"[处理错误] {e}")
 
+    # ==================== 位置 tracker ====================
+
+    def _assign_stable_key(self, para_box, fallback_key):
+        now = time.time()
+        x1, y1, x2, y2 = para_box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+
+        with self._tracker_lock:
+            expired = [k for k, e in self._tracker_entries.items()
+                       if now - e['last_seen'] > TRACKER_TIMEOUT]
+            for k in expired:
+                del self._tracker_entries[k]
+
+            best_key = None
+            best_dist = float('inf')
+            for k, e in self._tracker_entries.items():
+                ex1, ey1, ex2, ey2 = e['box']
+                ecx = (ex1 + ex2) / 2
+                ecy = (ey1 + ey2) / 2
+                d = ((cx - ecx) ** 2 + (cy - ecy) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_key = k
+
+            if best_key is not None and best_dist < POSITION_MATCH_TOLERANCE:
+                self._tracker_entries[best_key]['box'] = (x1, y1, x2, y2)
+                self._tracker_entries[best_key]['last_seen'] = now
+                return best_key
+            else:
+                self._tracker_entries[fallback_key] = {
+                    'box': (x1, y1, x2, y2),
+                    'last_seen': now,
+                }
+                return fallback_key
+
+    def _dedupe_same_frame(self, cur_items):
+        def norm(t):
+            if not t:
+                return ''
+            t = re.sub(r'\s+', '', t)
+            t = re.sub(r'[.,;:!?"\'`~@#$%^&*()\[\]{}<>|\\/'
+                       r'《》【】。，；：！？、""''…—\-_]+', '', t)
+            return t.lower()
+
+        groups = {}
+        for key, item in cur_items.items():
+            n = norm(item.get('text', ''))
+            if not n:
+                groups.setdefault('__u__' + key, [item])
+                continue
+            groups.setdefault(n, []).append(item)
+
+        result = {}
+        for n, items in groups.items():
+            if len(items) == 1:
+                result[items[0]['key']] = items[0]
+            else:
+                best = max(items, key=lambda it:
+                           (it['x2'] - it['x1']) * (it['y2'] - it['y1']))
+                result[best['key']] = best
+        return result
+
     # ==================== 译文颜色 ====================
 
     def _resolve_fg_color(self, avg_rgb):
-        """根据用户设置和背景色决定前景色"""
         user_fg = getattr(self.state, 'fg_color', 'auto')
         if user_fg and user_fg != 'auto':
             return user_fg
@@ -240,7 +412,6 @@ class Pipeline:
                 return gray.astype(np.int16)
             except Exception:
                 pass
-
         try:
             h, w = img.shape[:2]
             sy = max(1, h // THUMB_SIZE)
@@ -252,7 +423,6 @@ class Pipeline:
             return gray.astype(np.int16)
         except Exception:
             pass
-
         small = PILImage.fromarray(img).convert('L').resize(
             (THUMB_SIZE, THUMB_SIZE),
             PILImage.Resampling.NEAREST,
@@ -260,14 +430,14 @@ class Pipeline:
         return np.asarray(small, dtype=np.int16)
 
     def _get_changed_bbox(self, img):
+        """帧差检测（修复：连通域过滤 + 动态 padding）"""
         full_frame = (0, 0, img.shape[1], img.shape[0])
-
         if not self.state.enable_frame_diff:
             return full_frame
 
         crt = self.state.change_ratio_threshold
         ffr = self.state.full_frame_ratio
-        pad = self.state.bbox_padding
+        base_pad = self.state.bbox_padding
 
         thumb = self._make_thumbnail(img)
         prev = self.state.last_frame_pixels
@@ -284,13 +454,66 @@ class Pipeline:
 
         if changed_ratio < crt:
             return None
-
         if not self.state.enable_block_ocr:
             return full_frame
-
         if changed_ratio > ffr:
             return full_frame
 
+        # ⭐ 连通域过滤：只取主要变化区，忽略角落小噪声
+        if _CV2_OK and changed_ratio < ffr * 0.5:
+            try:
+                mask_u8 = (mask.astype(np.uint8) * 255)
+                kernel = np.ones((3, 3), np.uint8)
+                mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+
+                n_labels, labels, stats, _ = \
+                    cv2.connectedComponentsWithStats(
+                        mask_u8, connectivity=8)
+
+                comps = []
+                for i in range(1, n_labels):
+                    area = stats[i, cv2.CC_STAT_AREA]
+                    if area < FRAME_DIFF_MIN_COMPONENT_AREA:
+                        continue
+                    comps.append((area, i))
+                comps.sort(reverse=True)
+                top_n = comps[:FRAME_DIFF_MAX_COMPONENTS]
+
+                if not top_n:
+                    return None
+
+                xs_list = []
+                ys_list = []
+                for area, i in top_n:
+                    cx = stats[i, cv2.CC_STAT_LEFT]
+                    cy = stats[i, cv2.CC_STAT_TOP]
+                    cw = stats[i, cv2.CC_STAT_WIDTH]
+                    ch = stats[i, cv2.CC_STAT_HEIGHT]
+                    xs_list.extend([cx, cx + cw])
+                    ys_list.extend([cy, cy + ch])
+
+                sx = img.shape[1] / THUMB_SIZE
+                sy = img.shape[0] / THUMB_SIZE
+
+                t_x1 = min(xs_list)
+                t_y1 = min(ys_list)
+                t_x2 = max(xs_list)
+                t_y2 = max(ys_list)
+
+                # ⭐ 动态 padding：变化区高度 × FRAME_DIFF_PADDING_RATIO
+                change_h = (t_y2 - t_y1) * sy
+                pad = max(base_pad,
+                          int(change_h * FRAME_DIFF_PADDING_RATIO))
+
+                x1 = max(0, int(t_x1 * sx) - pad)
+                y1 = max(0, int(t_y1 * sy) - pad)
+                x2 = min(img.shape[1], int(t_x2 * sx) + pad)
+                y2 = min(img.shape[0], int(t_y2 * sy) + pad)
+                return (x1, y1, x2 - x1, y2 - y1)
+            except Exception as e:
+                log.debug(f"[帧差] 连通域分析失败：{e}")
+
+        # 回退：直接 bbox
         ys, xs = np.where(mask)
         if len(xs) == 0:
             return None
@@ -298,10 +521,10 @@ class Pipeline:
         sx = img.shape[1] / THUMB_SIZE
         sy = img.shape[0] / THUMB_SIZE
 
-        x1 = max(0, int(xs.min() * sx) - pad)
-        y1 = max(0, int(ys.min() * sy) - pad)
-        x2 = min(img.shape[1], int(xs.max() * sx) + pad)
-        y2 = min(img.shape[0], int(ys.max() * sy) + pad)
+        x1 = max(0, int(xs.min() * sx) - base_pad)
+        y1 = max(0, int(ys.min() * sy) - base_pad)
+        x2 = min(img.shape[1], int(xs.max() * sx) + base_pad)
+        y2 = min(img.shape[0], int(ys.max() * sy) + base_pad)
         return (x1, y1, x2 - x1, y2 - y1)
 
     # ==================== 帧相似度 ====================
@@ -354,21 +577,32 @@ class Pipeline:
         return max(1, n)
 
     def _ocr_multithread(self, img, x, y, w, h):
+        """分块 OCR（修复：均匀分块 + 更大重叠 + IoU 去重）"""
         n = self._decide_chunks(h)
-
         if n <= 1:
             crop = img[y:y+h, x:x+w]
             crop_small, scale = self._shrink_for_ocr(crop)
             items = self.ocr.recognize(crop_small)
             return self._remap_items(items, x, y, scale)
 
-        chunk_h = max(1, h // n)
+        # ⭐ 均匀分块：保证每块高度基本一致
+        chunks = []
+        for i in range(n):
+            cy1 = y + (h * i) // n
+            cy2 = y + (h * (i + 1)) // n
+            if cy2 <= cy1:
+                continue
+            chunks.append((cy1, cy2))
+
+        if not chunks:
+            crop = img[y:y+h, x:x+w]
+            crop_small, scale = self._shrink_for_ocr(crop)
+            items = self.ocr.recognize(crop_small)
+            return self._remap_items(items, x, y, scale)
+
         crops = []
         offsets = []
-
-        for i in range(n):
-            cy1 = y + i * chunk_h
-            cy2 = y + h if i == n - 1 else y + (i + 1) * chunk_h
+        for cy1, cy2 in chunks:
             cy1p = max(y, cy1 - MULTITHREAD_OCR_OVERLAP)
             cy2p = min(y + h, cy2 + MULTITHREAD_OCR_OVERLAP)
             chunk = img[cy1p:cy2p, x:x + w]
@@ -377,11 +611,9 @@ class Pipeline:
             offsets.append((x, cy1p, scale))
 
         results = self.ocr.recognize_batch(crops)
-
         merged = []
         for items, (ox, oy, scale) in zip(results, offsets):
             merged.extend(self._remap_items(items, ox, oy, scale))
-
         return self._dedupe(merged)
 
     def _remap_items(self, items, ox, oy, scale):
@@ -401,52 +633,75 @@ class Pipeline:
         return out
 
     def _dedupe(self, items):
-        seen = set()
+        """
+        去重（修复版）：
+        - 文本相同 + box IoU > 0.5 → 判为重叠区重复，保留面积大的
+        """
+        if not items:
+            return []
+
         result = []
-        for it in items:
-            x1, y1, _, _ = it['box']
-            key = (it['text'].strip(), x1 // 8, y1 // 8)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(it)
-        return result
-
-    # ==================== 短语缓存 ====================
-
-    def _prefill_from_phrases(self, items):
-        """短语缓存命中 → 预填段落缓存（受快速响应层开关控制）"""
-        if not self.state.enable_fast_lookup:
-            return 0
-
-        filled = 0
         for it in items:
             text = it['text'].strip()
             if not text:
                 continue
 
+            bx1, by1, bx2, by2 = it['box']
+            a1 = (bx2 - bx1) * (by2 - by1)
+
+            dup = False
+            for idx, kept in enumerate(result):
+                if kept['text'].strip() != text:
+                    continue
+
+                kx1, ky1, kx2, ky2 = kept['box']
+                ix1 = max(bx1, kx1)
+                iy1 = max(by1, ky1)
+                ix2 = min(bx2, kx2)
+                iy2 = min(by2, ky2)
+                if ix2 <= ix1 or iy2 <= iy1:
+                    continue
+
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                a2 = (kx2 - kx1) * (ky2 - ky1)
+                union = a1 + a2 - inter
+                if union <= 0:
+                    continue
+                if inter / union > 0.5:
+                    dup = True
+                    if a1 > a2:
+                        result[idx] = it
+                    break
+
+            if not dup:
+                result.append(it)
+
+        return result
+
+    # ==================== 短语缓存 ====================
+
+    def _prefill_from_phrases(self, items):
+        if not self.state.enable_fast_lookup:
+            return 0
+        filled = 0
+        for it in items:
+            text = it['text'].strip()
+            if not text:
+                continue
             if len(text) > LOCAL_LOOKUP_MAX_CHARS:
                 continue
             wc = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
             if wc > LOCAL_LOOKUP_MAX_WORDS:
                 continue
-
             zh = self.phrase_cache.lookup_fuzzy(text)
             if not zh:
                 continue
-
-            fake_para = {
-                'text': text,
-                'box': it['box'],
-                'lines': [it],
-            }
+            fake_para = {'text': text, 'box': it['box'], 'lines': [it]}
             p_hash = hash_paragraph(fake_para)
-
             if self.cache.get(p_hash) is None:
                 line_hashes = get_line_hashes(fake_para)
                 self.cache.put(p_hash, zh, line_hashes)
                 filled += 1
-
         if filled:
             log.info(f"[快速响应] 预填 {filled} 条段落")
         return filled
@@ -454,32 +709,22 @@ class Pipeline:
     # ==================== 快速响应层 ====================
 
     def _lookup_local(self, text):
-        """
-        快速响应层（本地词典 + 短语缓存）
-        - 开关关闭 → 直接返回 None（全走策略）
-        - 只处理单词和词组，长文本跳过交给上层策略
-        """
         if not self.state.enable_fast_lookup:
             return None
-
         text = (text or '').strip()
         if not text:
             return None
-
         if len(text) > LOCAL_LOOKUP_MAX_CHARS:
             return None
         word_count = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
         if word_count > LOCAL_LOOKUP_MAX_WORDS:
             return None
-
         zh = self.phrase_cache.lookup_fuzzy(text)
         if zh:
             return zh
-
         zh = self.local_dict.smart_lookup(text)
         if zh:
             return zh
-
         return None
 
     # ==================== 主处理 ====================
@@ -491,17 +736,22 @@ class Pipeline:
         t_start = time.time()
 
         bbox = self._get_changed_bbox(img)
+        t_frame_diff = time.time()
+
         if bbox is None:
             self.state.idle_count += 1
+            self._perf.tick(skipped=True)
+            self._maybe_report_perf()
             return
+
         self.state.idle_count = 0
         self.state.idle_skip_counter = 0
         self.state.pending_change = True
 
-        t_frame_diff = time.time()
-
         x, y, w, h = bbox
         if w < 10 or h < 10:
+            self._perf.tick(skipped=True)
+            self._maybe_report_perf()
             return
 
         use_mt = (self.state.enable_multithread_ocr and
@@ -519,36 +769,86 @@ class Pipeline:
         t_ocr = time.time()
 
         if not items:
+            self._perf.tick(has_ocr=True)
+            self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+            self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+            self._perf.add('t_total', (t_ocr - t_start) * 1000)
+            self._maybe_report_perf()
             return
 
         region = self.state.snapshot_region()
 
         if self.state.enable_filter:
             items = filter_invalid_items(
-                items, region['width'], region['height']
-            )
+                items, region['width'], region['height'])
             if not items:
+                self._perf.tick(has_ocr=True)
+                self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+                self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+                self._perf.add('t_total', (t_ocr - t_start) * 1000)
+                self._maybe_report_perf()
                 return
 
         if self.state.enable_general_filter:
             items = filter_general_content(items)
             if not items:
+                self._perf.tick(has_ocr=True)
+                self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+                self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+                self._perf.add('t_total', (t_ocr - t_start) * 1000)
+                self._maybe_report_perf()
                 return
 
-        # 快速响应层预填
+        if getattr(self.state, 'enable_english_only', False):
+            items = filter_english_only(items)
+            if not items:
+                self._perf.tick(has_ocr=True)
+                self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+                self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+                self._perf.add('t_total', (t_ocr - t_start) * 1000)
+                self._maybe_report_perf()
+                return
+
+        if getattr(self.state, 'enable_title_filter', False):
+            items = filter_title_logo(items)
+            if not items:
+                self._perf.tick(has_ocr=True)
+                self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+                self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+                self._perf.add('t_total', (t_ocr - t_start) * 1000)
+                self._maybe_report_perf()
+                return
+
+        t_filter = time.time()
+
         self._prefill_from_phrases(items)
 
         cur_keys = self._make_frame_keys(items)
         if self._is_frame_unchanged(cur_keys):
+            self._perf.tick(has_ocr=True)
+            self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+            self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+            self._perf.add('t_filter', (t_filter - t_ocr) * 1000)
+            self._perf.add('t_total', (t_filter - t_start) * 1000)
+            self._maybe_report_perf()
             return
         self.state.last_frame_keys = cur_keys
 
         paragraphs = merge_lines_to_paragraphs(items)
         to_translate = [p for p in paragraphs if not is_chinese_text(p['text'])]
+
+        t_merge = time.time()
+
         if not to_translate:
+            self._perf.tick(has_ocr=True)
+            self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+            self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+            self._perf.add('t_filter', (t_filter - t_ocr) * 1000)
+            self._perf.add('t_merge', (t_merge - t_filter) * 1000)
+            self._perf.add('t_total', (t_merge - t_start) * 1000)
+            self._maybe_report_perf()
             return
 
-        # 按策略处理
         strategy = getattr(self.state, 'translation_strategy',
                            'single_translate')
         strategy_name = STRATEGY_LABELS.get(strategy, strategy)
@@ -557,25 +857,19 @@ class Pipeline:
         for p in to_translate:
             p_hash = hash_paragraph(p)
             line_hashes = get_line_hashes(p)
-
             if self.cache.get(p_hash) is not None:
                 continue
-
             reused = self.cache.find_reusable(line_hashes)
             if reused is not None:
                 self.cache.put(p_hash, reused, line_hashes)
                 continue
-
             text = p['text']
             zh = self._lookup_local(text)
             if zh:
                 self.cache.put(p_hash, zh, line_hashes)
                 continue
-
-            # 离线策略未命中：跳过
             if strategy == 'local_only':
                 continue
-
             need_api.append((p, p_hash, line_hashes))
 
         self._emit_paragraphs(to_translate, img, region)
@@ -583,12 +877,24 @@ class Pipeline:
         t_emit = time.time()
 
         total_ms = (t_emit - t_start) * 1000
+
+        self._perf.tick(has_ocr=True)
+        self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
+        self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
+        self._perf.add('t_filter', (t_filter - t_ocr) * 1000)
+        self._perf.add('t_merge', (t_merge - t_filter) * 1000)
+        self._perf.add('t_emit', (t_emit - t_merge) * 1000)
+        self._perf.add('t_total', total_ms)
+        self._maybe_report_perf()
+
         if total_ms > SLOW_THRESHOLD_MS:
             log.warning(
                 f"[处理慢] 总 {total_ms:.0f}ms | "
                 f"帧差 {(t_frame_diff-t_start)*1000:.0f}ms | "
                 f"OCR {(t_ocr-t_frame_diff)*1000:.0f}ms | "
-                f"推送 {(t_emit-t_ocr)*1000:.0f}ms | "
+                f"过滤 {(t_filter-t_ocr)*1000:.0f}ms | "
+                f"合并 {(t_merge-t_filter)*1000:.0f}ms | "
+                f"推送 {(t_emit-t_merge)*1000:.0f}ms | "
                 f"{len(to_translate)} 段 / {len(need_api)} 需API | "
                 f"策略 {strategy_name}"
             )
@@ -621,19 +927,41 @@ class Pipeline:
                         need_api, to_translate, img, region,
                     )
 
+    # ==================== 性能报告 ====================
+
+    def _maybe_report_perf(self):
+        now = time.time()
+        if now - self._perf_last_report < PERF_REPORT_INTERVAL:
+            return
+        self._perf_last_report = now
+        s = self._perf.summary_and_reset()
+        if s['frames'] == 0:
+            return
+
+        log.info(
+            f"[性能] 最近 {PERF_REPORT_INTERVAL:.0f}s | "
+            f"帧数 {s['frames']}（OCR {s['frames_with_ocr']} / "
+            f"跳过 {s['frames_skipped']}）| "
+            f"帧差 {s['frame_diff']:.1f}ms | "
+            f"OCR {s['ocr']:.1f}ms | "
+            f"过滤 {s['filter']:.1f}ms | "
+            f"合并 {s['merge']:.1f}ms | "
+            f"推送 {s['emit']:.1f}ms | "
+            f"总计 {s['total']:.1f}ms"
+        )
+
+    # ==================== 翻译异步 ====================
+
     def _translate_one_and_emit(self, p, p_hash, lh, all_paragraphs,
                                 img, region):
         try:
             text = p['text']
             zh = self.translator.translate_lines([text])[0]
             self.cache.put(p_hash, zh, lh)
-
             if len(text) <= 30:
                 self.phrase_cache.put(text, zh)
-
             if self.state.freeze_overlay:
                 return
-
             self._emit_paragraphs(all_paragraphs, img, region)
         except Exception as e:
             log.exception(f"[单段翻译错误] {e}")
@@ -648,11 +976,9 @@ class Pipeline:
             translations = self.translator.translate_lines(texts)
             for (p, p_hash, lh), zh in zip(need_api, translations):
                 self.cache.put(p_hash, zh, lh)
-
                 t = p['text']
                 if len(t) <= 30:
                     self.phrase_cache.put(t, zh)
-
             if self.state.freeze_overlay:
                 return
             self._emit_paragraphs(all_paragraphs, img, region)
@@ -670,7 +996,12 @@ class Pipeline:
         base_font = self.state.base_font_size
         display_mode = getattr(self.state, 'display_mode', 'overlay')
 
-        final = []
+        try:
+            scroll_mode = self.state.is_scrolling()
+        except Exception:
+            scroll_mode = False
+
+        cur_items = {}
         fine_used = 0
         inpaint_used = 0
 
@@ -682,13 +1013,15 @@ class Pipeline:
 
             x1, y1, x2, y2 = p['box']
 
-            # ============ 双语 / 小窗口模式：只算颜色，不覆盖 ============
+            fallback_key = paragraph_display_key(p)
+            display_key = self._assign_stable_key(
+                (x1, y1, x2, y2), fallback_key)
+
             if display_mode in ('bilingual', 'window'):
                 avg = self._crop_avg_color(img, x1, y1, x2, y2)
                 bg_hex = f'#{avg[0]:02x}{avg[1]:02x}{avg[2]:02x}'
                 fg = self._resolve_fg_color(avg)
-
-                item = {
+                cur_items[display_key] = {
                     'x1': x1 + region['left'],
                     'y1': y1 + region['top'],
                     'x2': x2 + region['left'],
@@ -698,26 +1031,22 @@ class Pipeline:
                     'bg_hex': bg_hex,
                     'fg': fg,
                     'bg_image': None,
-                    'key': paragraph_display_key(p),
+                    'key': display_key,
                     'bilingual': (display_mode == 'bilingual'),
                     'orig_w': x2 - x1,
                     'orig_h': y2 - y1,
                 }
-                final.append(item)
                 continue
 
-            # ============ 覆盖模式 ============
             use_fine_this = (fine_enabled and
                              is_fine_text_suitable(img, x1, y1, x2, y2))
 
             if use_fine_this:
                 fine_used += 1
-
                 with self._inpaint_lock:
                     if p_hash not in self.fine_cache:
                         self.fine_cache[p_hash] = inpaint_text_only(
-                            img, x1, y1, x2, y2
-                        )
+                            img, x1, y1, x2, y2)
                         if (self.cache.auto_clean and
                                 len(self.fine_cache) > self.inpaint_cache_max):
                             self.fine_cache.popitem(last=False)
@@ -725,27 +1054,23 @@ class Pipeline:
 
                     if p_hash not in self.color_cache:
                         self.color_cache[p_hash] = sample_text_color(
-                            img, x1, y1, x2, y2
-                        )
+                            img, x1, y1, x2, y2)
                     user_fg = getattr(self.state, 'fg_color', 'auto')
                     if user_fg and user_fg != 'auto':
                         fg = user_fg
                     else:
                         fg = self.color_cache[p_hash]
-
                 bg_hex = '#FFFFFF'
                 item_extra = {'force_font_size': base_font}
             else:
                 avg = self._crop_avg_color(img, x1, y1, x2, y2)
                 bg_hex = f'#{avg[0]:02x}{avg[1]:02x}{avg[2]:02x}'
                 fg = self._resolve_fg_color(avg)
-
                 bg_image = None
                 if use_inpaint:
                     inpaint_used += 1
                     bg_image = self._get_inpaint_cached(
-                        p_hash, img, x1, y1, x2, y2
-                    )
+                        p_hash, img, x1, y1, x2, y2)
                 item_extra = {}
 
             item = {
@@ -758,20 +1083,57 @@ class Pipeline:
                 'bg_hex': bg_hex,
                 'fg': fg,
                 'bg_image': bg_image,
-                'key': paragraph_display_key(p),
+                'key': display_key,
                 'bilingual': False,
                 'orig_w': x2 - x1,
                 'orig_h': y2 - y1,
             }
             item.update(item_extra)
-            final.append(item)
+            cur_items[display_key] = item
 
-        if fine_enabled:
+        if scroll_mode:
+            before = len(cur_items)
+            cur_items = self._dedupe_same_frame(cur_items)
+            after = len(cur_items)
+            if before != after:
+                log.debug(f"[滚动] 同帧去重 {before} → {after}")
+
+        with self._known_lock:
+            gen_at_start = self._generation
+
+            for key, item in cur_items.items():
+                self._known_items[key] = item
+                self._known_miss[key] = 0
+
+            for key in list(self._known_items.keys()):
+                if key in cur_items:
+                    continue
+                m = self._known_miss.get(key, 0) + 1
+                if m > MISS_FRAMES_TOLERANCE:
+                    del self._known_items[key]
+                    self._known_miss.pop(key, None)
+                else:
+                    self._known_miss[key] = m
+
+            all_known = list(self._known_items.values())
+
+        stable = self.emit_debouncer.process(all_known)
+
+        if fine_enabled and fine_used > 0:
             log.info(f"[精细模式] 使用 {fine_used} 段 | "
-                     f"回退整框 {inpaint_used} 段")
+                     f"回退整框 {inpaint_used} 段 | "
+                     f"known={len(all_known)} | "
+                     f"scroll={'Y' if scroll_mode else 'N'} | "
+                     f"changed={'Y' if stable is not None else 'N'}")
 
-        if final:
-            self.result_queue.put(('items', final))
+        if stable is not None:
+            with self._known_lock:
+                if self._generation != gen_at_start:
+                    log.debug(
+                        f"[emit] generation 已变 "
+                        f"({gen_at_start} → {self._generation})，丢弃")
+                    return
+            self.result_queue.put(('items', stable))
 
     def _get_inpaint_cached(self, p_hash, img, x1, y1, x2, y2):
         with self._inpaint_lock:

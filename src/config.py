@@ -210,11 +210,11 @@ FG_COLOR_PRESETS = {
 
 DEFAULT_FG_COLOR = 'auto'
 
-# OCR 模型大小
-# - 'server'：精度高，慢
-# - 'mobile'：速度快，精度略低（约 2-4 倍加速）
+# OCR 模型大小（PP-OCRv6）
+# - 'server'：PP-OCRv6 small/medium，精度高，慢
+# - 'tiny'：PP-OCRv6 tiny，速度极快，参数约 1.1M
 OCR_MODEL_SIZE_SERVER = 'server'
-OCR_MODEL_SIZE_MOBILE = 'mobile'
+OCR_MODEL_SIZE_TINY = 'tiny'
 OCR_MODEL_SIZE_DEFAULT = OCR_MODEL_SIZE_SERVER
 
 # 高精度 OCR（多引擎投票）
@@ -224,3 +224,9 @@ HIGH_ACCURACY_IOU_THRESHOLD = 0.5
 
 # OCR 加速优化（关方向分类 + det 限长 + cv2 缩放，一个开关统一控制）
 DEFAULT_ENABLE_OCR_SPEED_OPT = True
+
+# 英文模式（只识别包含英文字母的文本）
+DEFAULT_ENABLE_ENGLISH_ONLY = False
+
+# 标题/Logo 过滤（全大写 + 超大字号）
+DEFAULT_ENABLE_TITLE_FILTER = False

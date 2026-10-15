@@ -1,11 +1,4 @@
-"""面板构建 Mixin
-
-拆出 TranslatorApp 里两个纯 UI 构建方法：
-    - _build_display_tab  （显示设置面板）
-    - _build_hotkey_tab   （热键设置面板）
-
-Mixin 只负责"造控件"，所有回调（_on_xxx）仍定义在 TranslatorApp 上。
-"""
+"""面板构建 Mixin"""
 
 import customtkinter as ctk
 
@@ -21,6 +14,8 @@ from config import (
     DEFAULT_ENABLE_BLOCK_OCR,
     DEFAULT_ENABLE_FILTER,
     DEFAULT_ENABLE_GENERAL_FILTER,
+    DEFAULT_ENABLE_ENGLISH_ONLY,
+    DEFAULT_ENABLE_TITLE_FILTER,
     DEFAULT_ENABLE_FAST_LOOKUP,
     DEFAULT_ENABLE_ASYNC_TRANSLATE,
     DEFAULT_ENABLE_WINDOW_POOL,
@@ -36,8 +31,6 @@ from .constants import CACHE_MIN, CACHE_MAX, CACHE_DEFAULT
 
 
 class DisplayPanelMixin:
-    """显示设置面板构建"""
-
     def _build_display_tab(self, parent):
         # ===== 性能模式 =====
         ctk.CTkLabel(
@@ -45,16 +38,13 @@ class DisplayPanelMixin:
         ).grid(row=0, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
 
         self.mode_selector = ctk.CTkSegmentedButton(
-            parent,
-            values=["快", "中", "慢"],
-            command=self._on_mode_change,
-            font=(FONT_NAME, 11),
+            parent, values=["快", "中", "慢"],
+            command=self._on_mode_change, font=(FONT_NAME, 11),
         )
         self.mode_selector.set(PERFORMANCE_MODES[DEFAULT_MODE]['name'])
         self.mode_selector.grid(
             row=0, column=1, columnspan=2,
-            sticky='ew', padx=10, pady=(12, 6),
-        )
+            sticky='ew', padx=10, pady=(12, 6))
 
         self.mode_desc_label = ctk.CTkLabel(
             parent, text="",
@@ -63,8 +53,7 @@ class DisplayPanelMixin:
         )
         self.mode_desc_label.grid(
             row=1, column=0, columnspan=3,
-            sticky='w', padx=(15, 15), pady=(0, 8),
-        )
+            sticky='w', padx=(15, 15), pady=(0, 8))
         self._update_mode_desc(DEFAULT_MODE)
 
         # ===== 加速方式 =====
@@ -90,8 +79,7 @@ class DisplayPanelMixin:
         accel_btns.pack_propagate(True)
 
         self.btn_cpu_multi = ctk.CTkButton(
-            accel_btns, text="多线程 CPU",
-            width=140, height=48,
+            accel_btns, text="多线程 CPU", width=140, height=48,
             font=(FONT_NAME, 10),
             fg_color='#6c757d', hover_color='#5a6268',
             command=lambda: self.switch_accel_mode('cpu_multi'),
@@ -99,8 +87,7 @@ class DisplayPanelMixin:
         self.btn_cpu_multi.pack(side='left', padx=3)
 
         self.btn_directml = ctk.CTkButton(
-            accel_btns, text="DirectML GPU\n(单引擎)",
-            width=140, height=48,
+            accel_btns, text="DirectML GPU\n(单引擎)", width=140, height=48,
             font=(FONT_NAME, 10),
             fg_color='#3a86ff', hover_color='#2a6fd8',
             command=lambda: self.switch_accel_mode('directml'),
@@ -108,8 +95,7 @@ class DisplayPanelMixin:
         self.btn_directml.pack(side='left', padx=3)
 
         self.btn_cuda = ctk.CTkButton(
-            accel_btns, text="NVIDIA CUDA\n(多引擎)",
-            width=140, height=48,
+            accel_btns, text="NVIDIA CUDA\n(多引擎)", width=140, height=48,
             font=(FONT_NAME, 10),
             fg_color='#28a745', hover_color='#1e7e34',
             command=lambda: self.switch_accel_mode('cuda'),
@@ -118,15 +104,13 @@ class DisplayPanelMixin:
 
         # ===== CPU 引擎数 =====
         cpu_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
-        cpu_row.grid(
-            row=5, column=0, columnspan=3,
-            sticky='ew', padx=(25, 15), pady=(6, 2))
+        cpu_row.grid(row=5, column=0, columnspan=3,
+                     sticky='ew', padx=(25, 15), pady=(6, 2))
         cpu_row.pack_propagate(True)
 
-        ctk.CTkLabel(
-            cpu_row, text="CPU 引擎数：",
-            font=(FONT_NAME, 10), text_color='#333333', anchor='w',
-        ).pack(side='left')
+        ctk.CTkLabel(cpu_row, text="CPU 引擎数：",
+                     font=(FONT_NAME, 10), text_color='#333333',
+                     anchor='w').pack(side='left')
 
         self.cpu_count_label = ctk.CTkLabel(
             cpu_row, text=str(CPU_ENGINE_COUNT_DEFAULT), width=26,
@@ -135,27 +119,22 @@ class DisplayPanelMixin:
         self.cpu_count_label.pack(side='right')
 
         self.cpu_count_slider = ctk.CTkSlider(
-            cpu_row,
-            from_=CPU_ENGINE_COUNT_MIN,
-            to=CPU_ENGINE_COUNT_MAX,
+            cpu_row, from_=CPU_ENGINE_COUNT_MIN, to=CPU_ENGINE_COUNT_MAX,
             number_of_steps=CPU_ENGINE_COUNT_MAX - CPU_ENGINE_COUNT_MIN,
-            command=self._on_cpu_count_change,
-            height=14, width=160,
+            command=self._on_cpu_count_change, height=14, width=160,
         )
         self.cpu_count_slider.set(CPU_ENGINE_COUNT_DEFAULT)
         self.cpu_count_slider.pack(side='right', padx=4)
 
         # ===== CUDA 引擎数 =====
         dml_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
-        dml_row.grid(
-            row=6, column=0, columnspan=3,
-            sticky='ew', padx=(25, 15), pady=(2, 4))
+        dml_row.grid(row=6, column=0, columnspan=3,
+                     sticky='ew', padx=(25, 15), pady=(2, 4))
         dml_row.pack_propagate(True)
 
-        ctk.CTkLabel(
-            dml_row, text="CUDA 引擎数：",
-            font=(FONT_NAME, 10), text_color='#333333', anchor='w',
-        ).pack(side='left')
+        ctk.CTkLabel(dml_row, text="CUDA 引擎数：",
+                     font=(FONT_NAME, 10), text_color='#333333',
+                     anchor='w').pack(side='left')
 
         self.dml_count_label = ctk.CTkLabel(
             dml_row, text=str(DML_WORKER_COUNT_DEFAULT), width=26,
@@ -164,12 +143,9 @@ class DisplayPanelMixin:
         self.dml_count_label.pack(side='right')
 
         self.dml_count_slider = ctk.CTkSlider(
-            dml_row,
-            from_=DML_WORKER_COUNT_MIN,
-            to=DML_WORKER_COUNT_MAX,
+            dml_row, from_=DML_WORKER_COUNT_MIN, to=DML_WORKER_COUNT_MAX,
             number_of_steps=DML_WORKER_COUNT_MAX - DML_WORKER_COUNT_MIN,
-            command=self._on_dml_count_change,
-            height=14, width=160,
+            command=self._on_dml_count_change, height=14, width=160,
         )
         self.dml_count_slider.set(DML_WORKER_COUNT_DEFAULT)
         self.dml_count_slider.pack(side='right', padx=4)
@@ -184,12 +160,10 @@ class DisplayPanelMixin:
         ).grid(row=7, column=0, columnspan=3,
                sticky='w', padx=(25, 15), pady=(0, 6))
 
-        # ===== 加速状态 =====
         self.accel_status_label = ctk.CTkLabel(
             parent, text="",
             font=(FONT_NAME, 9), text_color='#666666',
-            anchor='w', justify='left',
-            wraplength=600,
+            anchor='w', justify='left', wraplength=600,
         )
         self.accel_status_label.grid(
             row=8, column=0, columnspan=3,
@@ -203,8 +177,7 @@ class DisplayPanelMixin:
         self.frame_diff_switch = ctk.CTkSwitch(
             parent, text="帧差检测（静止时跳过）",
             command=self._on_frame_diff_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_FRAME_DIFF:
             self.frame_diff_switch.select()
@@ -215,8 +188,7 @@ class DisplayPanelMixin:
         self.block_ocr_switch = ctk.CTkSwitch(
             parent, text="分块 OCR（只识别变化的区域）",
             command=self._on_block_ocr_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_BLOCK_OCR:
             self.block_ocr_switch.select()
@@ -227,8 +199,7 @@ class DisplayPanelMixin:
         self.filter_switch = ctk.CTkSwitch(
             parent, text="文字过滤（过滤异常框）",
             command=self._on_filter_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_FILTER:
             self.filter_switch.select()
@@ -237,10 +208,9 @@ class DisplayPanelMixin:
             sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.general_filter_switch = ctk.CTkSwitch(
-            parent, text="通用过滤（艺术字/数字/单位）",
+            parent, text="通用过滤（只过滤数字 / 单位 / 图像）",
             command=self._on_general_filter_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_GENERAL_FILTER:
             self.general_filter_switch.select()
@@ -251,8 +221,7 @@ class DisplayPanelMixin:
         self.fast_lookup_switch = ctk.CTkSwitch(
             parent, text="快速响应层（本地词典 + 短语缓存，只处理单词和词组）",
             command=self._on_fast_lookup_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_FAST_LOOKUP:
             self.fast_lookup_switch.select()
@@ -260,16 +229,42 @@ class DisplayPanelMixin:
             row=14, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 3))
 
-        # ===== 轻量型 OCR =====
-        self.lightweight_ocr_switch = ctk.CTkSwitch(
+        # ===== 英语特化（原英文模式） =====
+        self.english_only_switch = ctk.CTkSwitch(
             parent,
-            text="轻量型 OCR（mobile 模型，约 2-4 倍加速，精度略低）",
-            command=self._on_lightweight_ocr_toggle,
+            text="英语特化（字母占比 ≥ 50%，中文占比 ≤ 20%）",
+            command=self._on_english_only_toggle,
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
+        )
+        # ===== 标题/Logo 过滤 =====
+        self.title_filter_switch = ctk.CTkSwitch(
+            parent,
+            text="标题/Logo 过滤（全大写 或 超大字号）",
+            command=self._on_title_filter_toggle,
             onvalue=True, offvalue=False,
             font=(FONT_NAME, 10),
         )
-        self.lightweight_ocr_switch.grid(
+        if DEFAULT_ENABLE_TITLE_FILTER:
+            self.title_filter_switch.select()
+        self.title_filter_switch.grid(
+            row=16, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
+        
+        if DEFAULT_ENABLE_ENGLISH_ONLY:
+            self.english_only_switch.select()
+        self.english_only_switch.grid(
             row=15, column=0, columnspan=3,
+            sticky='w', padx=(25, 15), pady=(0, 3))
+
+        # ===== 轻量型 OCR =====
+        self.lightweight_ocr_switch = ctk.CTkSwitch(
+            parent,
+            text="轻量型 OCR（PP-OCRv6 tiny，速度极快，精度略低）",
+            command=self._on_lightweight_ocr_toggle,
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
+        )
+        self.lightweight_ocr_switch.grid(
+            row=16, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 3))
 
         # ===== 高精度 OCR =====
@@ -277,11 +272,10 @@ class DisplayPanelMixin:
             parent,
             text="高精度 OCR（双引擎投票，慢约 2 倍）",
             command=self._on_high_accuracy_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         self.high_accuracy_ocr_switch.grid(
-            row=16, column=0, columnspan=3,
+            row=17, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 3))
 
         # ===== OCR 加速优化 =====
@@ -289,17 +283,16 @@ class DisplayPanelMixin:
             parent,
             text="OCR 加速优化（关方向分类 + det 限长 + cv2 缩放）",
             command=self._on_ocr_speed_opt_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         self.ocr_speed_opt_switch.grid(
-            row=17, column=0, columnspan=3,
+            row=18, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 3))
 
         # 短语表按钮
         phrase_btns = ctk.CTkFrame(parent, fg_color='transparent', height=1)
         phrase_btns.grid(
-            row=18, column=0, columnspan=3,
+            row=19, column=0, columnspan=3,
             sticky='ew', padx=(45, 15), pady=(0, 6))
         phrase_btns.pack_propagate(True)
 
@@ -333,11 +326,11 @@ class DisplayPanelMixin:
         # 本地词典
         ctk.CTkLabel(
             parent, text="本地词典：", font=(FONT_NAME, 11, 'bold'),
-        ).grid(row=19, column=0, sticky='w', padx=(15, 5), pady=(6, 4))
+        ).grid(row=20, column=0, sticky='w', padx=(15, 5), pady=(6, 4))
 
         dict_btns = ctk.CTkFrame(parent, fg_color='transparent', height=1)
         dict_btns.grid(
-            row=20, column=0, columnspan=3,
+            row=21, column=0, columnspan=3,
             sticky='ew', padx=(25, 15), pady=(0, 6))
         dict_btns.pack_propagate(True)
 
@@ -371,37 +364,35 @@ class DisplayPanelMixin:
         self.async_translate_switch = ctk.CTkSwitch(
             parent, text="异步翻译（不阻塞 OCR）",
             command=self._on_async_translate_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_ASYNC_TRANSLATE:
             self.async_translate_switch.select()
         self.async_translate_switch.grid(
-            row=21, column=0, columnspan=3,
+            row=22, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.window_pool_switch = ctk.CTkSwitch(
             parent, text="窗口池（复用译文窗口）",
             command=self._on_window_pool_toggle,
-            onvalue=True, offvalue=False,
-            font=(FONT_NAME, 10),
+            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
         if DEFAULT_ENABLE_WINDOW_POOL:
             self.window_pool_switch.select()
         self.window_pool_switch.grid(
-            row=22, column=0, columnspan=3,
+            row=23, column=0, columnspan=3,
             sticky='w', padx=(25, 15), pady=(0, 8))
 
         ctk.CTkLabel(
             parent, text="刷新间隔 (秒)：", font=(FONT_NAME, 11),
-        ).grid(row=23, column=0, sticky='w', padx=(15, 5), pady=6)
+        ).grid(row=24, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.scan_value_label = ctk.CTkLabel(
             parent,
             text=f"{PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval']:.2f} s",
             width=60, font=(FONT_NAME, 11),
         )
-        self.scan_value_label.grid(row=23, column=2, sticky='e', padx=(5, 15))
+        self.scan_value_label.grid(row=24, column=2, sticky='e', padx=(5, 15))
 
         n_steps = int((SCAN_MAX - SCAN_MIN) / 0.05)
         self.scan_slider = ctk.CTkSlider(
@@ -410,17 +401,17 @@ class DisplayPanelMixin:
             command=self._on_scan_change,
         )
         self.scan_slider.set(PERFORMANCE_MODES[DEFAULT_MODE]['scan_interval'])
-        self.scan_slider.grid(row=23, column=1, sticky='ew', padx=10)
+        self.scan_slider.grid(row=24, column=1, sticky='ew', padx=10)
 
         ctk.CTkLabel(
             parent, text="文字大小：", font=(FONT_NAME, 11),
-        ).grid(row=24, column=0, sticky='w', padx=(15, 5), pady=6)
+        ).grid(row=25, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.font_value_label = ctk.CTkLabel(
             parent, text=str(INITIAL_FONT_SIZE), width=60,
             font=(FONT_NAME, 11),
         )
-        self.font_value_label.grid(row=24, column=2, sticky='e', padx=(5, 15))
+        self.font_value_label.grid(row=25, column=2, sticky='e', padx=(5, 15))
 
         self.font_slider = ctk.CTkSlider(
             parent, from_=FONT_MIN, to=FONT_MAX,
@@ -428,27 +419,25 @@ class DisplayPanelMixin:
             command=self._on_font_change,
         )
         self.font_slider.set(INITIAL_FONT_SIZE)
-        self.font_slider.grid(row=24, column=1, sticky='ew', padx=10)
+        self.font_slider.grid(row=25, column=1, sticky='ew', padx=10)
 
         ctk.CTkLabel(
             parent, text="译文颜色：", font=(FONT_NAME, 11),
-        ).grid(row=25, column=0, sticky='w', padx=(15, 5), pady=6)
+        ).grid(row=26, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.fg_color_selector = ctk.CTkOptionMenu(
-            parent,
-            values=list(FG_COLOR_PRESETS.values()),
+            parent, values=list(FG_COLOR_PRESETS.values()),
             command=self._on_fg_color_change,
-            font=(FONT_NAME, 10),
-            width=200,
+            font=(FONT_NAME, 10), width=200,
         )
         self.fg_color_selector.set(FG_COLOR_PRESETS[DEFAULT_FG_COLOR])
         self.fg_color_selector.grid(
-            row=25, column=1, columnspan=2,
+            row=26, column=1, columnspan=2,
             sticky='w', padx=10, pady=6)
 
         ctk.CTkLabel(
             parent, text="图像修复（整框）：", font=(FONT_NAME, 11),
-        ).grid(row=26, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
+        ).grid(row=27, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
 
         self.inpaint_switch = ctk.CTkSwitch(
             parent, text="",
@@ -457,7 +446,7 @@ class DisplayPanelMixin:
         )
         if DEFAULT_USE_INPAINTING and CV2_AVAILABLE:
             self.inpaint_switch.select()
-        self.inpaint_switch.grid(row=26, column=1, sticky='w', padx=10)
+        self.inpaint_switch.grid(row=27, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.inpaint_switch.configure(state='disabled')
@@ -465,7 +454,7 @@ class DisplayPanelMixin:
         ctk.CTkLabel(
             parent, text="精细文字替换（保留背景）：",
             font=(FONT_NAME, 11),
-        ).grid(row=27, column=0, sticky='w', padx=(15, 5), pady=(8, 6))
+        ).grid(row=28, column=0, sticky='w', padx=(15, 5), pady=(8, 6))
 
         self.fine_text_switch = ctk.CTkSwitch(
             parent, text="",
@@ -474,7 +463,7 @@ class DisplayPanelMixin:
         )
         if DEFAULT_ENABLE_FINE_TEXT and CV2_AVAILABLE:
             self.fine_text_switch.select()
-        self.fine_text_switch.grid(row=27, column=1, sticky='w', padx=10)
+        self.fine_text_switch.grid(row=28, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.fine_text_switch.configure(state='disabled')
@@ -482,7 +471,7 @@ class DisplayPanelMixin:
         ctk.CTkLabel(
             parent, text="异步覆盖（逐字显示）：",
             font=(FONT_NAME, 11),
-        ).grid(row=28, column=0, sticky='w', padx=(15, 5), pady=(8, 6))
+        ).grid(row=29, column=0, sticky='w', padx=(15, 5), pady=(8, 6))
 
         self.async_overlay_switch = ctk.CTkSwitch(
             parent, text="",
@@ -491,11 +480,11 @@ class DisplayPanelMixin:
         )
         if DEFAULT_ENABLE_ASYNC_OVERLAY:
             self.async_overlay_switch.select()
-        self.async_overlay_switch.grid(row=28, column=1, sticky='w', padx=10)
+        self.async_overlay_switch.grid(row=29, column=1, sticky='w', padx=10)
 
         ctk.CTkLabel(
             parent, text="自动清理缓存：", font=(FONT_NAME, 11),
-        ).grid(row=29, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
+        ).grid(row=30, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
 
         self.auto_clean_switch = ctk.CTkSwitch(
             parent, text="",
@@ -503,17 +492,17 @@ class DisplayPanelMixin:
             onvalue=True, offvalue=False,
         )
         self.auto_clean_switch.select()
-        self.auto_clean_switch.grid(row=29, column=1, sticky='w', padx=10)
+        self.auto_clean_switch.grid(row=30, column=1, sticky='w', padx=10)
 
         ctk.CTkLabel(
             parent, text="缓存上限：", font=(FONT_NAME, 11),
-        ).grid(row=30, column=0, sticky='w', padx=(15, 5), pady=6)
+        ).grid(row=31, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.cache_limit_label = ctk.CTkLabel(
             parent, text=str(CACHE_DEFAULT), width=60,
             font=(FONT_NAME, 11),
         )
-        self.cache_limit_label.grid(row=30, column=2, sticky='e', padx=(5, 15))
+        self.cache_limit_label.grid(row=31, column=2, sticky='e', padx=(5, 15))
 
         self.cache_limit_slider = ctk.CTkSlider(
             parent, from_=CACHE_MIN, to=CACHE_MAX,
@@ -521,10 +510,10 @@ class DisplayPanelMixin:
             command=self._on_cache_limit_change,
         )
         self.cache_limit_slider.set(CACHE_DEFAULT)
-        self.cache_limit_slider.grid(row=30, column=1, sticky='ew', padx=10)
+        self.cache_limit_slider.grid(row=31, column=1, sticky='ew', padx=10)
 
         cache_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
-        cache_row.grid(row=31, column=0, columnspan=3,
+        cache_row.grid(row=32, column=0, columnspan=3,
                        sticky='ew', padx=(15, 15), pady=(4, 12))
         cache_row.pack_propagate(True)
 
@@ -546,8 +535,6 @@ class DisplayPanelMixin:
 
 
 class HotkeyPanelMixin:
-    """热键设置面板构建"""
-
     def _build_hotkey_tab(self, parent):
         self.hotkey_entries = {}
         for i, (key, label) in enumerate(HOTKEY_LABELS.items()):

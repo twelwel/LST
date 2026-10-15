@@ -2,7 +2,7 @@
 - CPU：多引擎并行（1-8 可调）
 - CUDA：多引擎并行（1-4 可调）
 - DirectML：单引擎
-- 支持 server / mobile 两种模型
+- 支持 server / tiny 两种模型（PP-OCRv6）
 - 支持高精度模式（双引擎投票融合）
 - 支持 OCR 加速优化（关方向分类 + det 限长 + cv2 缩放）
 - 热重载安全：旧引擎延时释放，重载期间 recognize 返回空
@@ -25,9 +25,9 @@ from cuda_setup import (
 # ==================== 枚举探测 ====================
 
 _MODEL_TYPE_ENUM = None
-_MOBILE_VALUE = None
+_TINY_VALUE = None
 _OCR_VERSION_ENUM = None
-_PPOCRV5_VALUE = None
+_PPOCRV6_VALUE = None
 _LANG_DET_ENUM = None
 _LANG_REC_ENUM = None
 
@@ -94,42 +94,45 @@ def _resolve_enum(enum_cls, names):
     return None
 
 
-def _get_mobile_value():
-    global _MOBILE_VALUE
-    if _MOBILE_VALUE is not None:
-        return _MOBILE_VALUE
+def _get_tiny_value():
+    """解析 PP-OCRv6 的 TINY 模型枚举值"""
+    global _TINY_VALUE
+    if _TINY_VALUE is not None:
+        return _TINY_VALUE
     mt = _find_model_type()
-    _MOBILE_VALUE = _resolve_enum(mt, [
-        'MOBILE', 'Mobile', 'mobile', 'LITE', 'Lite', 'lite',
+    _TINY_VALUE = _resolve_enum(mt, [
+        'TINY', 'Tiny', 'tiny',
     ])
-    return _MOBILE_VALUE
+    return _TINY_VALUE
 
 
-def _get_ppocrv5_value():
-    global _PPOCRV5_VALUE
-    if _PPOCRV5_VALUE is not None:
-        return _PPOCRV5_VALUE
+def _get_ppocrv6_value():
+    """解析 PP-OCRv6 的版本枚举值"""
+    global _PPOCRV6_VALUE
+    if _PPOCRV6_VALUE is not None:
+        return _PPOCRV6_VALUE
     ov = _find_ocr_version()
-    _PPOCRV5_VALUE = _resolve_enum(ov, [
-        'PPOCRV5', 'PP_OCRV5', 'PPOCRv5', 'PPOCR_V5', 'V5',
+    _PPOCRV6_VALUE = _resolve_enum(ov, [
+        'PPOCRV6', 'PP_OCRV6', 'PPOCRv6', 'PPOCR_V6', 'V6',
     ])
-    return _PPOCRV5_VALUE
+    return _PPOCRV6_VALUE
 
 
-def _build_mobile_params():
-    """构造 mobile 模型参数（PP-OCRv5 + mobile）"""
-    mobile_v = _get_mobile_value()
-    v5_v = _get_ppocrv5_value()
-    if mobile_v is None or v5_v is None:
+def _build_tiny_params():
+    """构造 PP-OCRv6 tiny 模型参数"""
+    tiny_v = _get_tiny_value()
+    v6_v = _get_ppocrv6_value()
+    if tiny_v is None or v6_v is None:
         return None
 
     ld, lr = _find_lang_enums()
     params = {
-        "Det.ocr_version": v5_v,
-        "Rec.ocr_version": v5_v,
-        "Det.model_type": mobile_v,
-        "Rec.model_type": mobile_v,
+        "Det.ocr_version": v6_v,
+        "Rec.ocr_version": v6_v,
+        "Det.model_type": tiny_v,
+        "Rec.model_type": tiny_v,
     }
+    # PP-OCRv6 tiny 不支持日文，使用中文
     lv = _resolve_enum(ld, ['CH', 'Ch', 'ch', 'CHINESE'])
     if lv is not None:
         params["Det.lang_type"] = lv
@@ -184,28 +187,22 @@ class OCREngine:
              model_size='server', high_accuracy=False, speed_opt=True):
         """
         mode: 'cpu_multi' / 'cuda' / 'directml'
-        model_size: 'server' / 'mobile'
+        model_size: 'server' / 'tiny'（PP-OCRv6 tiny）
         high_accuracy: 是否启用多引擎投票
         speed_opt: 是否启用 OCR 加速优化
         """
-        # 标记正在重载
         with self._lock:
             self._reloading = True
 
         try:
-            # ===== 备份旧引擎 + 立即清空 self.engines =====
-            # pipeline 线程此刻若在 recognize，拿到的旧引用仍然有效
-            # 因为旧引擎不释放（放进退休列表），只是 self.engines 换了新列表
             old_engines = self.engines
             old_aux = self.aux_engines
             self.engines = []
             self.aux_engines = []
 
-            # ===== 旧引擎延时释放（5 秒后清）=====
             self._retire_engines(old_engines)
             self._retire_engines(old_aux)
 
-            # ===== 执行实际重载 =====
             return self._do_init(
                 mode=mode, pool_size=pool_size,
                 dml_worker_count=dml_worker_count,
@@ -223,7 +220,7 @@ class OCREngine:
         self.last_error = ''
         self.mode = mode
 
-        if model_size not in ('server', 'mobile'):
+        if model_size not in ('server', 'tiny'):
             model_size = 'server'
         self.model_size = model_size
         self.high_accuracy = bool(high_accuracy)
@@ -265,10 +262,10 @@ class OCREngine:
         else:
             self.pool_size = max(1, int(pool_size))
 
-        # mobile 模型可用性检查
-        if self.model_size == 'mobile':
-            if _build_mobile_params() is None:
-                print("[OCR] ⚠️ mobile 模型不可用，回退 server")
+        # tiny 模型可用性检查
+        if self.model_size == 'tiny':
+            if _build_tiny_params() is None:
+                print("[OCR] ⚠️ PP-OCRv6 tiny 不可用，回退 server")
                 self.model_size = 'server'
 
         try:
@@ -285,9 +282,9 @@ class OCREngine:
             print(f"[OCR] 初始化失败：{e}")
             self._cleanup_current()
 
-            # 降级：mobile → server
-            if self.model_size == 'mobile':
-                print("[OCR] mobile 失败，回退 server")
+            # 降级：tiny → server
+            if self.model_size == 'tiny':
+                print("[OCR] tiny 失败，回退 server")
                 self.model_size = 'server'
                 try:
                     self._init_engines()
@@ -314,7 +311,6 @@ class OCREngine:
     # ================= 引擎清理 =================
 
     def _cleanup_current(self):
-        """清理当前引擎（init 失败时用）——立即释放，因为刚创建失败"""
         for e in self.engines + self.aux_engines:
             try:
                 del e
@@ -328,7 +324,6 @@ class OCREngine:
             pass
 
     def _retire_engines(self, engines_list):
-        """把旧引擎加入退休列表，5 秒后释放（给 pipeline 线程留时间）"""
         if not engines_list:
             return
         with self._lock:
@@ -353,9 +348,9 @@ class OCREngine:
 
     def _build_model_params(self):
         """当前模型对应的参数"""
-        if self.model_size != 'mobile':
+        if self.model_size != 'tiny':
             return {}
-        p = _build_mobile_params()
+        p = _build_tiny_params()
         return p or {}
 
     def _speed_params(self):
@@ -363,9 +358,9 @@ class OCREngine:
         if not self.speed_opt:
             return {}
         return {
-            "Global.use_cls": False,       # 关方向分类，横排文字零损失
-            "Det.limit_type": "max",       # 只限长边，避免短边被放大
-            "Det.limit_side_len": 1280,    # 长边超过才缩小
+            "Global.use_cls": False,
+            "Det.limit_type": "max",
+            "Det.limit_side_len": 1280,
         }
 
     def _init_engines(self):
@@ -462,17 +457,17 @@ class OCREngine:
     def _init_aux_engines(self):
         """
         辅助引擎：
-        - 用 CPU + 与主引擎相反的模型（主 server → 辅 mobile，主 mobile → 辅 server）
+        - 用 CPU + 与主引擎相反的模型（主 server → 辅 tiny，主 tiny → 辅 server）
         - 不占用 GPU，避免与主引擎冲突
         """
         from rapidocr import RapidOCR
 
-        aux_model = 'mobile' if self.model_size == 'server' else 'server'
+        aux_model = 'tiny' if self.model_size == 'server' else 'server'
 
-        if aux_model == 'mobile':
-            params = _build_mobile_params()
+        if aux_model == 'tiny':
+            params = _build_tiny_params()
             if params is None:
-                print("[OCR] 辅助引擎：mobile 不可用，跳过")
+                print("[OCR] 辅助引擎：tiny 不可用，跳过")
                 return
         else:
             params = {}
@@ -494,7 +489,6 @@ class OCREngine:
     # ================= 截图 =================
 
     def capture(self, region):
-        """复用 mss 实例（主线程调用，安全）"""
         if self._sct is None:
             try:
                 self._sct = mss.mss()
@@ -517,8 +511,6 @@ class OCREngine:
     # ================= 识别 =================
 
     def _get_engine_snapshot(self):
-        """取引擎列表的快照引用（防止重载期间列表被换）"""
-        # 由于 Python list 是引用赋值，这里取到的快照是安全的
         with self._lock:
             if self._reloading:
                 return None, None
@@ -535,10 +527,8 @@ class OCREngine:
         if not engines or not images:
             return [[] for _ in images]
 
-        # 主引擎识别
         main_results = self._recognize_main(images, engines)
 
-        # 高精度：辅助引擎 + 融合
         if self.high_accuracy and aux:
             aux_results = self._recognize_aux(images, aux)
             fused = []
@@ -549,7 +539,6 @@ class OCREngine:
         return main_results
 
     def _recognize_main(self, images, engines):
-        """主引擎识别（多引擎线程池并行）"""
         n = len(engines)
         if n == 1 or len(images) == 1:
             engine = engines[0]
@@ -573,7 +562,6 @@ class OCREngine:
         return results
 
     def _recognize_aux(self, images, aux):
-        """辅助引擎识别（串行，CPU）"""
         engine = aux[0]
         return [self._recognize_one(engine, img) for img in images]
 
@@ -598,12 +586,6 @@ class OCREngine:
     # ================= 结果融合 =================
 
     def _fuse_results(self, results_list, iou_threshold=0.5):
-        """
-        融合多个引擎的识别结果：
-        1. 收集所有 box
-        2. 按 IoU 聚类（同一位置的识别归为一组）
-        3. 每组投票：多数相同用多数，都不相同选最长
-        """
         all_items = []
         for src_idx, items in enumerate(results_list):
             for it in items:
@@ -666,7 +648,7 @@ class OCREngine:
         if not self.engines:
             return "未初始化"
         n = len(self.engines)
-        model_tag = "轻量" if self.model_size == 'mobile' else "标准"
+        model_tag = "tiny" if self.model_size == 'tiny' else "标准"
         ha_tag = " + 高精度" if self.high_accuracy else ""
         opt_tag = " + 加速" if self.speed_opt else ""
         if self.mode == 'directml':
@@ -679,7 +661,6 @@ class OCREngine:
         return self.mode in ('directml', 'cuda')
 
     def shutdown(self):
-        """退出时释放所有资源"""
         with self._lock:
             self._reloading = True
         try:
@@ -689,7 +670,6 @@ class OCREngine:
         finally:
             with self._lock:
                 self._reloading = False
-        # 关 mss
         if self._sct is not None:
             try:
                 self._sct.close()
