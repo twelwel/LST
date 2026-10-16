@@ -1,16 +1,12 @@
-"""自适应输出防抖模块（视频字幕专用）
+"""自适应输出防抖模块（视频字幕专用 + 日语优化）
 
-针对视频字幕场景的核心机制：
-
-1. **位置即身份**：同一位置（容差内）视为同一段，文本变化不影响 identity
-2. **多帧投票**：窗口内文本聚类，选最大簇的最长文本（字幕逐字出现时最完整）
-3. **显示节流**：同一段的最小更新间隔，避免逐字出现时 UI 高频刷新
-4. **位置平滑**：anchor 缓慢跟随，位置小抖动不传到 UI
+核心机制：
+1. **位置即身份**：用「中心点距离」判断同段，避免文本变长导致误判
+2. **多帧投票**：窗口内文本聚类，选最大簇的最长文本
+3. **显示节流**：同一段的最小更新间隔
+4. **位置防抖**：位置变化 < 8px 视为 OCR 抖动，不更新窗口
 5. **消失容忍**：连续 N 帧未出现才移除
-
-对外接口：
-    reset()          → 清空状态
-    process(items)   → 处理一帧全量输入，返回 None（无变化）或 list（全量稳定列表）
+6. **日语模式**：更激进的节流和消失容忍
 """
 
 import threading
@@ -19,67 +15,61 @@ from collections import deque
 from difflib import SequenceMatcher
 
 
+def _has_kana(text):
+    if not text:
+        return False
+    return any('\u3040' <= ch <= '\u30ff' for ch in text)
+
+
 class EmitDebouncer:
-    # ============ 参数（视频字幕场景调优） ============
+    # ============ 通用参数 ============
 
-    # 投票窗口大小（帧）—— 越大越稳，但字幕换句响应越慢
     VOTE_WINDOW = 4
-
-    # 同一段的最小更新间隔（秒）
-    # 字幕逐字出现时，本段内每帧文本都不同
-    # 此值控制更新频率：0.12s ≈ 8次/秒，人眼看起来流畅且不抖
     MIN_UPDATE_INTERVAL = 0.12
 
-    # 位置容差（像素）—— 低于此值视为同段
-    # 视频字幕位置固定，抖动一般在 ±10px 内
-    POS_TOLERANCE = 16
+    # 中心点容差：判断是否同一段（容忍文本变长）
+    CENTER_TOLERANCE = 30
 
-    # 位置平滑系数（0=不动，1=完全跟随）
-    # 0.35：稳定但能缓慢适应
-    POS_BLEND = 0.35
+    # ⭐ 位置更新阈值
+    # 文本未变时，位置偏差超过此值才更新窗口（防 OCR 抖动）
+    # - 太小：窗口跟着 OCR 抖动
+    # - 太大：真移动不跟随
+    # 8px 是经验值：> POSITION_QUANTIZE(6)，< 一行字号
+    POS_UPDATE_THRESHOLD = 8
 
-    # 消失容忍帧数 —— 字幕短暂识别失败不立即消失
     MISS_TOLERANCE = 2
 
-    # 文本相似度阈值 —— 用于投票聚类
     TEXT_SIMILARITY = 0.7
-
-    # 文本长度相似下限（低于此值视为不同文本，不参与聚类）
     TEXT_MIN_LEN_RATIO = 0.5
 
-    # ============ 状态 ============
+    # ============ 日语专用参数 ============
+    JP_VOTE_WINDOW = 3
+    JP_MIN_UPDATE_INTERVAL = 0.06
+    JP_MISS_TOLERANCE = 1
+    JP_TEXT_SIMILARITY = 0.8
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._states = {}   # key -> state dict
+        self._states = {}
 
     def reset(self):
-        """清空所有状态（切换区域/模式/策略时调用）"""
         with self._lock:
             self._states.clear()
 
     def process(self, items):
-        """
-        参数：
-            items: pipeline 认为「当前应该显示」的全部 item 列表
-
-        返回：
-            None  → 无变化，UI 无需更新
-            list  → 有变化，返回完整的稳定 item 列表（全量替换）
-        """
         with self._lock:
             now = time.time()
             incoming = {it['key']: it for it in items}
             dirty = False
 
-            # ============ 1. 处理已存在的 key ============
+            # 1. 已存在的 key
             for key in list(self._states.keys()):
                 st = self._states[key]
 
                 if key not in incoming:
-                    # 消失：容忍几帧
                     st['miss'] += 1
-                    if st['miss'] > self.MISS_TOLERANCE:
+                    miss_tol = st.get('miss_tol', self.MISS_TOLERANCE)
+                    if st['miss'] > miss_tol:
                         del self._states[key]
                         dirty = True
                     continue
@@ -90,18 +80,32 @@ class EmitDebouncer:
                 if self._update_state(st, item, now):
                     dirty = True
 
-            # ============ 2. 处理新 key ============
+            # 2. 新 key
             for key, item in incoming.items():
                 if key in self._states:
                     continue
-                # 新 key 直接采纳（字幕新句出现时立即可见）
+
+                text = item.get('text', '')
+                is_jp = _has_kana(text)
+
                 self._states[key] = {
                     'stable': item,
-                    'texts': deque([item.get('text', '')],
-                                   maxlen=self.VOTE_WINDOW),
+                    'texts': deque(
+                        [text],
+                        maxlen=self.JP_VOTE_WINDOW if is_jp
+                        else self.VOTE_WINDOW,
+                    ),
                     'anchor': self._box(item),
                     'last_update_ts': now,
                     'miss': 0,
+                    'is_jp': is_jp,
+                    'miss_tol': (self.JP_MISS_TOLERANCE if is_jp
+                                 else self.MISS_TOLERANCE),
+                    'update_interval': (self.JP_MIN_UPDATE_INTERVAL
+                                        if is_jp
+                                        else self.MIN_UPDATE_INTERVAL),
+                    'text_sim': (self.JP_TEXT_SIMILARITY if is_jp
+                                 else self.TEXT_SIMILARITY),
                 }
                 dirty = True
 
@@ -116,54 +120,74 @@ class EmitDebouncer:
     # ==================== 内部 ====================
 
     def _update_state(self, st, item, now):
-        """更新已有 key 的状态，返回 True 表示 dirty"""
-        st['texts'].append(item.get('text', ''))
+        new_text = item.get('text', '')
+        st['texts'].append(new_text)
 
         new_box = self._box(item)
-        same_pos = self._pos_close(st['anchor'], new_box)
 
-        # ============ 位置大变：视为新段落 ============
-        if not same_pos:
+        # 位置大变 → 视为新段落
+        if not self._center_close(
+                st['anchor'], new_box, self.CENTER_TOLERANCE):
+            is_jp = _has_kana(new_text)
             st['stable'] = item
-            st['texts'] = deque([item.get('text', '')],
-                                maxlen=self.VOTE_WINDOW)
+            st['texts'] = deque(
+                [new_text],
+                maxlen=(self.JP_VOTE_WINDOW if is_jp
+                        else self.VOTE_WINDOW),
+            )
             st['anchor'] = new_box
             st['last_update_ts'] = now
+            st['is_jp'] = is_jp
+            st['miss_tol'] = (self.JP_MISS_TOLERANCE if is_jp
+                              else self.MISS_TOLERANCE)
+            st['update_interval'] = (self.JP_MIN_UPDATE_INTERVAL
+                                     if is_jp
+                                     else self.MIN_UPDATE_INTERVAL)
+            st['text_sim'] = (self.JP_TEXT_SIMILARITY if is_jp
+                              else self.TEXT_SIMILARITY)
             return True
 
-        # ============ 同一段：位置平滑 ============
-        st['anchor'] = self._blend_pos(
-            st['anchor'], new_box, self.POS_BLEND)
+        # ⭐ anchor 保留最新位置（不 blend，避免累积误差）
+        st['anchor'] = new_box
 
-        # ============ 多帧投票 ============
-        voted = self._vote(st['texts'])
+        # 多帧投票
+        voted = self._vote(
+            st['texts'], st.get('text_sim', self.TEXT_SIMILARITY))
         cur_text = st['stable'].get('text', '')
 
-        # ---- 文本未变：只更新位置（如果位置有明显偏差）----
+        # ---------- 文本未变 ----------
         if not voted or voted == cur_text:
-            if self._pos_far_from_stable(st['stable'], st['anchor']):
-                new_stable = dict(st['stable'])
-                (new_stable['x1'], new_stable['y1'],
-                 new_stable['x2'], new_stable['y2']) = st['anchor']
-                if 'orig_y2' in new_stable:
-                    new_stable['orig_y2'] = st['anchor'][3]
-                st['stable'] = new_stable
-                return True
+            # 比较最新位置 vs 上次显示位置
+            cur_pos = self._box(st['stable'])
+            drift = self._pos_drift(new_box, cur_pos)
+
+            if drift < self.POS_UPDATE_THRESHOLD:
+                # 抖动 → 不动
+                return False
+
+            # 真移动（>8px）→ 更新位置
+            new_stable = dict(st['stable'])
+            (new_stable['x1'], new_stable['y1'],
+             new_stable['x2'], new_stable['y2']) = new_box
+            if 'orig_y2' in new_stable:
+                new_stable['orig_y2'] = new_box[3]
+            st['stable'] = new_stable
+            return True
+
+        # ---------- 文本有变化：节流 ----------
+        interval = st.get('update_interval', self.MIN_UPDATE_INTERVAL)
+        if now - st['last_update_ts'] < interval:
             return False
 
-        # ---- 文本有变化：节流 ----
-        if now - st['last_update_ts'] < self.MIN_UPDATE_INTERVAL:
-            # 节流窗口内，暂不更新（投票窗口继续收集）
-            return False
-
-        # ---- 通过节流：采纳投票结果 + 平滑位置 ----
+        # 采纳投票结果 + 用最新位置
         new_stable = dict(item)
         new_stable['text'] = voted
-        new_stable['key'] = st['stable'].get('key', item.get('key', ''))
+        new_stable['key'] = st['stable'].get('key',
+                                              item.get('key', ''))
         (new_stable['x1'], new_stable['y1'],
-         new_stable['x2'], new_stable['y2']) = st['anchor']
+         new_stable['x2'], new_stable['y2']) = new_box
         if 'orig_y2' in new_stable:
-            new_stable['orig_y2'] = st['anchor'][3]
+            new_stable['orig_y2'] = new_box[3]
         st['stable'] = new_stable
         st['last_update_ts'] = now
         return True
@@ -174,31 +198,22 @@ class EmitDebouncer:
     def _box(it):
         return (it['x1'], it['y1'], it['x2'], it['y2'])
 
-    def _pos_close(self, a, b):
-        return (abs(a[0] - b[0]) <= self.POS_TOLERANCE and
-                abs(a[1] - b[1]) <= self.POS_TOLERANCE and
-                abs(a[2] - b[2]) <= self.POS_TOLERANCE and
-                abs(a[3] - b[3]) <= self.POS_TOLERANCE)
-
-    def _pos_far_from_stable(self, item, anchor):
-        tol = self.POS_TOLERANCE // 2
-        return (abs(item['x1'] - anchor[0]) > tol or
-                abs(item['y1'] - anchor[1]) > tol or
-                abs(item['x2'] - anchor[2]) > tol or
-                abs(item['y2'] - anchor[3]) > tol)
+    @staticmethod
+    def _center_close(a, b, tol):
+        acx = (a[0] + a[2]) / 2
+        acy = (a[1] + a[3]) / 2
+        bcx = (b[0] + b[2]) / 2
+        bcy = (b[1] + b[3]) / 2
+        return abs(acx - bcx) <= tol and abs(acy - bcy) <= tol
 
     @staticmethod
-    def _blend_pos(old, new, alpha):
-        return tuple(int(o * (1 - alpha) + n * alpha)
-                     for o, n in zip(old, new))
+    def _pos_drift(a, b):
+        return max(abs(a[0] - b[0]), abs(a[1] - b[1]),
+                   abs(a[2] - b[2]), abs(a[3] - b[3]))
 
-    def _vote(self, texts):
-        """
-        多帧投票：
-        1. 按相似度聚类
-        2. 最大簇（平局取总长度大者）
-        3. 簇内取最长文本（字幕逐字出现时最长=最完整）
-        """
+    def _vote(self, texts, similarity=None):
+        if similarity is None:
+            similarity = self.TEXT_SIMILARITY
         valid = [t for t in texts if t]
         if not valid:
             return ''
@@ -207,7 +222,7 @@ class EmitDebouncer:
         for t in valid:
             placed = False
             for c in clusters:
-                if self._text_sim(c[0], t) >= self.TEXT_SIMILARITY:
+                if self._text_sim(c[0], t) >= similarity:
                     c.append(t)
                     placed = True
                     break

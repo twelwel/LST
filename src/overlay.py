@@ -1,7 +1,7 @@
-"""
-覆盖显示模块
+"""覆盖显示模块
 - 覆盖模式：多小窗口
 - 双语模式：原文下方小字译文（视频字幕场景优化）
+  ⭐ 字幕自动单行：宽扁段落译文强制单行显示，字号自适应
 - 小窗口模式：独立浮窗累积译文（段落级去重）
 
 - 位置量化防抖
@@ -25,21 +25,14 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 POSITION_QUANTIZE = 6
 
 # ==================== 双语模式参数 ====================
-# 字号比例（相对原文，0.9 接近原文大小）
 BILINGUAL_FONT_SCALE = 0.9
-# 上下内边距
 BILINGUAL_PADDING = 3
-# 原文底部与译文窗口间距
 BILINGUAL_GAP = 2
-# 译文窗口最小高度
 BILINGUAL_MIN_H = 20
-# 译文窗口最小宽度
 BILINGUAL_MIN_W = 300
-# 译文窗口最大宽度（屏幕宽度比例）
 BILINGUAL_MAX_W_RATIO = 0.85
-# 最多显示行数（视频字幕一般 1-2 行，给到 4 行余量）
+BILINGUAL_MAX_W = 1600
 BILINGUAL_MAX_LINES = 4
-# 透明度（0.85 = 更容易看清）
 BILINGUAL_ALPHA = 0.85
 
 # ==================== 小窗口模式参数 ====================
@@ -81,7 +74,10 @@ def _estimate_text_width(text, font_size):
         return 0
     w = 0
     for ch in text:
-        if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f':
+        if ('\u4e00' <= ch <= '\u9fff' or
+                '\u3000' <= ch <= '\u303f' or
+                '\u3040' <= ch <= '\u30ff' or
+                '\uac00' <= ch <= '\ud7af'):
             w += font_size
         else:
             w += int(font_size * 0.55)
@@ -95,9 +91,13 @@ def _count_lines(text, font_size, width):
     lines = 1
     current = 0
     for ch in text:
-        cw = (font_size if ('\u4e00' <= ch <= '\u9fff' or
-                            '\u3000' <= ch <= '\u303f')
-              else int(font_size * 0.55))
+        if ('\u4e00' <= ch <= '\u9fff' or
+                '\u3000' <= ch <= '\u303f' or
+                '\u3040' <= ch <= '\u30ff' or
+                '\uac00' <= ch <= '\ud7af'):
+            cw = font_size
+        else:
+            cw = int(font_size * 0.55)
         if current + cw > width and current > 0:
             lines += 1
             current = cw
@@ -106,37 +106,74 @@ def _count_lines(text, font_size, width):
     return lines
 
 
-def _calc_bilingual_width(text, base_font_size, orig_w):
+def _calc_single_line_font(text, max_width, base_size, min_size=8):
+    """单行字号：从 base_size 递减到能塞进 max_width"""
+    if not text or max_width <= 0:
+        return base_size
+    size = base_size
+    while size > min_size:
+        w = _estimate_text_width(text, size)
+        if w <= max_width:
+            return size
+        size -= 1
+    return min_size
+
+
+def _truncate_single_line(text, max_width, min_size=8):
+    """单行截断（即使最小字号也塞不下时，末尾加省略号）"""
+    if not text or max_width <= 0:
+        return text
+
+    if _estimate_text_width(text, min_size) <= max_width:
+        return text
+
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        w = _estimate_text_width(text[:mid] + '…', min_size)
+        if w <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    if lo == 0:
+        return '…'
+    return text[:lo] + '…'
+
+
+def _calc_bilingual_width(text, base_font_size, orig_w, subtitle=False):
     """
     双语窗口宽度：
-    - 至少 = 原文宽度，保证译文从原文宽度开始
-    - 如果译文很长，扩展到估算宽度
-    - 上限 = 屏幕宽度 × BILINGUAL_MAX_W_RATIO
-    - 下限 = BILINGUAL_MIN_W
+    - 至少 = 原文宽度
+    - 字幕模式：自适应文本宽度
+    - 上限 = BILINGUAL_MAX_W
     """
     size = max(10, int(base_font_size * BILINGUAL_FONT_SCALE))
     est_w = _estimate_text_width(text, size) + 12
 
-    # 取 max(原文宽, 译文估算宽)
     w = max(int(orig_w or 0), est_w)
-
-    # 屏幕宽度限制
-    try:
-        sw = None
-        # 从 master 获取
-        pass
-    except Exception:
-        pass
 
     if w < BILINGUAL_MIN_W:
         w = BILINGUAL_MIN_W
+    if w > BILINGUAL_MAX_W:
+        w = BILINGUAL_MAX_W
 
     return int(w)
 
 
-def _calc_bilingual_height(text, width, base_font_size):
-    """双语窗口高度（译文区）：至少一行，最多 BILINGUAL_MAX_LINES 行"""
+def _calc_bilingual_height(text, width, base_font_size, subtitle=False):
+    """
+    双语窗口高度：
+    - subtitle=True：强制单行
+    - subtitle=False：最多 BILINGUAL_MAX_LINES 行
+    """
     size = max(10, int(base_font_size * BILINGUAL_FONT_SCALE))
+
+    if subtitle:
+        line_h = int(size * 1.35)
+        h = line_h + 2 * BILINGUAL_PADDING
+        return max(BILINGUAL_MIN_H, h)
+
     inner_w = max(10, width - 8)
     total_lines = _count_lines(text, size, inner_w)
     lines = min(total_lines, BILINGUAL_MAX_LINES)
@@ -146,7 +183,7 @@ def _calc_bilingual_height(text, width, base_font_size):
 
 
 def _truncate_bilingual(text, width, base_font_size):
-    """超出最大行数时截断，末尾加省略号"""
+    """超出最大行数时截断，末尾加省略号（多行）"""
     if not text:
         return text
     size = max(10, int(base_font_size * BILINGUAL_FONT_SCALE))
@@ -155,9 +192,13 @@ def _truncate_bilingual(text, width, base_font_size):
     lines = 1
     current = 0
     for i, ch in enumerate(text):
-        cw = (size if ('\u4e00' <= ch <= '\u9fff' or
-                       '\u3000' <= ch <= '\u303f')
-              else int(size * 0.55))
+        if ('\u4e00' <= ch <= '\u9fff' or
+                '\u3000' <= ch <= '\u303f' or
+                '\u3040' <= ch <= '\u30ff' or
+                '\uac00' <= ch <= '\ud7af'):
+            cw = size
+        else:
+            cw = int(size * 0.55)
         if current + cw > inner_w and current > 0:
             lines += 1
             if lines > BILINGUAL_MAX_LINES:
@@ -198,6 +239,7 @@ class TranslationBox(tk.Toplevel):
         self._photo = None
         self._initialized = False
         self._bilingual = False
+        self._subtitle = False
 
     def _apply_alpha(self):
         try:
@@ -209,8 +251,10 @@ class TranslationBox(tk.Toplevel):
             pass
 
     def reset(self, x, y, w, h, text, bg_hex, fg, bg_image,
-              base_font_size, async_enabled=False, bilingual=False):
+              base_font_size, async_enabled=False, bilingual=False,
+              subtitle=False):
         self._bilingual = bool(bilingual)
+        self._subtitle = bool(subtitle)
         self._box_w = w
         self._box_h = h
         self._full_text = text
@@ -249,12 +293,32 @@ class TranslationBox(tk.Toplevel):
 
         # ============ 双语模式 ============
         if self._bilingual:
-            # 背景
             self.canvas.configure(bg=self._bg_hex)
 
-            # 字号
             base_size = max(10, int(self._base_font_size *
                                    BILINGUAL_FONT_SCALE))
+
+            # ⭐ 字幕：单行显示，字号自适应
+            if self._subtitle:
+                visible = self._full_text[:self._visible_len]
+                inner_w = max(10, self._box_w - 8)
+
+                # 先截断
+                visible = _truncate_single_line(visible, inner_w)
+                # 字号自适应
+                font_size = _calc_single_line_font(
+                    visible, inner_w, base_size)
+
+                self.canvas.create_text(
+                    4, BILINGUAL_PADDING,
+                    text=visible, fill=self._fg,
+                    font=(self._font_name, font_size),
+                    anchor='nw',
+                    justify='left',
+                )
+                return
+
+            # 多行模式
             font_size = calc_font_size(
                 self._full_text, self._box_w - 8,
                 self._box_h - 2 * BILINGUAL_PADDING, base_size)
@@ -263,7 +327,6 @@ class TranslationBox(tk.Toplevel):
             visible = _truncate_bilingual(
                 visible, self._box_w, self._base_font_size)
 
-            # 左上角开始绘制多行
             self.canvas.create_text(
                 4, BILINGUAL_PADDING,
                 text=visible, fill=self._fg,
@@ -296,14 +359,16 @@ class TranslationBox(tk.Toplevel):
         )
 
     def update_content(self, text, base_font_size, bg_hex, fg, bg_image,
-                       async_enabled=False, bilingual=False):
+                       async_enabled=False, bilingual=False,
+                       subtitle=False):
         text_changed = (self._full_text != text)
         style_changed = (
             self._base_font_size != base_font_size or
             self._bg_hex != bg_hex or
             self._fg != fg or
             self._bg_image is not bg_image or
-            self._bilingual != bool(bilingual)
+            self._bilingual != bool(bilingual) or
+            self._subtitle != bool(subtitle)
         )
 
         if not text_changed and not style_changed:
@@ -315,6 +380,7 @@ class TranslationBox(tk.Toplevel):
         self._fg = fg
         self._bg_image = bg_image
         self._bilingual = bool(bilingual)
+        self._subtitle = bool(subtitle)
 
         self._apply_alpha()
 
@@ -373,7 +439,8 @@ class TranslationBox(tk.Toplevel):
             return
         old_x, old_y = self._pos
         if quantize:
-            if abs(x - old_x) < POSITION_QUANTIZE and abs(y - old_y) < POSITION_QUANTIZE:
+            if (abs(x - old_x) < POSITION_QUANTIZE and
+                    abs(y - old_y) < POSITION_QUANTIZE):
                 return
         if (x, y) != self._pos:
             self._pos = (x, y)
@@ -418,7 +485,6 @@ class CaptionWindow:
         except Exception:
             pass
 
-        # 标题栏
         self.bar = tk.Frame(self.win, bg=CAPTION_BAR_BG, height=26)
         self.bar.pack(fill='x', side='top')
         self.bar.pack_propagate(False)
@@ -453,7 +519,6 @@ class CaptionWindow:
             font=(font_name, 8),
         ).pack(side='right', padx=4)
 
-        # 文本区
         text_frame = tk.Frame(self.win, bg=CAPTION_BG)
         text_frame.pack(fill='both', expand=True)
 
@@ -596,8 +661,6 @@ class OverlayWindow:
         self.boxes = {}
         self.base_font_size = 15
 
-        # 双语模式下译文相对原文的额外偏移（像素）
-        # 正数=译文更靠下，负数=译文向上覆盖原文
         self.bilingual_gap = BILINGUAL_GAP
 
         self.use_pool = True
@@ -708,16 +771,18 @@ class OverlayWindow:
             item_font = item.get('force_font_size', base_font_size)
 
             bilingual = item.get('bilingual', False)
+            subtitle = item.get('subtitle', False)
             orig_w = item.get('orig_w', x2 - x1)
             orig_h = item.get('orig_h', y2 - y1)
 
             if bilingual:
-                # 双语：放在原文底部下方，宽度自适应，高度自适应多行
                 orig_y2 = item.get('orig_y2', y2)
                 new_x1 = x1
                 new_y1 = orig_y2 + self.bilingual_gap
-                new_w = _calc_bilingual_width(text, item_font, orig_w)
-                new_h = _calc_bilingual_height(text, new_w, item_font)
+                new_w = _calc_bilingual_width(
+                    text, item_font, orig_w, subtitle=subtitle)
+                new_h = _calc_bilingual_height(
+                    text, new_w, item_font, subtitle=subtitle)
                 bg_image = None
             else:
                 new_x1 = x1
@@ -734,6 +799,7 @@ class OverlayWindow:
                     item_font,
                     async_enabled=self.async_enabled,
                     bilingual=bilingual,
+                    subtitle=subtitle,
                 )
                 self.boxes[key] = box
             else:
@@ -743,6 +809,7 @@ class OverlayWindow:
                     text, item_font, bg_hex, fg, bg_image,
                     async_enabled=self.async_enabled,
                     bilingual=bilingual,
+                    subtitle=subtitle,
                 )
 
         for key in list(self.boxes.keys()):

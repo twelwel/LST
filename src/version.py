@@ -15,6 +15,9 @@ REPO_URL = "https://github.com/twelwel/LST"
 RELEASE_URL = REPO_URL + "/releases"
 
 VERSION_INFO = {
+    "1.40.1": "v1.40.1：修复二次 OCR 验证 DML 崩溃；"
+              "双语模式去重（不再重复输出）；"
+              "字幕单行显示优化；字幕判定",
     "1.40.0": "v1.40.0：多语言支持（源/目标语言可选）；"
               "内置延迟测试 + 全链路测量；"
               "英语特化 / 标题过滤 / 二次 OCR 验证 / 双语距离滑块；"

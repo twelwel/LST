@@ -286,3 +286,16 @@ TARGET_LANG_NAME = {
     'es': 'Español',
     'ru': 'Русский',
 }
+
+# 源语言 → OCR lang_type 映射（rapidocr 枚举名）
+SOURCE_LANG_TO_OCR = {
+    'auto': 'CH',
+    'en':   'EN',
+    'zh':   'CH',
+    'ja':   'JAPAN',
+    'ko':   'KOREAN',
+    'fr':   'FRENCH',
+    'de':   'GERMAN',
+    'es':   'SPANISH',
+    'ru':   'RUSSIAN',
+}

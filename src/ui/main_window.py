@@ -207,6 +207,12 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         saved_fg_color = self.user_cfg.get('fg_color', DEFAULT_FG_COLOR)
         saved_source_lang = self.user_cfg.get(
             'source_lang', DEFAULT_SOURCE_LANG)
+        # OCR 语言（用于识别）
+        from config import SOURCE_LANG_TO_OCR
+        saved_ocr_lang = self.user_cfg.get(
+            'ocr_lang',
+            SOURCE_LANG_TO_OCR.get(saved_source_lang, 'CH'))
+        self._ocr_lang = saved_ocr_lang
         if saved_source_lang not in SOURCE_LANGS:
             saved_source_lang = DEFAULT_SOURCE_LANG
 
@@ -268,6 +274,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             model_size=self.ocr_model_size,
             high_accuracy=self.high_accuracy_ocr,
             speed_opt=self.enable_ocr_speed_opt,
+            lang_name=saved_ocr_lang,
         )
         log.info(f"OCR 引擎初始化：{variant} × "
                  f"{len(self.ocr_engine.engines)}")
@@ -1282,8 +1289,14 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
     # ================= 语言 =================
 
     def _on_source_lang_change(self, label):
+        from config import SOURCE_LANG_TO_OCR
+
         rev = {v: k for k, v in SOURCE_LANGS.items()}
         key = rev.get(label, DEFAULT_SOURCE_LANG)
+
+        old_ocr_lang = getattr(self, '_ocr_lang', 'CH')
+        new_ocr_lang = SOURCE_LANG_TO_OCR.get(key, 'CH')
+
         self.app_state.source_lang = key
         try:
             self.translator.set_languages(source=key)
@@ -1291,8 +1304,48 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             pass
         self.user_cfg.set('source_lang', key)
         self.user_cfg.save()
-        log.info(f"[源语言] 切换为 {key}")
+        log.info(f"[源语言] 切换为 {key} (OCR lang: {new_ocr_lang})")
+
+        # ⭐ OCR 语言变化 → 重载引擎
+        if new_ocr_lang != old_ocr_lang:
+            if self.app_state.running:
+                self.bottom_label.configure(
+                    text="⚠️ 请先暂停翻译再切换源语言")
+                # 回滚
+                self.app_state.source_lang = key
+                return
+
+            self._ocr_lang = new_ocr_lang
+            self.user_cfg.set('ocr_lang', new_ocr_lang)
+            self.user_cfg.save()
+
+            self.bottom_label.configure(
+                text=f"OCR 语言切换为 {new_ocr_lang}，正在重载...")
+            self.after(200, self._reload_ocr_for_lang)
+
         self.bottom_label.configure(text=f"源语言：{label}")
+
+    def _reload_ocr_for_lang(self):
+        """根据当前源语言重新初始化 OCR"""
+        try:
+            actual = self.ocr_engine.init(
+                mode=self.ocr_engine.mode,
+                pool_size=self.cpu_engine_count,
+                dml_worker_count=self.dml_worker_count,
+                model_size=self.ocr_model_size,
+                high_accuracy=self.high_accuracy_ocr,
+                speed_opt=self.enable_ocr_speed_opt,
+                lang_name=getattr(self, '_ocr_lang', 'CH'),
+            )
+            try:
+                self.pipeline.reset_debouncer()
+            except Exception:
+                pass
+            self.overlay.clear()
+            self.bottom_label.configure(text=f"✅ OCR 重载完成：{actual}")
+        except Exception as e:
+            log.exception(f"[OCR] 重载失败：{e}")
+            self.bottom_label.configure(text=f"重载失败：{e}")
 
     def _on_target_lang_change(self, label):
         rev = {v: k for k, v in TARGET_LANGS.items()}
@@ -1677,6 +1730,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                 model_size=self.ocr_model_size,
                 high_accuracy=self.high_accuracy_ocr,
                 speed_opt=self.enable_ocr_speed_opt,
+                lang_name=getattr(self, '_ocr_lang', 'CH'),
             )
             log.info(f"[加速] 切换完成：{actual} "
                      f"× {len(self.ocr_engine.engines)}")

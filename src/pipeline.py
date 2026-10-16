@@ -1,4 +1,18 @@
-"""后台处理管道"""
+"""后台处理管道
+- 6 种翻译策略：离线 / 单翻译 API / 多翻译轮询 / 混合 / 单 AI / 多 AI 投票
+- 快速响应层（本地词典 + 短语缓存）：所有策略共用，只处理单词和词组
+- 显示模式：覆盖 / 双语 / 小窗口
+- 译文颜色：全模式通用
+- 输出防抖：位置匹配复用 key + EmitDebouncer + Generation 保护
+- 通用过滤：只过滤数字、单位、图像
+- 英语特化：只识别字母主导的英文段落
+- 标题过滤：全大写 / 超大字号
+- 二次 OCR 验证：emit 前局部复核，防一闪而过（用独立 CPU 引擎）
+- 双语/滚动去重：同帧相同/相似文本只保留一份
+- 帧差检测：连通域过滤 + 动态 padding
+- 分块 OCR：均匀分块 + IoU 去重
+- 性能统计：各阶段平均延迟，定期打印
+"""
 
 import queue
 import re
@@ -22,7 +36,6 @@ from layout import (
     hash_paragraph,
     paragraph_display_key,
     get_line_hashes,
-    is_chinese_text,
     is_target_language_text,
     filter_invalid_items,
     filter_general_content,
@@ -55,6 +68,7 @@ THUMB_SIZE = 40
 PIXEL_DIFF_THRESHOLD = 20
 INPAINT_CACHE_MAX = 200
 
+# ============ 分块 OCR 参数 ============
 MULTITHREAD_OCR_MIN_AREA = 600 * 150
 MULTITHREAD_OCR_OVERLAP = 40
 MULTITHREAD_OCR_MIN_CHUNK_H = 400
@@ -64,18 +78,34 @@ SLOW_THRESHOLD_MS = 300
 
 PERF_REPORT_INTERVAL = 10.0
 
+# ============ 位置匹配参数 ============
 POSITION_MATCH_TOLERANCE = 40
 TRACKER_TIMEOUT = 1.5
 
+# ============ 帧差检测参数 ============
 FRAME_DIFF_MIN_COMPONENT_AREA = 4
 FRAME_DIFF_PADDING_RATIO = 0.3
 FRAME_DIFF_MAX_COMPONENTS = 5
 
+# ============ 二次 OCR 验证参数 ============
 OCR_VERIFY_PADDING = 8
 OCR_VERIFY_SIMILARITY = 0.6
-OCR_VERIFY_MIN_AREA = 8 * 8
+
+# 严格的最小尺寸（DirectML / ONNX 的最低要求）
+OCR_VERIFY_MIN_W = 32
+OCR_VERIFY_MIN_H = 32
+OCR_VERIFY_MIN_AREA = 32 * 32
+
+# 验证用独立 CPU 引擎（不用主引擎，避免 DML 崩溃）
+OCR_VERIFY_USE_CPU_ENGINE = True
+
+# 单帧最多验证几段（防拖慢）
+OCR_VERIFY_MAX_ITEMS = 20
+
 OCR_VERIFY_FAIL_OPEN = True
 
+
+# ==================== 性能统计 ====================
 
 class _PerfStats:
     def __init__(self):
@@ -145,6 +175,8 @@ class _PerfStats:
             return result
 
 
+# ==================== AppState ====================
+
 class AppState:
     def __init__(self, initial_region,
                  frame_similarity_threshold=0.9,
@@ -164,9 +196,9 @@ class AppState:
                  enable_async_translate=True,
                  enable_window_pool=True,
                  enable_multithread_ocr=False,
+                 enable_ocr_speed_opt=True,
                  source_lang='auto',
-                 target_lang='zh',
-                 enable_ocr_speed_opt=True):
+                 target_lang='zh'):
         self.running = False
         self.region = dict(initial_region)
         self.base_font_size = 15
@@ -178,11 +210,11 @@ class AppState:
         self.enable_ocr_verify = enable_ocr_verify
         self.enable_fast_lookup = enable_fast_lookup
         self.enable_ocr_speed_opt = enable_ocr_speed_opt
-        self.source_lang = source_lang
-        self.target_lang = target_lang
         self.translation_strategy = 'single_translate'
         self.display_mode = 'overlay'
         self.fg_color = 'auto'
+        self.source_lang = source_lang
+        self.target_lang = target_lang
         self.local_dict_path = local_dict_path
         self.lock = threading.Lock()
         self.frame_similarity_threshold = frame_similarity_threshold
@@ -209,7 +241,9 @@ class AppState:
         self.freeze_overlay = False
         self.scroll_boost = False
         self.pending_change = False
+
         self._scroll_until = 0.0
+
         if mode_cfg:
             self.apply_mode(mode_cfg)
 
@@ -244,6 +278,8 @@ class AppState:
         self.pending_change = False
 
 
+# ==================== Pipeline ====================
+
 class Pipeline:
     def __init__(self, ocr_engine, cache, translator, state):
         self.ocr = ocr_engine
@@ -268,7 +304,8 @@ class Pipeline:
             except Exception as e:
                 log.error(f"[本地词典] 初始化失败：{e}")
 
-        self.translate_pool = ThreadPoolExecutor(max_workers=4)
+        # 提高并发（日语翻译更耗时）
+        self.translate_pool = ThreadPoolExecutor(max_workers=8)
         self._pending_translates = set()
 
         self.emit_debouncer = EmitDebouncer()
@@ -279,6 +316,10 @@ class Pipeline:
 
         self._tracker_entries = {}
         self._tracker_lock = threading.Lock()
+
+        # 二次 OCR 验证专用 CPU 引擎（延迟创建）
+        self._verify_engine = None
+        self._verify_engine_lock = threading.Lock()
 
         self._perf = _PerfStats()
         self._perf_last_report = time.time()
@@ -330,19 +371,36 @@ class Pipeline:
 
     # ==================== 位置 tracker ====================
 
-    def _assign_stable_key(self, para_box, fallback_key, used_keys=None):
+    def _assign_stable_key(self, para_box, fallback_key,
+                            used_keys=None, text=None):
         """
         位置匹配复用老 key
 
-        used_keys：本帧已被占用的 key 集合，防止多个段落撞同一个 key
+        优先匹配规则：
+        1. 位置最近 + 文本相同 → 直接复用
+        2. 位置最近（< 容差）→ 复用
+        3. 生成新 key
+
+        used_keys：本帧已被占用的 key 集合
+        text：当前段落文本（用于文本匹配）
         """
         now = time.time()
         x1, y1, x2, y2 = para_box
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
 
+        def norm(t):
+            if not t:
+                return ''
+            t = re.sub(r'\s+', '', t)
+            t = re.sub(
+                r'[.,;:!?"\'`~@#$%^&*()\[\]{}<>|\\/'
+                r'《》【】。，；：！？、""''…—\-_]+', '', t)
+            return t.lower()
+
+        cur_text_norm = norm(text) if text else ''
+
         with self._tracker_lock:
-            # 清理超时
             expired = [k for k, e in self._tracker_entries.items()
                        if now - e['last_seen'] > TRACKER_TIMEOUT]
             for k in expired:
@@ -350,8 +408,8 @@ class Pipeline:
 
             best_key = None
             best_dist = float('inf')
+
             for k, e in self._tracker_entries.items():
-                # ⭐ 跳过本帧已用的 key
                 if used_keys and k in used_keys:
                     continue
 
@@ -359,6 +417,22 @@ class Pipeline:
                 ecx = (ex1 + ex2) / 2
                 ecy = (ey1 + ey2) / 2
                 d = ((cx - ecx) ** 2 + (cy - ecy) ** 2) ** 0.5
+
+                # 文本相同 + 位置相近 → 强匹配
+                e_text_norm = norm(e.get('text', ''))
+                same_text = (cur_text_norm and e_text_norm and
+                             cur_text_norm == e_text_norm)
+
+                if same_text and d < POSITION_MATCH_TOLERANCE * 2:
+                    self._tracker_entries[k]['box'] = (x1, y1, x2, y2)
+                    self._tracker_entries[k]['last_seen'] = now
+                    if text:
+                        self._tracker_entries[k]['text'] = text
+                    if used_keys is not None:
+                        used_keys.add(k)
+                    return k
+
+                # 普通位置匹配
                 if d < best_dist:
                     best_dist = d
                     best_key = k
@@ -366,13 +440,13 @@ class Pipeline:
             if best_key is not None and best_dist < POSITION_MATCH_TOLERANCE:
                 self._tracker_entries[best_key]['box'] = (x1, y1, x2, y2)
                 self._tracker_entries[best_key]['last_seen'] = now
+                if text:
+                    self._tracker_entries[best_key]['text'] = text
                 if used_keys is not None:
                     used_keys.add(best_key)
                 return best_key
 
-            # fallback_key 也可能已被本帧用
             if used_keys and fallback_key in used_keys:
-                # 生成一个带盐的 key
                 fallback_key = hash_text(
                     f"{fallback_key}|{int(x1)}|{int(y1)}")
                 while used_keys and fallback_key in used_keys:
@@ -381,36 +455,80 @@ class Pipeline:
             self._tracker_entries[fallback_key] = {
                 'box': (x1, y1, x2, y2),
                 'last_seen': now,
+                'text': text or '',
             }
             if used_keys is not None:
                 used_keys.add(fallback_key)
             return fallback_key
 
     def _dedupe_same_frame(self, cur_items):
+        """
+        同帧去重（双语模式 / 滚动模式通用）
+
+        合并规则：
+        1. 归一化文本完全相同 → 只留面积最大的
+        2. 归一化文本相似度 > 0.9 且中心点距离 < 60px → 合并
+        """
         def norm(t):
             if not t:
                 return ''
             t = re.sub(r'\s+', '', t)
-            t = re.sub(r'[.,;:!?"\'`~@#$%^&*()\[\]{}<>|\\/'
-                       r'《》【】。，；：！？、""''…—\-_]+', '', t)
+            t = re.sub(
+                r'[.,;:!?"\'`~@#$%^&*()\[\]{}<>|\\/'
+                r'《》【】。，；：！？、""''…—\-_]+', '', t)
             return t.lower()
 
-        groups = {}
-        for key, item in cur_items.items():
-            n = norm(item.get('text', ''))
-            if not n:
-                groups.setdefault('__u__' + key, [item])
-                continue
-            groups.setdefault(n, []).append(item)
+        def center(item):
+            return ((item['x1'] + item['x2']) / 2,
+                    (item['y1'] + item['y2']) / 2)
+
+        def area(item):
+            return (item['x2'] - item['x1']) * (item['y2'] - item['y1'])
+
+        from difflib import SequenceMatcher
+
+        items_list = list(cur_items.values())
 
         result = {}
-        for n, items in groups.items():
-            if len(items) == 1:
-                result[items[0]['key']] = items[0]
-            else:
-                best = max(items, key=lambda it:
-                           (it['x2'] - it['x1']) * (it['y2'] - it['y1']))
-                result[best['key']] = best
+        processed = set()
+
+        for i, item in enumerate(items_list):
+            if i in processed:
+                continue
+            text_i = norm(item.get('text', ''))
+            if not text_i:
+                result[item['key']] = item
+                processed.add(i)
+                continue
+
+            group = [item]
+            cx_i, cy_i = center(item)
+            for j in range(i + 1, len(items_list)):
+                if j in processed:
+                    continue
+                other = items_list[j]
+                text_j = norm(other.get('text', ''))
+                if not text_j:
+                    continue
+
+                if text_i == text_j:
+                    group.append(other)
+                    processed.add(j)
+                    continue
+
+                sim = SequenceMatcher(None, text_i, text_j).ratio()
+                if sim < 0.9:
+                    continue
+                cx_j, cy_j = center(other)
+                dist = ((cx_i - cx_j) ** 2 + (cy_i - cy_j) ** 2) ** 0.5
+                if dist < 60:
+                    group.append(other)
+                    processed.add(j)
+
+            best = max(group, key=area)
+            result[best['key']] = best
+            processed.add(i)
+
         return result
 
     # ==================== 译文颜色 ====================
@@ -731,9 +849,16 @@ class Pipeline:
             return None
         if len(text) > LOCAL_LOOKUP_MAX_CHARS:
             return None
-        word_count = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
-        if word_count > LOCAL_LOOKUP_MAX_WORDS:
-            return None
+
+        # 日语短语：跳过单词数检查
+        has_kana = any('\u3040' <= ch <= '\u30ff' for ch in text)
+
+        if not has_kana:
+            word_count = len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?",
+                                        text))
+            if word_count > LOCAL_LOOKUP_MAX_WORDS:
+                return None
+
         zh = self.phrase_cache.lookup_fuzzy(text)
         if zh:
             return zh
@@ -744,44 +869,129 @@ class Pipeline:
 
     # ==================== 二次 OCR 验证 ====================
 
+    def _get_verify_engine(self):
+        """获取用于二次验证的引擎（优先 CPU，避免 DML 崩溃）"""
+        # 高精度模式下复用辅助引擎（CPU）
+        try:
+            if self.ocr.aux_engines:
+                return self.ocr.aux_engines[0]
+        except Exception:
+            pass
+
+        if self._verify_engine is not None:
+            return self._verify_engine
+
+        with self._verify_engine_lock:
+            if self._verify_engine is not None:
+                return self._verify_engine
+
+            try:
+                from rapidocr import RapidOCR
+                log.info("[验证] 创建独立 CPU 引擎...")
+                self._verify_engine = RapidOCR()
+                log.info("[验证] 独立 CPU 引擎就绪")
+            except Exception as e:
+                log.error(f"[验证] 引擎创建失败：{e}")
+                self._verify_engine = None
+
+        return self._verify_engine
+
     def _verify_paragraph(self, p, img, region):
+        """
+        二次 OCR 验证（修复版）
+
+        关键保护：
+        - 用独立 CPU 引擎（不用 DML 主引擎）
+        - crop 尺寸严格检查（< 32×32 直接跳过）
+        - 强制 uint8 + 3 通道
+        - 任何异常都视为"通过"（保守）
+        """
         x1, y1, x2, y2 = p['box']
-        if (x2 - x1) * (y2 - y1) < OCR_VERIFY_MIN_AREA:
+
+        # 1. 面积检查
+        w = x2 - x1
+        h = y2 - y1
+        if w < OCR_VERIFY_MIN_W or h < OCR_VERIFY_MIN_H:
+            return True
+        if w * h < OCR_VERIFY_MIN_AREA:
             return True
 
+        # 2. 裁剪
         pad = OCR_VERIFY_PADDING
-        h, w = img.shape[:2]
+        img_h, img_w = img.shape[:2]
         cx1 = max(0, x1 - pad)
         cy1 = max(0, y1 - pad)
-        cx2 = min(w, x2 + pad)
-        cy2 = min(h, y2 + pad)
-        if cx2 <= cx1 or cy2 <= cy1:
+        cx2 = min(img_w, x2 + pad)
+        cy2 = min(img_h, y2 + pad)
+
+        if cx2 - cx1 < OCR_VERIFY_MIN_W or cy2 - cy1 < OCR_VERIFY_MIN_H:
             return True
 
         crop = img[cy1:cy2, cx1:cx2]
-        if crop.size == 0:
+        if crop is None or crop.size == 0:
             return True
 
-        crop_small, scale = self._shrink_for_ocr(crop)
+        # 3. 强制 uint8 + 3 通道
         try:
-            items = self.ocr.recognize(crop_small)
+            if crop.dtype != np.uint8:
+                crop = crop.astype(np.uint8)
+
+            if crop.ndim == 2:
+                if _CV2_OK:
+                    crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+                else:
+                    crop = np.stack([crop] * 3, axis=-1)
+            elif crop.ndim == 3:
+                if crop.shape[2] == 4:
+                    if _CV2_OK:
+                        crop = cv2.cvtColor(crop, cv2.COLOR_RGBA2BGR)
+                    else:
+                        crop = crop[:, :, :3]
+                elif crop.shape[2] == 1:
+                    if _CV2_OK:
+                        crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+                    else:
+                        crop = np.repeat(crop, 3, axis=2)
+            else:
+                return True
+        except Exception as e:
+            log.debug(f"[验证] crop 规范化失败：{e}")
+            return True
+
+        # 4. 强制最小尺寸
+        crop_h, crop_w = crop.shape[:2]
+        if crop_h < OCR_VERIFY_MIN_H or crop_w < OCR_VERIFY_MIN_W:
+            return True
+
+        # 5. 缩放
+        try:
+            crop_small, _ = self._shrink_for_ocr(crop)
+        except Exception as e:
+            log.debug(f"[验证] 缩放失败：{e}")
+            return True
+
+        # 6. 用独立 CPU 引擎
+        engine = self._get_verify_engine()
+        if engine is None:
+            return True
+
+        try:
+            result = engine(crop_small)
         except Exception as e:
             log.debug(f"[验证] OCR 异常：{e}")
-            return OCR_VERIFY_FAIL_OPEN
+            return True
 
-        if not items:
+        if result is None or not result.txts:
             return False
 
-        new_text = ''
-        for it in items:
-            t = it['text'].strip()
-            if t:
-                new_text += t
+        new_text = ''.join(
+            (t or '').strip() for t in result.txts if t
+        )
 
         if not new_text:
             return False
 
-        old_text = p['text'].strip()
+        old_text = (p.get('text') or '').strip()
         if not old_text:
             return False
 
@@ -865,7 +1075,7 @@ class Pipeline:
                 self._maybe_report_perf()
                 return
 
-        # 英语特化：目标语言是英语时自动跳过（避免自相矛盾）
+        # 英语特化：目标语言是英语时自动跳过
         target_lang = getattr(self.state, 'target_lang', 'zh')
         english_only_on = getattr(self.state, 'enable_english_only', False)
         if english_only_on and target_lang != 'en':
@@ -904,9 +1114,10 @@ class Pipeline:
         self.state.last_frame_keys = cur_keys
 
         paragraphs = merge_lines_to_paragraphs(items)
-        to_translate = [p for p in paragraphs
-                        if not is_target_language_text(
-                            p['text'], target_lang)]
+        to_translate = [
+            p for p in paragraphs
+            if not is_target_language_text(p['text'], target_lang)
+        ]
 
         t_merge = time.time()
 
@@ -1084,9 +1295,9 @@ class Pipeline:
         fine_used = 0
         inpaint_used = 0
         verify_failed = 0
+        verify_count = 0
         t_verify_total = 0.0
 
-        # ⭐ 本帧已用 key（防重复）
         used_keys = set()
 
         for p in paragraphs:
@@ -1097,7 +1308,9 @@ class Pipeline:
 
             x1, y1, x2, y2 = p['box']
 
-            if verify_on:
+            # 二次 OCR 验证（限制单帧最多验证 N 段）
+            if verify_on and verify_count < OCR_VERIFY_MAX_ITEMS:
+                verify_count += 1
                 t_v0 = time.time()
                 passed = self._verify_paragraph(p, img, region)
                 t_v1 = time.time()
@@ -1109,12 +1322,24 @@ class Pipeline:
 
             fallback_key = paragraph_display_key(p)
             display_key = self._assign_stable_key(
-                (x1, y1, x2, y2), fallback_key, used_keys)
+                (x1, y1, x2, y2), fallback_key, used_keys,
+                text=p.get('text', ''))
 
+            # 双语 / 小窗口
             if display_mode in ('bilingual', 'window'):
                 avg = self._crop_avg_color(img, x1, y1, x2, y2)
                 bg_hex = f'#{avg[0]:02x}{avg[1]:02x}{avg[2]:02x}'
                 fg = self._resolve_fg_color(avg)
+
+                # 字幕判定（仅双语模式）
+                subtitle = False
+                if display_mode == 'bilingual':
+                    try:
+                        from layout import is_subtitle_text
+                        subtitle = is_subtitle_text(p['text'], p['box'])
+                    except Exception:
+                        subtitle = False
+
                 cur_items[display_key] = {
                     'x1': x1 + region['left'],
                     'y1': y1 + region['top'],
@@ -1127,11 +1352,13 @@ class Pipeline:
                     'bg_image': None,
                     'key': display_key,
                     'bilingual': (display_mode == 'bilingual'),
+                    'subtitle': subtitle,
                     'orig_w': x2 - x1,
                     'orig_h': y2 - y1,
                 }
                 continue
 
+            # 覆盖模式
             use_fine_this = (fine_enabled and
                              is_fine_text_suitable(img, x1, y1, x2, y2))
 
@@ -1179,6 +1406,7 @@ class Pipeline:
                 'bg_image': bg_image,
                 'key': display_key,
                 'bilingual': False,
+                'subtitle': False,
                 'orig_w': x2 - x1,
                 'orig_h': y2 - y1,
             }
@@ -1190,15 +1418,15 @@ class Pipeline:
         if verify_on and verify_failed > 0:
             log.debug(f"[验证] 丢弃 {verify_failed} 段")
 
-        if scroll_mode:
+        # ⭐ 双语 / 滚动模式去重
+        if scroll_mode or display_mode == 'bilingual':
             before = len(cur_items)
             cur_items = self._dedupe_same_frame(cur_items)
             after = len(cur_items)
             if before != after:
-                log.debug(f"[滚动] 同帧去重 {before} → {after}")
+                log.info(f"[去重] {display_mode} {before} → {after}")
 
-        # ⭐ 关键改动：直接替换 known_items（不再做缺帧容忍）
-        # 消失的 key 交给 EmitDebouncer 处理（MISS_TOLERANCE=2）
+        # 合并到全量 known
         with self._known_lock:
             gen_at_start = self._generation
             self._known_items = dict(cur_items)

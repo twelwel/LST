@@ -3,6 +3,7 @@
 - CUDA：多引擎并行（1-4 可调）
 - DirectML：单引擎
 - 支持 server / tiny 两种模型（PP-OCRv6）
+- 支持多语言（CH / EN / JAPAN / KOREAN / FRENCH / GERMAN / SPANISH / RUSSIAN）
 - 支持高精度模式（双引擎投票融合）
 - 支持 OCR 加速优化（关方向分类 + det 限长 + cv2 缩放）
 - 热重载安全：旧引擎延时释放，重载期间 recognize 返回空
@@ -86,6 +87,7 @@ def _find_lang_enums():
 
 
 def _resolve_enum(enum_cls, names):
+    """按候选名依次尝试解析枚举值"""
     if enum_cls is None:
         return None
     for name in names:
@@ -118,28 +120,77 @@ def _get_ppocrv6_value():
     return _PPOCRV6_VALUE
 
 
-def _build_tiny_params():
-    """构造 PP-OCRv6 tiny 模型参数"""
-    tiny_v = _get_tiny_value()
+# ==================== 语言枚举解析 ====================
+
+# 每种语言的候选枚举名（不同版本 rapidocr 命名不同）
+_LANG_CANDIDATES = {
+    'CH':      ['CH', 'Ch', 'ch', 'CHINESE', 'Chinese'],
+    'EN':      ['EN', 'En', 'en', 'ENGLISH', 'English'],
+    'JAPAN':   ['JAPAN', 'Japan', 'japan', 'JP', 'Jp',
+                'JAPANESE', 'Japanese'],
+    'KOREAN':  ['KOREAN', 'Korean', 'korean', 'KR', 'Kr',
+                'KOREAN_KOR', 'Kor'],
+    'FRENCH':  ['FRENCH', 'French', 'french', 'FR', 'Fr',
+                'FRENCH_FRA', 'Fra'],
+    'GERMAN':  ['GERMAN', 'German', 'german', 'DE', 'De',
+                'GERMAN_DEU', 'Deu'],
+    'SPANISH': ['SPANISH', 'Spanish', 'spanish', 'ES', 'Es',
+                'SPANISH_SPA', 'Spa'],
+    'RUSSIAN': ['RUSSIAN', 'Russian', 'russian', 'RU', 'Ru',
+                'RUSSIAN_RUS', 'Rus'],
+}
+
+
+def _resolve_lang(enum_cls, lang_name):
+    """根据语言名解析枚举值"""
+    if enum_cls is None or not lang_name:
+        return None
+    candidates = _LANG_CANDIDATES.get(lang_name)
+    if not candidates:
+        candidates = [lang_name, lang_name.upper(), lang_name.lower()]
+    return _resolve_enum(enum_cls, candidates)
+
+
+def _build_model_params(model_size='server', lang_name='CH'):
+    """
+    构造 PP-OCRv6 模型参数
+
+    model_size: 'server' / 'tiny'
+    lang_name:  'CH' / 'EN' / 'JAPAN' / 'KOREAN' / ...
+    """
     v6_v = _get_ppocrv6_value()
-    if tiny_v is None or v6_v is None:
+    if v6_v is None:
         return None
 
-    ld, lr = _find_lang_enums()
     params = {
         "Det.ocr_version": v6_v,
         "Rec.ocr_version": v6_v,
-        "Det.model_type": tiny_v,
-        "Rec.model_type": tiny_v,
     }
-    # PP-OCRv6 tiny 不支持日文，使用中文
-    lv = _resolve_enum(ld, ['CH', 'Ch', 'ch', 'CHINESE'])
-    if lv is not None:
-        params["Det.lang_type"] = lv
-    lv = _resolve_enum(lr, ['CH', 'Ch', 'ch', 'CHINESE'])
-    if lv is not None:
-        params["Rec.lang_type"] = lv
+
+    # tiny 模型
+    if model_size == 'tiny':
+        tiny_v = _get_tiny_value()
+        if tiny_v is None:
+            return None
+        params["Det.model_type"] = tiny_v
+        params["Rec.model_type"] = tiny_v
+
+    # 语言类型
+    ld, lr = _find_lang_enums()
+    det_lv = _resolve_lang(ld, lang_name) or _resolve_lang(ld, 'CH')
+    rec_lv = _resolve_lang(lr, lang_name) or _resolve_lang(lr, 'CH')
+
+    if det_lv is not None:
+        params["Det.lang_type"] = det_lv
+    if rec_lv is not None:
+        params["Rec.lang_type"] = rec_lv
+
     return params
+
+
+# 兼容旧调用（其他模块可能还在用 _build_tiny_params）
+def _build_tiny_params(lang_name='CH'):
+    return _build_model_params('tiny', lang_name)
 
 
 # ==================== IoU 工具 ====================
@@ -172,11 +223,12 @@ class OCREngine:
         self.model_size = 'server'
         self.high_accuracy = False
         self.speed_opt = True
+        self.lang_name = 'CH'
 
         # ===== 热重载保护 =====
         self._lock = threading.Lock()
         self._reloading = False
-        self._retiring = []          # 退休中的旧引擎（延时释放）
+        self._retiring = []
 
         # ===== mss 复用 =====
         self._sct = None
@@ -184,12 +236,14 @@ class OCREngine:
     # ================= 初始化 =================
 
     def init(self, mode='cpu_multi', pool_size=2, dml_worker_count=2,
-             model_size='server', high_accuracy=False, speed_opt=True):
+             model_size='server', high_accuracy=False, speed_opt=True,
+             lang_name='CH'):
         """
         mode: 'cpu_multi' / 'cuda' / 'directml'
-        model_size: 'server' / 'tiny'（PP-OCRv6 tiny）
+        model_size: 'server' / 'tiny'
         high_accuracy: 是否启用多引擎投票
         speed_opt: 是否启用 OCR 加速优化
+        lang_name: OCR 语言（CH / EN / JAPAN / KOREAN / ...）
         """
         with self._lock:
             self._reloading = True
@@ -209,13 +263,15 @@ class OCREngine:
                 model_size=model_size,
                 high_accuracy=high_accuracy,
                 speed_opt=speed_opt,
+                lang_name=lang_name,
             )
         finally:
             with self._lock:
                 self._reloading = False
 
     def _do_init(self, mode='cpu_multi', pool_size=2, dml_worker_count=2,
-                 model_size='server', high_accuracy=False, speed_opt=True):
+                 model_size='server', high_accuracy=False, speed_opt=True,
+                 lang_name='CH'):
         """实际的初始化逻辑"""
         self.last_error = ''
         self.mode = mode
@@ -225,6 +281,7 @@ class OCREngine:
         self.model_size = model_size
         self.high_accuracy = bool(high_accuracy)
         self.speed_opt = bool(speed_opt)
+        self.lang_name = lang_name or 'CH'
 
         try:
             n = int(dml_worker_count)
@@ -264,7 +321,7 @@ class OCREngine:
 
         # tiny 模型可用性检查
         if self.model_size == 'tiny':
-            if _build_tiny_params() is None:
+            if _build_model_params('tiny', self.lang_name) is None:
                 print("[OCR] ⚠️ PP-OCRv6 tiny 不可用，回退 server")
                 self.model_size = 'server'
 
@@ -273,7 +330,7 @@ class OCREngine:
             if self.high_accuracy:
                 self._init_aux_engines()
             print(f"[OCR] 使用 {mode}，主引擎 {len(self.engines)}，"
-                  f"模型 {self.model_size}，"
+                  f"模型 {self.model_size}，语言 {self.lang_name}，"
                   f"高精度 {'开' if self.high_accuracy else '关'}，"
                   f"加速 {'开' if self.speed_opt else '关'}")
             return mode
@@ -282,7 +339,7 @@ class OCREngine:
             print(f"[OCR] 初始化失败：{e}")
             self._cleanup_current()
 
-            # 降级：tiny → server
+            # 降级 1：tiny → server
             if self.model_size == 'tiny':
                 print("[OCR] tiny 失败，回退 server")
                 self.model_size = 'server'
@@ -295,7 +352,20 @@ class OCREngine:
                     print(f"[OCR] server 也失败：{e2}")
                     self._cleanup_current()
 
-            # 降级：GPU → CPU
+            # 降级 2：当前语言 → CH
+            if self.lang_name != 'CH':
+                print(f"[OCR] {self.lang_name} 失败，回退 CH")
+                self.lang_name = 'CH'
+                try:
+                    self._init_engines()
+                    if self.high_accuracy:
+                        self._init_aux_engines()
+                    return mode
+                except Exception as e3:
+                    print(f"[OCR] CH 也失败：{e3}")
+                    self._cleanup_current()
+
+            # 降级 3：GPU → CPU
             if mode != 'cpu_multi':
                 print(f"[OCR] {mode} 失败，回退 CPU")
                 self.mode = 'cpu_multi'
@@ -303,8 +373,8 @@ class OCREngine:
                 try:
                     self._init_engines()
                     return 'cpu_multi'
-                except Exception as e3:
-                    self.last_error = str(e3)
+                except Exception as e4:
+                    self.last_error = str(e4)
                     self._cleanup_current()
             return 'cpu_multi'
 
@@ -346,11 +416,9 @@ class OCREngine:
 
     # ================= 主引擎创建 =================
 
-    def _build_model_params(self):
-        """当前模型对应的参数"""
-        if self.model_size != 'tiny':
-            return {}
-        p = _build_tiny_params()
+    def _build_model_params_for_current(self):
+        """当前模型 + 语言对应的参数"""
+        p = _build_model_params(self.model_size, self.lang_name)
         return p or {}
 
     def _speed_params(self):
@@ -373,10 +441,10 @@ class OCREngine:
 
     def _init_engines_cpu(self):
         from rapidocr import RapidOCR
-        params = self._build_model_params()
+        params = self._build_model_params_for_current()
         params.update(self._speed_params())
         print(f"[OCR] 创建 {self.pool_size} 个 CPU 引擎"
-              f"（模型：{self.model_size}）...")
+              f"（模型：{self.model_size}，语言：{self.lang_name}）...")
         for i in range(self.pool_size):
             try:
                 t0 = time.time()
@@ -399,10 +467,11 @@ class OCREngine:
             "Rec.use_dml": True,
             "Cls.use_dml": False,
         }
-        params.update(self._build_model_params())
+        params.update(self._build_model_params_for_current())
         params.update(self._speed_params())
 
-        print(f"[OCR] 创建 DirectML 单引擎（模型：{self.model_size}）...")
+        print(f"[OCR] 创建 DirectML 单引擎"
+              f"（模型：{self.model_size}，语言：{self.lang_name}）...")
         t0 = time.time()
         engine = RapidOCR(params=params)
         print(f"[OCR] session 创建完成 ({time.time()-t0:.1f}s)，预热中...")
@@ -425,11 +494,12 @@ class OCREngine:
             "Rec.use_cuda": True,
             "Cls.use_cuda": False,
         }
-        params.update(self._build_model_params())
+        params.update(self._build_model_params_for_current())
         params.update(self._speed_params())
 
         n = self.pool_size
-        print(f"[OCR] 创建 {n} 个 CUDA 引擎（模型：{self.model_size}）...")
+        print(f"[OCR] 创建 {n} 个 CUDA 引擎"
+              f"（模型：{self.model_size}，语言：{self.lang_name}）...")
 
         self.engines = []
         for i in range(n):
@@ -458,6 +528,7 @@ class OCREngine:
         """
         辅助引擎：
         - 用 CPU + 与主引擎相反的模型（主 server → 辅 tiny，主 tiny → 辅 server）
+        - 语言与主引擎相同
         - 不占用 GPU，避免与主引擎冲突
         """
         from rapidocr import RapidOCR
@@ -465,16 +536,17 @@ class OCREngine:
         aux_model = 'tiny' if self.model_size == 'server' else 'server'
 
         if aux_model == 'tiny':
-            params = _build_tiny_params()
+            params = _build_model_params('tiny', self.lang_name)
             if params is None:
                 print("[OCR] 辅助引擎：tiny 不可用，跳过")
                 return
         else:
-            params = {}
+            params = _build_model_params('server', self.lang_name) or {}
 
         params.update(self._speed_params())
 
-        print(f"[OCR] 高精度模式：创建 CPU 辅助引擎（模型：{aux_model}）...")
+        print(f"[OCR] 高精度模式：创建 CPU 辅助引擎"
+              f"（模型：{aux_model}，语言：{self.lang_name}）...")
         try:
             t0 = time.time()
             engine = RapidOCR(params=params) if params else RapidOCR()
@@ -649,13 +721,14 @@ class OCREngine:
             return "未初始化"
         n = len(self.engines)
         model_tag = "tiny" if self.model_size == 'tiny' else "标准"
+        lang_tag = f" {self.lang_name}" if self.lang_name != 'CH' else ""
         ha_tag = " + 高精度" if self.high_accuracy else ""
         opt_tag = " + 加速" if self.speed_opt else ""
         if self.mode == 'directml':
-            return f'DirectML 单引擎（{model_tag}{ha_tag}{opt_tag}）'
+            return f'DirectML 单引擎（{model_tag}{lang_tag}{ha_tag}{opt_tag}）'
         if self.mode == 'cuda':
-            return f'CUDA × {n}（{model_tag}{ha_tag}{opt_tag}）'
-        return f'CPU × {n}（{model_tag}{ha_tag}{opt_tag}）'
+            return f'CUDA × {n}（{model_tag}{lang_tag}{ha_tag}{opt_tag}）'
+        return f'CPU × {n}（{model_tag}{lang_tag}{ha_tag}{opt_tag}）'
 
     def check_gpu_available(self):
         return self.mode in ('directml', 'cuda')

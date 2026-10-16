@@ -2,8 +2,11 @@
 自动排版模块
 - OCR 异常框过滤
 - 通用过滤（只过滤数字、单位、图像）
-- 英文模式过滤（只保留包含英文字母的文本）
+- 英语特化过滤（只保留字母主导的段落）
+- 标题/Logo 过滤（全大写 + 超大字号）
+- 目标语言过滤（按 target_lang 动态判断）
 - 段落合并（三向对齐 + 宽度相似）
+- 日语优化（归一化 hash + 行长度判断）
 - 自适应字号（像素级估算，中英文区分）
 """
 
@@ -52,8 +55,12 @@ DECORATIVE_CHARS = set(
     'ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ'
 )
 
-# ==================== 英文模式参数 ====================
-ENGLISH_LETTER_RATIO = 0.3
+# ==================== 英语特化参数 ====================
+ENGLISH_LETTER_RATIO = 0.5
+ENGLISH_MAX_CHINESE_RATIO = 0.2
+
+# ==================== 标题/Logo 过滤参数 ====================
+TITLE_HEIGHT_RATIO = 1.8
 
 # ==================== 字号参数 ====================
 MIN_FONT_SIZE = 9
@@ -65,7 +72,7 @@ WIDTH_ASCII_WIDE = 0.65
 WIDTH_ASCII = 0.55
 WIDTH_ASCII_NARROW = 0.35
 
-# ==================== 位置量化（静止模式） ====================
+# ==================== 位置量化 ====================
 POSITION_KEY_QUANTIZE = 40
 POSITION_KEY_QUANTIZE_Y = 20
 POSITION_KEY_QUANTIZE_H = 12
@@ -77,22 +84,65 @@ def hash_text(text):
     return hashlib.md5(text.encode('utf-8')).hexdigest()
 
 
+def _has_kana(text):
+    """检查文本是否含日文假名"""
+    if not text:
+        return False
+    return any('\u3040' <= ch <= '\u30ff' for ch in text)
+
+
+def _normalize_jp(text):
+    """
+    日语归一化：
+    - 去掉首尾标点
+    - 去掉末尾可能的 OCR 抖动（末尾重复字符）
+    """
+    if not text:
+        return ''
+    t = text.strip()
+    t = t.strip('。、！？「」『』（）()[]【】.,!? \t')
+    if len(t) >= 4:
+        last = t[-1]
+        if t[-2] == last and t[-3] == last:
+            t = t.rstrip(last)
+    return t
+
+
 def hash_paragraph(paragraph):
-    """段落内容 hash（不含位置，用于翻译缓存）"""
-    line_hashes = sorted(
-        hash_text(line['text'].strip()) for line in paragraph['lines']
-    )
+    """段落内容 hash（不含位置，用于翻译缓存）
+
+    ⭐ 日语优化：日语文本用归一化 hash，减少 OCR 抖动导致的缓存失效
+    """
+    line_texts = []
+    for line in paragraph['lines']:
+        raw = line['text'].strip()
+        if _has_kana(raw):
+            line_texts.append(_normalize_jp(raw))
+        else:
+            line_texts.append(raw)
+
+    line_hashes = sorted(hash_text(t) for t in line_texts)
     return hashlib.md5('|'.join(line_hashes).encode('utf-8')).hexdigest()
 
 
 def get_line_hashes(paragraph):
-    return frozenset(
-        hash_text(line['text'].strip()) for line in paragraph['lines']
-    )
+    """返回段落每行的 hash 集合（用于缓存复用）"""
+    result = set()
+    for line in paragraph['lines']:
+        raw = line['text'].strip()
+        if _has_kana(raw):
+            result.add(hash_text(_normalize_jp(raw)))
+        else:
+            result.add(hash_text(raw))
+    return frozenset(result)
 
 
 def paragraph_display_key(paragraph):
-    """段落显示 key（位置量化，稳定）"""
+    """
+    段落显示 key：
+    - 用「中心位置 + 尺寸」粗量化做 key
+    - 不依赖 OCR 文本，避免逐字抖动
+    """
     box = paragraph.get('box', (0, 0, 0, 0))
     try:
         x1, y1, x2, y2 = (int(box[0]), int(box[1]),
@@ -111,9 +161,11 @@ def paragraph_display_key(paragraph):
     key = f"{cx // qx}|{cy // qy}|{h // qh}"
     return hash_text(key)
 
+
 # ==================== OCR 异常框过滤 ====================
 
 def filter_invalid_items(items, region_w=None, region_h=None):
+    """过滤 OCR 误识别的异常文本框"""
     if not items:
         return []
 
@@ -141,7 +193,10 @@ def filter_invalid_items(items, region_w=None, region_h=None):
         if len(text) < MIN_CONFIDENCE_LENGTH:
             continue
 
-        if not any(ch.isalnum() or '\u4e00' <= ch <= '\u9fff' for ch in text):
+        if not any(ch.isalnum() or '\u4e00' <= ch <= '\u9fff'
+                   or '\u3040' <= ch <= '\u30ff'
+                   or '\uac00' <= ch <= '\ud7af'
+                   for ch in text):
             continue
 
         if h > 0 and (w / h) > 50:
@@ -163,6 +218,7 @@ def _digit_ratio(text):
 
 
 def _is_decorative(text):
+    """纯装饰字符（视为图像）"""
     if not text:
         return True
     deco = sum(1 for ch in text if ch in DECORATIVE_CHARS)
@@ -170,20 +226,26 @@ def _is_decorative(text):
 
 
 def _is_number_or_unit(text):
+    """纯数字、纯单位、数字+单位"""
     t = text.strip()
     if not t:
         return True
+
     if re.fullmatch(r'[\d\.,]+', t):
         return True
+
     if UNIT_PATTERN.match(t):
         return True
+
     if _digit_ratio(t) >= DIGIT_RATIO_THRESHOLD:
         if not any('\u4e00' <= ch <= '\u9fff' for ch in t):
             return True
+
     return False
 
 
 def _is_symbol_only(text):
+    """纯符号（无字母、无任何语言字符、无数字）"""
     if not text:
         return True
     for ch in text:
@@ -191,25 +253,37 @@ def _is_symbol_only(text):
             return False
         if '\u4e00' <= ch <= '\u9fff':
             return False
+        if '\u3040' <= ch <= '\u30ff':
+            return False
+        if '\uac00' <= ch <= '\ud7af':
+            return False
+        if '\u0400' <= ch <= '\u04ff':
+            return False
     return True
 
 
 def is_general_content_filtered(text, debug=False):
+    """通用过滤：只过滤数字/单位/装饰字符/纯符号"""
     if not text or not text.strip():
         return True
+
     t = text.strip()
+
     if _is_number_or_unit(t):
         if debug:
             print(f"[通用过滤] 数字/单位: '{t}'")
         return True
+
     if _is_decorative(t):
         if debug:
             print(f"[通用过滤] 装饰字符: '{t}'")
         return True
+
     if _is_symbol_only(t):
         if debug:
             print(f"[通用过滤] 纯符号: '{t}'")
         return True
+
     return False
 
 
@@ -228,12 +302,6 @@ def filter_general_content(items, debug=False):
 
 
 # ==================== 英语特化过滤 ====================
-
-# 英文字母占非空白字符的最低比例
-ENGLISH_LETTER_RATIO = 0.5
-# 中文占非空白字符的最高比例
-ENGLISH_MAX_CHINESE_RATIO = 0.2
-
 
 def is_english_filtered(text, debug=False):
     """
@@ -290,12 +358,147 @@ def filter_english_only(items, debug=False):
     return valid
 
 
+# ==================== 标题 / Logo 过滤 ====================
+
+def is_title_logo_filtered(text, box, med_height=None, debug=False):
+    """
+    过滤标题 / Logo / 品牌名：
+    1. 全大写字母（≥ 2 个字母且全大写，无小写）
+    2. 字号过大（框高 > 中位高度 × TITLE_HEIGHT_RATIO）
+    """
+    t = text.strip()
+    if not t:
+        return True
+
+    letters = [ch for ch in t if ch.isascii() and ch.isalpha()]
+    if len(letters) >= 2:
+        has_lower = any(ch.islower() for ch in letters)
+        if not has_lower:
+            if debug:
+                print(f"[标题过滤] 全大写: '{t}'")
+            return True
+
+    if med_height is not None and med_height > 0:
+        h = box[3] - box[1]
+        if h > med_height * TITLE_HEIGHT_RATIO:
+            if debug:
+                print(f"[标题过滤] 字号过大 "
+                      f"h={h} > {med_height * TITLE_HEIGHT_RATIO:.0f}: "
+                      f"'{t}'")
+            return True
+
+    return False
+
+
+def filter_title_logo(items, debug=False):
+    """过滤标题/Logo（需先算框中位高度）"""
+    if not items:
+        return []
+
+    heights = sorted((it['box'][3] - it['box'][1]) for it in items)
+    med_height = heights[len(heights) // 2] if heights else 0
+
+    valid = []
+    for it in items:
+        text = it['text'].strip()
+        if not text:
+            continue
+        if is_title_logo_filtered(text, it['box'], med_height,
+                                   debug=debug):
+            continue
+        valid.append(it)
+    return valid
+
+
+# ==================== 目标语言过滤 ====================
+
+def is_target_language_text(text, target_lang='zh', threshold=0.5):
+    """
+    判断文本是否已经是目标语言（是则跳过翻译）
+
+    ⭐ 日语优化：含假名的文本即使汉字多，也不算中文
+    """
+    if not text:
+        return False
+    t = text.strip()
+    total = len(t)
+    if total == 0:
+        return False
+
+    has_kana = any('\u3040' <= ch <= '\u30ff' for ch in t)
+    has_hangul = any('\uac00' <= ch <= '\ud7af' for ch in t)
+
+    if target_lang == 'zh':
+        # 含假名/韩文 → 不算中文
+        if has_kana or has_hangul:
+            return False
+        cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
+        return cn / total >= threshold
+
+    if target_lang == 'ja':
+        jp = sum(1 for ch in t if '\u3040' <= ch <= '\u30ff')
+        cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
+        if jp == 0:
+            return False
+        return (jp + cn) / total >= threshold
+
+    if target_lang == 'ko':
+        kr = sum(1 for ch in t if '\uac00' <= ch <= '\ud7af')
+        return kr / total >= threshold
+
+    if target_lang == 'ru':
+        ru = sum(1 for ch in t if '\u0400' <= ch <= '\u04ff')
+        return ru / total >= threshold
+
+    if target_lang == 'en':
+        letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
+        return letters / total >= threshold
+
+    # fr/de/es 都用拉丁字母
+    letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
+    return letters / total >= threshold
+
+
+# 兼容旧接口
+def is_chinese_text(text, threshold=0.5):
+    return is_target_language_text(text, 'zh', threshold)
+
+
+# ==================== 文本相似度 ====================
+
+def text_similarity(a, b):
+    """
+    归一化 + 双向包含 + SequenceMatcher
+    """
+    if not a or not b:
+        return 0.0
+
+    from difflib import SequenceMatcher as _SM
+
+    a_n = re.sub(r'\s+', '', a).lower()
+    b_n = re.sub(r'\s+', '', b).lower()
+
+    if not a_n or not b_n:
+        return 0.0
+    if a_n == b_n:
+        return 1.0
+    if a_n in b_n or b_n in a_n:
+        return 1.0
+
+    return _SM(None, a_n, b_n).ratio()
+
+
 # ==================== 行长度判断 ====================
 
 def _is_long_line(item):
     text = item['text'].strip()
     x1, y1, x2, y2 = item['box']
     width = x2 - x1
+
+    # ⭐ 日语行：字符数阈值降低
+    if _has_kana(text):
+        return len(text) >= 3 and width >= 60
+
     return (len(text) >= MIN_MERGE_LINE_LENGTH
             and width >= MIN_MERGE_LINE_WIDTH)
 
@@ -395,8 +598,10 @@ def _build(lines):
         t = it['text'].strip()
         if not t:
             continue
+        # 日语不加空格
         if parts and t[0] not in ',.;:!?，。；：！？)】」':
-            parts.append(' ')
+            if not _has_kana(t) and not _has_kana(parts[-1]):
+                parts.append(' ')
         parts.append(t)
     text = ''.join(parts)
 
@@ -416,10 +621,12 @@ _WIDE_ASCII = set("MW@%&#")
 
 def _char_width(ch, size):
     code = ord(ch)
+    # CJK 汉字 / 假名 / 全角
     if (0x4E00 <= code <= 0x9FFF or
             0x3000 <= code <= 0x303F or
             0xFF00 <= code <= 0xFFEF or
-            0x3040 <= code <= 0x30FF):
+            0x3040 <= code <= 0x30FF or
+            0xAC00 <= code <= 0xD7AF):
         return size
     if ch in _NARROW_CHARS:
         return max(1, int(size * WIDTH_ASCII_NARROW))
@@ -466,131 +673,41 @@ def calc_font_size(text, w, h, base_size):
         size -= 1
     return MIN_FONT_SIZE
 
+# ==================== 字幕判定 ====================
 
-def is_chinese_text(text, threshold=0.5):
-    if not text:
-        return False
-    total = len(text.strip())
-    if total == 0:
-        return False
-    cn = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
-    return cn / total >= threshold
-
-# ==================== 标题 / Logo 过滤 ====================
-
-# 框高 > 本帧中位高度 × 该值 → 视为标题/Logo
-TITLE_HEIGHT_RATIO = 1.8
+SUBTITLE_MAX_HEIGHT = 120
+SUBTITLE_MIN_ASPECT = 2.5
+SUBTITLE_MIN_CHARS = 3
+SUBTITLE_MAX_CHARS = 200
 
 
-def is_title_logo_filtered(text, box, med_height=None, debug=False):
+def is_subtitle_text(text, box):
     """
-    过滤标题 / Logo / 品牌名：
-    1. 全大写字母（≥ 2 个字母且全大写，无小写）
-    2. 字号过大（框高 > 中位高度 × TITLE_HEIGHT_RATIO）
+    判断段落是否像视频字幕：
+    - 文本长度 3-200 字符
+    - 框高 < 120px（不超过 3 行）
+    - 宽高比 >= 2.5（宽扁形状）
     """
+    if not text or not text.strip():
+        return False
+
     t = text.strip()
-    if not t:
-        return True
-
-    # 规则 1：全大写
-    letters = [ch for ch in t if ch.isascii() and ch.isalpha()]
-    if len(letters) >= 2:
-        has_lower = any(ch.islower() for ch in letters)
-        if not has_lower:
-            if debug:
-                print(f"[标题过滤] 全大写: '{t}'")
-            return True
-
-    # 规则 2：字号过大
-    if med_height is not None and med_height > 0:
-        h = box[3] - box[1]
-        if h > med_height * TITLE_HEIGHT_RATIO:
-            if debug:
-                print(f"[标题过滤] 字号过大 "
-                      f"h={h} > {med_height * TITLE_HEIGHT_RATIO:.0f}: '{t}'")
-            return True
-
-    return False
-
-
-def filter_title_logo(items, debug=False):
-    """过滤标题/Logo（需先算框中位高度）"""
-    if not items:
-        return []
-
-    heights = sorted((it['box'][3] - it['box'][1]) for it in items)
-    med_height = heights[len(heights) // 2] if heights else 0
-
-    valid = []
-    for it in items:
-        text = it['text'].strip()
-        if not text:
-            continue
-        if is_title_logo_filtered(text, it['box'], med_height, debug=debug):
-            continue
-        valid.append(it)
-    return valid
-
-# ==================== 文本相似度 ====================
-
-def text_similarity(a, b):
-    """
-    归一化 + 双向包含 + SequenceMatcher
-    - 一方是另一方的子串 → 1.0
-    - 否则算 SequenceMatcher 相似度
-    """
-    if not a or not b:
-        return 0.0
-
-    import re as _re
-    from difflib import SequenceMatcher as _SM
-
-    a_n = _re.sub(r'\s+', '', a).lower()
-    b_n = _re.sub(r'\s+', '', b).lower()
-
-    if not a_n or not b_n:
-        return 0.0
-    if a_n == b_n:
-        return 1.0
-    if a_n in b_n or b_n in a_n:
-        return 1.0
-
-    return _SM(None, a_n, b_n).ratio()
-
-# ==================== 目标语言过滤 ====================
-
-def is_target_language_text(text, target_lang='zh', threshold=0.5):
-    """
-    判断文本是否已经是目标语言（是则跳过翻译）
-    """
-    if not text:
-        return False
-    t = text.strip()
-    total = len(t)
-    if total == 0:
+    if not (SUBTITLE_MIN_CHARS <= len(t) <= SUBTITLE_MAX_CHARS):
         return False
 
-    if target_lang == 'zh':
-        cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
-        return cn / total >= threshold
+    try:
+        x1, y1, x2, y2 = box
+    except Exception:
+        return False
 
-    if target_lang == 'ja':
-        jp = sum(1 for ch in t if '\u3040' <= ch <= '\u30ff')
-        cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
-        return (jp + cn) / total >= threshold
+    w = x2 - x1
+    h = max(1, y2 - y1)
 
-    if target_lang == 'ko':
-        kr = sum(1 for ch in t if '\uac00' <= ch <= '\ud7af')
-        return kr / total >= threshold
+    if h > SUBTITLE_MAX_HEIGHT:
+        return False
 
-    if target_lang == 'ru':
-        ru = sum(1 for ch in t if '\u0400' <= ch <= '\u04ff')
-        return ru / total >= threshold
+    aspect = w / h
+    if aspect < SUBTITLE_MIN_ASPECT:
+        return False
 
-    if target_lang == 'en':
-        letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
-        return letters / total >= threshold
-
-    # fr/de/es 都用拉丁字母
-    letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
-    return letters / total >= threshold
+    return True
