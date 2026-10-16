@@ -1,6 +1,15 @@
-"""AI Provider 诊断"""
+"""AI Provider 诊断
+
+用法：python tools/debug_ai.py
+"""
+
+import os
 import sys
-sys.path.insert(0, 'src')
+
+_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src')
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 from translation.api_config import load_providers, load_strategy
 from translation.providers import create_provider

@@ -144,6 +144,7 @@ DEFAULT_LOCAL_DICT_PATH = ""
 # ==================== 翻译策略 ====================
 TRANSLATION_STRATEGIES = {
     'local_only':          '离线',
+    'local_api':           '离线 + API',
     'single_translate':    '单翻译 API',
     'multi_translate_rr':  '多翻译 API 轮询',
     'hybrid':              '翻译 API + AI 混合',
@@ -152,7 +153,8 @@ TRANSLATION_STRATEGIES = {
 }
 
 TRANSLATION_STRATEGY_DESC = {
-    'local_only':          '纯离线：本地词典/短语未命中则跳过，不联网',
+    'local_only':          '只用本地模型 + 短语缓存，完全离线',
+    'local_api':           '优先本地模型，未命中走翻译 API',
     'single_translate':    '主翻译 API，失败自动尝试其他翻译 API',
     'multi_translate_rr':  '多个翻译 API 轮流使用，均衡负载',
     'hybrid':              '翻译 API 与 AI 混合（顺序可在 API 设置里配置）',
@@ -160,7 +162,7 @@ TRANSLATION_STRATEGY_DESC = {
     'multi_ai_vote':       '多个 AI 并发翻译，相似度/长度投票',
 }
 
-DEFAULT_TRANSLATION_STRATEGY = 'single_translate'
+DEFAULT_TRANSLATION_STRATEGY = 'local_api'
 
 # ==================== 快速响应层 ====================
 DEFAULT_ENABLE_FAST_LOOKUP = True
@@ -306,3 +308,14 @@ DEFAULT_ENABLE_THROTTLE = False
 DEFAULT_THROTTLE_QPS = 1.0       # 每个 API 每秒请求数
 THROTTLE_QPS_MIN = 0.2
 THROTTLE_QPS_MAX = 20.0
+
+# ==================== 本地模型设备 ====================
+
+LOCAL_MODEL_DEVICES = {
+    'auto':     '自动（GPU 优先）',
+    'cuda':     'NVIDIA CUDA',
+    'directml': 'DirectML',
+    'cpu':      'CPU（不占显卡）',
+}
+
+DEFAULT_LOCAL_MODEL_DEVICE = 'auto'

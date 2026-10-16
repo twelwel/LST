@@ -1,4 +1,9 @@
-"""翻译策略 —— 6 种模式（含请求节流）"""
+"""翻译策略 —— 7 种模式
+
+层级：
+    本地模型（离线） → 翻译 API → AI
+"""
+
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
@@ -28,9 +33,11 @@ def _throttled_translate(provider, text, source, target):
 class BaseStrategy:
     name = 'base'
 
-    def __init__(self, translate_providers, ai_providers, options):
+    def __init__(self, translate_providers, ai_providers,
+                 options, local_providers=None):
         self.translate_providers = list(translate_providers or [])
         self.ai_providers = list(ai_providers or [])
+        self.local_providers = list(local_providers or [])
         self.options = options or {}
         self._rr_lock = threading.Lock()
         self._rr_index = 0
@@ -38,11 +45,43 @@ class BaseStrategy:
     def translate(self, text, source='auto', target='zh'):
         raise NotImplementedError
 
+    # ---------- 本地模型 ----------
+
+    def _try_local_detail(self, text, source, target):
+        """
+        尝试所有本地模型，返回 (result_or_None, last_error_str)
+        """
+        last_err = ''
+        for lp in self.local_providers:
+            try:
+                r = _throttled_translate(lp, text, source, target)
+                if r.success and r.text and r.text.strip():
+                    return r.text, ''
+                last_err = r.error or '返回空结果'
+            except Exception as e:
+                last_err = str(e)
+        return None, last_err
+
+    def _try_local(self, text, source, target):
+        """尝试所有本地模型，命中返回译文，否则 None"""
+        result, _ = self._try_local_detail(text, source, target)
+        return result
+
+    def _has_local(self):
+        return bool(self.local_providers)
+
+    # ---------- 翻译 API ----------
+
     def _primary_translate(self):
         for p in self.translate_providers:
             if p.is_primary:
                 return p
         return self.translate_providers[0] if self.translate_providers else None
+
+    def _has_translate(self):
+        return bool(self.translate_providers)
+
+    # ---------- AI ----------
 
     def _primary_ai(self):
         for p in self.ai_providers:
@@ -50,19 +89,59 @@ class BaseStrategy:
                 return p
         return self.ai_providers[0] if self.ai_providers else None
 
-    def _has_translate(self):
-        return bool(self.translate_providers)
-
     def _has_ai(self):
         return bool(self.ai_providers)
 
 
-# ============ 离线 ============
+# ============ 离线（只用本地模型） ============
 class LocalOnlyStrategy(BaseStrategy):
     name = '离线'
 
     def translate(self, text, source='auto', target='zh'):
-        return '[离线：本地未命中]'
+        # ⭐ 无本地模型时给明确引导
+        if not self._has_local():
+            return ('[离线：未配置本地模型。'
+                    '请到「本地模型」下拉框选择并下载模型]')
+
+        result, err = self._try_local_detail(text, source, target)
+        if result:
+            return result
+
+        # ⭐ 显示真实错误原因（而不是笼统的"未命中"）
+        if err:
+            return f'[本地模型失败：{err}]'
+        return '[离线：本地模型未命中]'
+
+
+# ============ 离线 + API（先本地，未命中走 API） ============
+class LocalAPIStrategy(BaseStrategy):
+    name = '离线 + API'
+
+    def translate(self, text, source='auto', target='zh'):
+        # 1. 先本地模型
+        result = self._try_local(text, source, target)
+        if result:
+            return result
+
+        # 2. 未命中 → 走翻译 API
+        if self._has_translate():
+            primary = self._primary_translate()
+            r = _throttled_translate(primary, text, source, target)
+            if r.success and r.text.strip():
+                return r.text
+            # 兜底其他 API
+            for other in self.translate_providers:
+                if other is primary:
+                    continue
+                r2 = _throttled_translate(other, text, source, target)
+                if r2.success and r2.text.strip():
+                    return r2.text
+            return f'[离线 + API：{primary.name} 失败 - {r.error}]'
+
+        # 3. 也没有 API
+        if self._has_local():
+            return '[离线 + API：本地未命中，且未配置 API]'
+        return '[未配置本地模型和 API]'
 
 
 # ============ 单翻译 API ============
@@ -71,11 +150,14 @@ class SingleTranslateStrategy(BaseStrategy):
 
     def translate(self, text, source='auto', target='zh'):
         if not self._has_translate():
-            return '[无翻译 API]'
+            result = self._try_local(text, source, target)
+            return result or '[无翻译 API]'
+
         primary = self._primary_translate()
         r = _throttled_translate(primary, text, source, target)
         if r.success and r.text.strip():
             return r.text
+
         for other in self.translate_providers:
             if other is primary:
                 continue
@@ -92,10 +174,13 @@ class RoundRobinTranslateStrategy(BaseStrategy):
     def translate(self, text, source='auto', target='zh'):
         n = len(self.translate_providers)
         if n == 0:
-            return '[无翻译 API]'
+            result = self._try_local(text, source, target)
+            return result or '[无翻译 API]'
+
         with self._rr_lock:
             start = self._rr_index % n
             self._rr_index = (self._rr_index + 1) % max(1, n)
+
         last_err = ''
         for i in range(n):
             p = self.translate_providers[(start + i) % n]
@@ -261,6 +346,7 @@ class MultiAIVoteStrategy(BaseStrategy):
 
 STRATEGY_REGISTRY = {
     'local_only':          LocalOnlyStrategy,
+    'local_api':           LocalAPIStrategy,
     'single_translate':    SingleTranslateStrategy,
     'multi_translate_rr':  RoundRobinTranslateStrategy,
     'hybrid':              HybridStrategy,
@@ -270,6 +356,7 @@ STRATEGY_REGISTRY = {
 
 STRATEGY_LABELS = {
     'local_only':          '离线',
+    'local_api':           '离线 + API',
     'single_translate':    '单翻译 API',
     'multi_translate_rr':  '多翻译 API 轮询',
     'hybrid':              '翻译 API + AI 混合',
@@ -290,6 +377,8 @@ VOTE_STRATEGY_LABELS = {
 }
 
 
-def create_strategy(mode, translate_providers, ai_providers, options):
+def create_strategy(mode, translate_providers, ai_providers,
+                    options, local_providers=None):
     cls = STRATEGY_REGISTRY.get(mode, SingleTranslateStrategy)
-    return cls(translate_providers, ai_providers, options)
+    return cls(translate_providers, ai_providers,
+               options, local_providers)

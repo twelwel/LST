@@ -1,4 +1,5 @@
 """内置 Provider 适配器"""
+
 import time
 import json
 import random
@@ -54,12 +55,8 @@ class BaiduProvider(BaseProvider):
         except Exception as e:
             return self._err(str(e)[:200])
 
-    def _err(self, msg):
-        return ProviderResult(False, error=msg,
-                              provider_id=self.id, provider_name=self.name)
 
-
-# ============ OpenAI 兼容（GPT/DeepSeek/Qwen/Kimi/智谱/ollama） ============
+# ============ OpenAI 兼容 ============
 class OpenAICompatProvider(BaseProvider):
     provider_type = 'ai'
 
@@ -71,34 +68,7 @@ class OpenAICompatProvider(BaseProvider):
         "3. 专业术语保持准确"
     )
 
-    # ---------- 参数安全解析 ----------
-    @staticmethod
-    def _safe_float(v, default):
-        try:
-            if v is None or str(v).strip() == '':
-                return default
-            return float(v)
-        except (ValueError, TypeError):
-            return default
-
-    @staticmethod
-    def _safe_int(v, default):
-        try:
-            if v is None or str(v).strip() == '':
-                return default
-            return int(v)
-        except (ValueError, TypeError):
-            return default
-
-    # ---------- 端点拼接 ----------
     def _endpoint(self):
-        """
-        base_url 兼容多种写法：
-        - https://api.deepseek.com         → /chat/completions
-        - https://api.deepseek.com/v1      → /v1/chat/completions
-        - https://api.deepseek.com/v1/     → /v1/chat/completions
-        - 已经带 /chat/completions 的完整路径 → 直接用
-        """
         base = (self.params.get('base_url') or '').strip().rstrip('/')
         if not base:
             return ''
@@ -106,7 +76,6 @@ class OpenAICompatProvider(BaseProvider):
             return base
         return base + '/chat/completions'
 
-    # ---------- 翻译 ----------
     def translate(self, text, from_lang='auto', to_lang='zh'):
         from config import TARGET_LANG_NAME
         t0 = time.time()
@@ -117,7 +86,6 @@ class OpenAICompatProvider(BaseProvider):
 
         api_key = (self.params.get('api_key') or '').strip()
 
-        # 用户自定义 system_prompt 优先；否则根据目标语言动态生成
         user_system = (self.params.get('system_prompt') or '').strip()
         if user_system:
             system = user_system
@@ -159,7 +127,6 @@ class OpenAICompatProvider(BaseProvider):
         except Exception as e:
             return self._err(f'请求异常：{str(e)[:150]}')
 
-        # HTTP 状态检查
         if r.status_code != 200:
             snippet = ''
             try:
@@ -191,17 +158,12 @@ class OpenAICompatProvider(BaseProvider):
             provider_name=self.name,
             elapsed_ms=int((time.time() - t0) * 1000))
 
-    def _err(self, msg):
-        return ProviderResult(False, error=msg,
-                              provider_id=self.id, provider_name=self.name)
-
 
 # ============ 自定义 REST ============
 class CustomRestProvider(BaseProvider):
-    """URL 模板 + JSON 路径提取"""
     provider_type = 'translate'
 
-    def translate(self, text, from_lang='en', to_lang='zh'):
+    def translate(self, text, from_lang='auto', to_lang='zh'):
         t0 = time.time()
         url_tpl = (self.params.get('url') or '').strip()
         if not url_tpl:
@@ -261,15 +223,65 @@ class CustomRestProvider(BaseProvider):
         except Exception as e:
             return self._err(str(e)[:200])
 
-    def _err(self, msg):
-        return ProviderResult(False, error=msg,
-                              provider_id=self.id, provider_name=self.name)
+
+# ============ 本地模型 ============
+class LocalModelProvider(BaseProvider):
+    """本地翻译模型 Provider"""
+    provider_type = 'translate'
+    is_local = True                      # ⭐ 关键
+
+    def translate(self, text, from_lang='auto', to_lang='zh'):
+        t0 = time.time()
+
+        model_id = (self.params.get('model_id') or '').strip()
+        if not model_id:
+            return self._err('未配置 model_id')
+
+        try:
+            from .local_models import get_model_instance
+        except ImportError as e:
+            return self._err(f'本地模型模块加载失败：{e}')
+
+        try:
+            instance = get_model_instance(model_id)
+        except Exception as e:
+            return self._err(f'模型创建失败：{e}')
+
+        if instance is None:
+            return self._err(f'未知模型：{model_id}')
+
+        if not instance.is_loaded:
+            return self._err(
+                f'模型未加载：{model_id}。'
+                f'请到「本地模型」面板下载')
+
+        if not instance.supports(from_lang, to_lang):
+            return self._err(
+                f'模型 {instance.name} 不支持 {from_lang}→{to_lang}')
+
+        try:
+            result = instance.translate(text, from_lang, to_lang)
+            # ⭐ 过滤错误标记
+            if not result or result.startswith('['):
+                return self._err(result or '空结果')
+            return ProviderResult(
+                True,
+                text=result,
+                provider_id=self.id,
+                provider_name=self.name,
+                elapsed_ms=int((time.time() - t0) * 1000),
+            )
+        except Exception as e:
+            return self._err(f'翻译异常：{e}')
 
 
+# ============ 注册表 ============
 PROVIDER_REGISTRY = {
-    'baidu': BaiduProvider,
-    'openai_compat': OpenAICompatProvider,
-    'custom_rest': CustomRestProvider,
+    'baidu':            BaiduProvider,
+    'openai_compat':    OpenAICompatProvider,
+    'openai_compat_ai': OpenAICompatProvider,
+    'custom_rest':      CustomRestProvider,
+    'local_model':      LocalModelProvider,     # ⭐ 必须
 }
 
 

@@ -1,9 +1,11 @@
 """翻译后端"""
+
 from .manager import TranslationManager, get_manager
 from .api_config import (
     load_providers, save_providers,
     load_strategy, save_strategy,
     new_provider_id, is_configured,
+    ensure_local_provider, remove_local_provider,
 )
 
 __all__ = [
@@ -11,4 +13,5 @@ __all__ = [
     'load_providers', 'save_providers',
     'load_strategy', 'save_strategy',
     'new_provider_id', 'is_configured',
+    'ensure_local_provider', 'remove_local_provider',
 ]

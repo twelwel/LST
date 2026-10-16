@@ -1,7 +1,10 @@
 """翻译管理器：统一入口 + 策略调度（线程安全）"""
 import threading
 
-from .api_config import load_providers, load_strategy
+from .api_config import (
+    load_providers, load_strategy,
+    sync_downloaded_models,
+)
 from .providers import create_provider
 from .strategies import create_strategy, STRATEGY_LABELS
 
@@ -13,6 +16,7 @@ class TranslationManager:
         self._strategy = None
         self._strategy_mode = 'single_translate'
         self._strategy_cfg = {}
+        self._first_load = True
         self.reload()
 
     # ==================== 重载 ====================
@@ -20,6 +24,14 @@ class TranslationManager:
     def reload(self):
         """从配置文件重新读取 providers 和 strategy"""
         with self._lock:
+            # 0. ⭐ 首次加载时，同步已下载的本地模型
+            if self._first_load:
+                self._first_load = False
+                try:
+                    sync_downloaded_models()
+                except Exception as e:
+                    print(f"[翻译管理] 首次同步失败：{e}")
+
             # 1. 构造新 providers
             try:
                 cfgs = load_providers()
@@ -46,26 +58,35 @@ class TranslationManager:
             self._strategy_mode = mode
             self._strategy_cfg = dict(strategy_cfg)
 
-            # 3. 分类
+            # 3. 分类（本地模型单独拎出）
+            local_p = [p for p in new_providers.values()
+                       if p.provider_type == 'translate'
+                       and p.enabled
+                       and getattr(p, 'is_local', False)]
+
             translate_p = [p for p in new_providers.values()
-                           if p.provider_type == 'translate' and p.enabled]
+                           if p.provider_type == 'translate'
+                           and p.enabled
+                           and not getattr(p, 'is_local', False)]
+
             ai_p = [p for p in new_providers.values()
                     if p.provider_type == 'ai' and p.enabled]
 
             # 4. 构造新策略
             try:
                 new_strategy = create_strategy(
-                    mode, translate_p, ai_p, strategy_cfg)
+                    mode, translate_p, ai_p, strategy_cfg, local_p)
             except Exception as e:
                 print(f"[翻译管理] 策略创建失败：{e}")
                 new_strategy = create_strategy(
-                    'single_translate', translate_p, ai_p, {})
+                    'local_api', translate_p, ai_p, {}, local_p)
 
             # 5. 原子替换
             self._providers = new_providers
             self._strategy = new_strategy
 
             print(f"[翻译管理] 重载完成：策略={mode}, "
+                  f"本地={len(local_p)}, "
                   f"翻译API={len(translate_p)}, AI={len(ai_p)}")
 
     # ==================== 查询 ====================
@@ -108,12 +129,22 @@ class TranslationManager:
         with self._lock:
             mode = self._strategy_mode
             translate_p = [p for p in self._providers.values()
-                           if p.provider_type == 'translate' and p.enabled]
+                           if p.provider_type == 'translate'
+                           and p.enabled
+                           and not getattr(p, 'is_local', False)]
+            local_p = [p for p in self._providers.values()
+                       if p.provider_type == 'translate'
+                       and p.enabled
+                       and getattr(p, 'is_local', False)]
             ai_p = [p for p in self._providers.values()
                     if p.provider_type == 'ai' and p.enabled]
-            return (f"{STRATEGY_LABELS.get(mode, mode)} | "
-                    f"翻译API {len(translate_p)} 个 | "
-                    f"AI {len(ai_p)} 个")
+
+            parts = [STRATEGY_LABELS.get(mode, mode)]
+            if local_p:
+                parts.append(f"本地 {len(local_p)}")
+            parts.append(f"翻译API {len(translate_p)}")
+            parts.append(f"AI {len(ai_p)}")
+            return " | ".join(parts)
 
     def list_providers(self):
         with self._lock:
@@ -122,6 +153,10 @@ class TranslationManager:
 
 _manager = None
 _manager_lock = threading.Lock()
+
+
+_manager = None
+_manager_lock = threading.RLock()    # ⭐ 可重入
 
 
 def get_manager() -> TranslationManager:

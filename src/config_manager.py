@@ -30,8 +30,8 @@ DEFAULT_USER_CONFIG = {
     # 性能模式
     "performance_mode": "medium",
 
-    # 加速模式
-    "accel_mode": "",
+    # 加速模式（首次运行默认 DirectML，如不可用会自动回退）
+    "accel_mode": "directml",
 
     # CPU 引擎数（可调）
     "cpu_engine_count": 2,
@@ -89,7 +89,6 @@ DEFAULT_USER_CONFIG = {
     "enable_fine_text": False,
     "enable_async_overlay": False,
     "enable_general_filter": True,
-    "local_dict_path": "",
 
     # 翻译策略
     "translation_strategy": "single_translate",
@@ -104,6 +103,11 @@ DEFAULT_USER_CONFIG = {
     "enable_title_filter": False,
 
     "enable_ocr_verify": False,
+
+    "enable_ocr_verify": False,
+
+    # ⭐ 本地模型设备
+    "local_model_device": "auto",
 }
 
 

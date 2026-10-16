@@ -1,16 +1,10 @@
-"""LST 延迟测试工具
+"""LST 延迟测试工具（优化版）
 
-命令行：
-    cd src
-    python test_latency.py                    # 30 次本地
-    python test_latency.py --api              # 加测 API
-    python test_latency.py --e2e              # 加测全链路
-
-UI 调用：
-    from test_latency import LatencyTester
-    tester = LatencyTester(translator=..., ocr_engine=...,
-                           pipeline=..., progress_cb=fn, log_cb=fn)
-    tester.run(runs=30, do_e2e=True)
+优化点：
+1. 全链路测试支持预热，测量更贴近真实
+2. 可选"每轮清空缓存"模拟冷启动
+3. 报告显示本地模型设备信息
+4. 全链路等待 pipeline 空闲后再开始计时
 """
 
 import os
@@ -29,8 +23,6 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-
-# ==================== 测试图 ====================
 
 def make_test_image(w: int = 800, h: int = 400) -> np.ndarray:
     img = Image.new('RGB', (w, h), (245, 245, 245))
@@ -66,15 +58,12 @@ def make_test_image(w: int = 800, h: int = 400) -> np.ndarray:
 
 def _add_noise(img: np.ndarray, seed: int,
                strength: int = 8) -> np.ndarray:
-    """加噪声让每次图片不同（触发帧差）"""
     rng = np.random.RandomState(seed)
     noise = rng.randint(-strength, strength + 1,
                         img.shape, dtype=np.int16)
     out = np.clip(img.astype(np.int16) + noise, 0, 255)
     return out.astype(np.uint8)
 
-
-# ==================== 统计 ====================
 
 class _Stat:
     def __init__(self, name: str):
@@ -102,11 +91,7 @@ class _Stat:
         }
 
 
-# ==================== 测试器 ====================
-
 class LatencyTester:
-    """可被 UI 调用的延迟测试器"""
-
     def __init__(self, translator=None, ocr_engine=None,
                  pipeline=None,
                  progress_cb: Optional[Callable] = None,
@@ -120,6 +105,10 @@ class LatencyTester:
         self.stats: Dict[str, _Stat] = {}
         self._cancel = threading.Event()
         self._lock = threading.Lock()
+
+        # ⭐ 全链路测试选项
+        self.clean_cache_each = False     # 每轮清空缓存（冷启动）
+        self.e2e_warmup = 2               # 全链路预热次数
 
     def cancel(self):
         self._cancel.set()
@@ -150,7 +139,38 @@ class LatencyTester:
         self._get(name).add((t1 - t0) * 1000)
         return r
 
-    # ---------- 报告 ----------
+    # ==================== 报告 ====================
+
+    def get_device_info(self) -> str:
+        """获取当前执行设备信息（OCR + 本地模型）"""
+        parts = []
+
+        # OCR
+        try:
+            if self.ocr_engine is not None:
+                parts.append(f"OCR={self.ocr_engine.mode}")
+        except Exception:
+            pass
+
+        # 本地模型
+        try:
+            from translation.local_models import get_preferred_device
+            pref = get_preferred_device()
+            parts.append(f"本地模型偏好={pref}")
+
+            # 已加载的模型实例实际设备
+            try:
+                from translation.local_models import TranslationModelFactory
+                for mid, inst in (TranslationModelFactory._instances or {}).items():
+                    dev = getattr(inst, 'device', '?')
+                    parts.append(f"{mid}@{dev}")
+                    break
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return " | ".join(parts) if parts else "未知"
 
     def get_report(self) -> List[Dict]:
         with self._lock:
@@ -158,6 +178,8 @@ class LatencyTester:
 
     def get_report_text(self) -> str:
         lines = []
+        lines.append("=" * 100)
+        lines.append(f"设备：{self.get_device_info()}")
         lines.append("=" * 100)
         lines.append(f"{'阶段':<28} {'次数':>5} {'平均':>10} "
                      f"{'P50':>10} {'P95':>10} {'最小':>10} "
@@ -167,6 +189,7 @@ class LatencyTester:
         local_total = 0.0
         api_avg = 0.0
         e2e_avg = 0.0
+        local_model_avg = 0.0
 
         for s in self.get_report():
             lines.append(
@@ -184,33 +207,38 @@ class LatencyTester:
                 e2e_avg = s['avg']
             elif nm == 'API 翻译':
                 api_avg = s['avg']
-            elif nm[0].isdigit():   # 1.xxx / 2.xxx 本地阶段
+            elif nm == '本地模型翻译':
+                local_model_avg = s['avg']
+            elif nm[0].isdigit():
                 local_total += s['avg']
 
         lines.append("-" * 100)
-        lines.append(f"{'本地合计':<28} {local_total:>9.2f}ms")
+        lines.append(f"{'本地阶段合计':<28} {local_total:>9.2f}ms")
+        if local_model_avg > 0:
+            lines.append(f"{'本地模型翻译平均':<28} "
+                         f"{local_model_avg:>9.2f}ms")
         if api_avg > 0:
             lines.append(f"{'API 翻译平均':<28} {api_avg:>9.2f}ms")
-            lines.append(
-                f"{'理论全链路（本地 + API）':<28} "
-                f"{local_total + api_avg:>9.2f}ms")
         if e2e_avg > 0:
-            lines.append(
-                f"{'★ 实测全链路（含显示准备）':<28} "
-                f"{e2e_avg:>9.2f}ms")
+            lines.append(f"{'★ 实测全链路':<28} "
+                         f"{e2e_avg:>9.2f}ms")
         lines.append("=" * 100)
         return '\n'.join(lines)
 
-    # ---------- 主流程 ----------
+    # ==================== 运行 ====================
 
     def run(self, runs: int = 30, warmup: int = 3,
             do_ocr: bool = True,
             do_api: bool = False,
             api_runs: int = 5,
+            do_local: bool = False,
+            local_runs: int = 5,
             do_verify: bool = False,
             do_e2e: bool = False,
-            e2e_runs: int = 5):
+            e2e_runs: int = 5,
+            e2e_clean_cache: bool = False):
         self.reset()
+        self.clean_cache_each = bool(e2e_clean_cache)
 
         img = make_test_image(800, 400)
         prev_img = make_test_image(800, 400)
@@ -220,10 +248,12 @@ class LatencyTester:
         total_steps = runs
         if do_api:
             total_steps += api_runs
+        if do_local:
+            total_steps += local_runs
         if do_e2e:
             total_steps += e2e_runs
 
-        # 预热
+        # ---------- 本地阶段预热 ----------
         if warmup > 0 and not self.is_cancelled():
             self.log_cb(f"[预热] {warmup} 次...")
             for i in range(warmup):
@@ -233,7 +263,7 @@ class LatencyTester:
                                         do_ocr, do_verify,
                                         record=False)
 
-        # 本地阶段
+        # ---------- 本地阶段测试 ----------
         self.log_cb(f"[测试] 本地 {runs} 次")
         for i in range(runs):
             if self.is_cancelled():
@@ -246,7 +276,21 @@ class LatencyTester:
 
         step = runs
 
-        # API 测试
+        # ---------- 本地模型测试 ----------
+        if do_local:
+            self.log_cb(f"[本地模型] 预热 + 测试 {local_runs} 次...")
+            # 预热一次，把模型加载到内存
+            self._run_local_translate("warmup")
+            for i in range(local_runs):
+                if self.is_cancelled():
+                    return
+                self._run('本地模型翻译',
+                          self._run_local_translate,
+                          "Hello World")
+                step += 1
+                self.progress_cb(step, total_steps)
+
+        # ---------- API 测试 ----------
         if do_api and self.translator is not None:
             self.log_cb(f"[API] {api_runs} 次...")
             for i in range(api_runs):
@@ -258,54 +302,90 @@ class LatencyTester:
                 step += 1
                 self.progress_cb(step, total_steps)
 
-        # 全链路测试
+        # ---------- 全链路测试 ----------
         if do_e2e and self.pipeline is not None:
-            self.log_cb(f"[全链路] {e2e_runs} 次（提交图片 → "
-                        f"等待译文）...")
+            mode_tag = "（每轮清空缓存）" if self.clean_cache_each else "（复用缓存）"
+            self.log_cb(f"[全链路] 预热 {self.e2e_warmup} 次 + "
+                        f"测试 {e2e_runs} 次 {mode_tag}")
+
+            # 预热
+            for i in range(self.e2e_warmup):
+                if self.is_cancelled():
+                    return
+                test_img = _add_noise(img, seed=i * 7 + 1)
+                self._run_e2e_once(test_img, record=False)
+
+            # 正式测试
             for i in range(e2e_runs):
                 if self.is_cancelled():
                     return
-                # 每次加噪声保证帧差触发
                 test_img = _add_noise(img, seed=i * 7 + 1)
-                ms = self._run_e2e_once(test_img)
-                if ms is not None:
-                    self._get('★全链路（截图→译文）').add(ms)
-                else:
-                    self.log_cb(f"  [全链路] 第 {i+1} 次超时/失败")
+                ms = self._run_e2e_once(test_img, record=True)
+                if ms is None:
+                    self.log_cb(f"  第 {i+1} 次超时/未返回")
                 step += 1
                 self.progress_cb(step, total_steps)
 
         self.log_cb("[完成] 测试结束")
 
-    # ---------- 全链路 ----------
+    # ==================== 本地模型 ====================
+
+    def _run_local_translate(self, text):
+        """直接调用本地模型翻译（绕过策略层）
+
+        ⭐ 修复：加载失败明确报错，不再静默返回空
+        """
+        from translation.api_config import load_providers
+        providers = load_providers()
+
+        found = False
+        for p in providers:
+            if p.get('provider') == 'local_model' \
+                    and p.get('enabled', True):
+                mid = p.get('config', {}).get('model_id', '')
+                if not mid:
+                    continue
+
+                found = True
+
+                from translation.local_models import get_model_instance
+                inst = get_model_instance(mid)
+                if inst is None:
+                    raise RuntimeError(
+                        f"模型 {mid} 无法创建实例")
+
+                if not inst.is_loaded:
+                    err = getattr(inst, 'last_error', '') or '未知错误'
+                    raise RuntimeError(
+                        f"模型 {mid} 未加载：{err}")
+
+                variant = getattr(inst, 'variant', '')
+                device = getattr(inst, 'device', '')
+                self.log_cb(
+                    f"[本地模型] {mid} @ {device}（{variant}）")
+
+                return inst.translate(text, 'auto', 'zh')
+
+        if not found:
+            raise RuntimeError(
+                "未配置本地模型。请到「本地模型」面板下载并启用")
+        return ''
+
+    # ==================== 全链路 ====================
 
     def _run_e2e_once(self, img: np.ndarray,
-                      timeout: float = 20.0) -> Optional[float]:
-        """
-        提交一张图到 pipeline，等待 result_queue 收到译文。
-        返回毫秒数（从 submit 到收到结果的完整延迟）
-        """
+                      timeout: float = 30.0,
+                      record: bool = True) -> Optional[float]:
         if self.pipeline is None:
             return None
 
-        # 清空 result_queue 里的旧消息
+        # 1. 清空所有队列，确保环境干净
         try:
             while True:
                 self.pipeline.result_queue.get_nowait()
         except queue.Empty:
             pass
 
-        # 清空 debouncer + 缓存，确保这次是"全新"处理
-        try:
-            self.pipeline.reset_debouncer()
-        except Exception:
-            pass
-        try:
-            self.pipeline.cache.clear()
-        except Exception:
-            pass
-
-        # 清空 task_queue
         try:
             while not self.pipeline.task_queue.empty():
                 try:
@@ -315,6 +395,23 @@ class LatencyTester:
         except Exception:
             pass
 
+        # 2. 重置防抖状态
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
+
+        # 3. 可选：清空段落缓存（模拟冷启动）
+        if self.clean_cache_each:
+            try:
+                self.pipeline.cache.clear()
+            except Exception:
+                pass
+
+        # 4. 等 pipeline 空闲
+        time.sleep(0.05)
+
+        # 5. 提交并计时
         t0 = time.perf_counter()
         self.pipeline.submit(img)
 
@@ -326,14 +423,15 @@ class LatencyTester:
                 msg = self.pipeline.result_queue.get(timeout=0.3)
             except queue.Empty:
                 continue
-
             if msg and msg[0] == 'items' and msg[1]:
                 t1 = time.perf_counter()
-                return (t1 - t0) * 1000
-
+                ms = (t1 - t0) * 1000
+                if record:
+                    self._get('★ 全链路（截图→译文）').add(ms)
+                return ms
         return None
 
-    # ---------- 单次 pipeline ----------
+    # ==================== 本地阶段细分 ====================
 
     def _run_pipeline_once(self, img, prev_img,
                            do_ocr: bool, do_verify: bool,
@@ -349,7 +447,6 @@ class LatencyTester:
                 return r
             return self._run(name, fn, *args, **kwargs)
 
-        # ---------- 1. 帧差 ----------
         def _frame_diff(img, prev):
             try:
                 import cv2
@@ -388,7 +485,6 @@ class LatencyTester:
                     comps.append((area, k))
                 comps.sort(reverse=True)
                 top_n = comps[:5]
-
                 if not top_n:
                     return None
 
@@ -421,7 +517,6 @@ class LatencyTester:
         if w < 10 or h < 10:
             return
 
-        # ---------- 2. 裁剪+缩放 ----------
         def _crop(img, x, y, w, h, mw=1400, mh=600):
             crop = img[y:y+h, x:x+w]
             ch, cw = crop.shape[:2]
@@ -441,7 +536,6 @@ class LatencyTester:
             return
         crop_small, scale = result
 
-        # ---------- 3. OCR ----------
         items = []
         if do_ocr and self.ocr_engine is not None:
             def _ocr():
@@ -456,16 +550,11 @@ class LatencyTester:
                                 int(bx2 * inv) + x, int(by2 * inv) + y),
                     })
                 return out
-
             items = timed('3.OCR 识别', _ocr) or []
-        elif do_ocr and self.ocr_engine is None:
-            self.log_cb("[跳过] OCR 引擎未初始化")
-            return
 
         if not items:
             return
 
-        # ---------- 4. 过滤 ----------
         from layout import (
             filter_invalid_items,
             filter_general_content,
@@ -487,13 +576,11 @@ class LatencyTester:
         if not items:
             return
 
-        # ---------- 5. 段落合并 ----------
         paragraphs = timed('5.段落合并',
                            merge_lines_to_paragraphs, items) or []
         if not paragraphs:
             return
 
-        # ---------- 6. 二次 OCR 验证 ----------
         if do_verify and self.ocr_engine is not None:
             def _verify_one(p):
                 x1, y1, x2, y2 = p['box']
@@ -513,16 +600,14 @@ class LatencyTester:
                     return False
                 new_text = ''.join(it['text'].strip() for it in raw)
                 return text_similarity(p['text'], new_text) >= 0.6
-
             timed('6.二次OCR验证',
                   lambda: [_verify_one(p) for p in paragraphs])
 
-        # ---------- 7. 段落 key ----------
         timed('7.段落key生成',
               lambda: [paragraph_display_key(p) for p in paragraphs])
 
 
-# ==================== 命令行入口 ====================
+# ==================== CLI ====================
 
 def _cli():
     import argparse
@@ -530,14 +615,28 @@ def _cli():
     parser.add_argument('-n', '--runs', type=int, default=30)
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--no-ocr', action='store_true')
-    parser.add_argument('--api', action='store_true',
-                        help='测试 API 翻译')
+    parser.add_argument('--api', action='store_true')
     parser.add_argument('--api-runs', type=int, default=5)
+    parser.add_argument('--local', action='store_true',
+                        help='测试本地模型')
+    parser.add_argument('--local-runs', type=int, default=5)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument('--e2e', action='store_true',
-                        help='全链路测试')
+    parser.add_argument('--e2e', action='store_true')
     parser.add_argument('--e2e-runs', type=int, default=5)
+    parser.add_argument('--e2e-clean-cache', action='store_true',
+                        help='每轮全链路测试清空缓存（模拟冷启动）')
+    parser.add_argument('--device', type=str, default=None,
+                        help='本地模型设备：auto/cpu/cuda/directml')
     args = parser.parse_args()
+
+    # 设置本地模型设备
+    if args.device:
+        try:
+            from translation.local_models import set_preferred_device
+            set_preferred_device(args.device)
+            print(f"[准备] 本地模型设备：{args.device}")
+        except Exception as e:
+            print(f"[准备] 设置设备失败：{e}")
 
     ocr = None
     if not args.no_ocr:
@@ -552,7 +651,7 @@ def _cli():
             ocr = None
 
     translator = None
-    if args.api or args.e2e:
+    if args.api or args.local or args.e2e:
         try:
             from translator import Translator
             translator = Translator()
@@ -573,7 +672,7 @@ def _cli():
                 enable_frame_diff=True,
                 enable_filter=True,
                 enable_block_ocr=True,
-                enable_async_translate=False,   # 同步，方便计时
+                enable_async_translate=False,
                 enable_multithread_ocr=False,
             )
             pipeline = Pipeline(ocr, cache, translator, state)
@@ -597,9 +696,12 @@ def _cli():
         do_ocr=not args.no_ocr,
         do_api=args.api,
         api_runs=args.api_runs,
+        do_local=args.local,
+        local_runs=args.local_runs,
         do_verify=args.verify,
         do_e2e=args.e2e,
         e2e_runs=args.e2e_runs,
+        e2e_clean_cache=args.e2e_clean_cache,
     )
 
     print()

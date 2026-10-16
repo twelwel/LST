@@ -2,8 +2,8 @@
 所有版本号统一在这里修改
 """
 
-__version__ = "1.40.1"
-__version_tuple__ = (1, 40, 1)
+__version__ = "1.40.2"
+__version_tuple__ = (1, 40, 2)
 __author__ = "twelwel"
 __email__ = "2033697674@qq.com"
 __license__ = "MIT"
@@ -15,6 +15,8 @@ REPO_URL = "https://github.com/twelwel/LST"
 RELEASE_URL = REPO_URL + "/releases"
 
 VERSION_INFO = {
+    "1.40.2": "v1.40.2：新增翻译模型（支持 GPU）；"
+              "修复本地模型错误提示不明确的问题",
     "1.40.1": "v1.40.1：修复二次 OCR 验证 DML 崩溃；"
               "双语模式去重；字幕单行；日语优化；请求节流",
     "1.40.0": "v1.40.0：多语言支持（源/目标语言可选）；"
