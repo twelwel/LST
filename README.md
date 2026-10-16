@@ -54,15 +54,6 @@ https://github.com/twelwel/LST/issues
 最后更新：2026-10-16
 
 
----
-
-## 5. README 底部追加段
-
-打开 `README.md`，在最底部**追加**：
-
-```markdown
----
-
 ## 法律与合规
 
 - 本项目采用 MIT 协议，详见 [LICENSE](LICENSE)
