@@ -556,3 +556,41 @@ def text_similarity(a, b):
         return 1.0
 
     return _SM(None, a_n, b_n).ratio()
+
+# ==================== 目标语言过滤 ====================
+
+def is_target_language_text(text, target_lang='zh', threshold=0.5):
+    """
+    判断文本是否已经是目标语言（是则跳过翻译）
+    """
+    if not text:
+        return False
+    t = text.strip()
+    total = len(t)
+    if total == 0:
+        return False
+
+    if target_lang == 'zh':
+        cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
+        return cn / total >= threshold
+
+    if target_lang == 'ja':
+        jp = sum(1 for ch in t if '\u3040' <= ch <= '\u30ff')
+        cn = sum(1 for ch in t if '\u4e00' <= ch <= '\u9fff')
+        return (jp + cn) / total >= threshold
+
+    if target_lang == 'ko':
+        kr = sum(1 for ch in t if '\uac00' <= ch <= '\ud7af')
+        return kr / total >= threshold
+
+    if target_lang == 'ru':
+        ru = sum(1 for ch in t if '\u0400' <= ch <= '\u04ff')
+        return ru / total >= threshold
+
+    if target_lang == 'en':
+        letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
+        return letters / total >= threshold
+
+    # fr/de/es 都用拉丁字母
+    letters = sum(1 for ch in t if ch.isascii() and ch.isalpha())
+    return letters / total >= threshold

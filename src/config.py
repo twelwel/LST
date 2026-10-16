@@ -233,3 +233,56 @@ DEFAULT_ENABLE_TITLE_FILTER = False
 
 # 二次 OCR 验证（视频场景防一闪而过）
 DEFAULT_ENABLE_OCR_VERIFY = False
+
+# ==================== 多语言 ====================
+
+SOURCE_LANGS = {
+    'auto': '自适应',
+    'en':   '英语',
+    'zh':   '中文',
+    'ja':   '日语',
+    'ko':   '韩语',
+    'fr':   '法语',
+    'de':   '德语',
+    'es':   '西班牙语',
+    'ru':   '俄语',
+}
+
+TARGET_LANGS = {
+    'zh':   '中文',
+    'en':   '英语',
+    'ja':   '日语',
+    'ko':   '韩语',
+    'fr':   '法语',
+    'de':   '德语',
+    'es':   '西班牙语',
+    'ru':   '俄语',
+}
+
+DEFAULT_SOURCE_LANG = 'auto'
+DEFAULT_TARGET_LANG = 'zh'
+
+# 百度翻译语言代码
+BAIDU_LANG_MAP = {
+    'auto': 'auto',
+    'en':   'en',
+    'zh':   'zh',
+    'ja':   'jp',
+    'ko':   'kor',
+    'fr':   'fra',
+    'de':   'de',
+    'es':   'spa',
+    'ru':   'ru',
+}
+
+# AI 翻译提示词的语言名
+TARGET_LANG_NAME = {
+    'zh': '简体中文',
+    'en': 'English',
+    'ja': '日本語',
+    'ko': '한국어',
+    'fr': 'Français',
+    'de': 'Deutsch',
+    'es': 'Español',
+    'ru': 'Русский',
+}

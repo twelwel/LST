@@ -3,10 +3,16 @@ from translation import get_manager
 
 
 class Translator:
-    def __init__(self, source='en', target='zh'):
+    def __init__(self, source='auto', target='zh'):
         self.source = source
         self.target = target
         self._manager = get_manager()
+
+    def set_languages(self, source=None, target=None):
+        if source is not None:
+            self.source = source
+        if target is not None:
+            self.target = target
 
     def reload_config(self):
         self._manager.reload()
@@ -14,24 +20,31 @@ class Translator:
     def is_configured(self):
         return self._manager.is_configured()
 
-    def translate(self, text):
-        return self._manager.translate(text)
+    def translate(self, text, source=None, target=None):
+        """翻译单条文本
 
-    def translate_lines(self, lines):
+        source/target 为 None 时用实例默认值
+        """
+        src = source if source is not None else self.source
+        tgt = target if target is not None else self.target
+        return self._manager.translate(text, src, tgt)
+
+    def translate_lines(self, lines, source=None, target=None):
         if not lines:
             return []
-        return self._manager.translate_lines(lines)
+        src = source if source is not None else self.source
+        tgt = target if target is not None else self.target
+        return self._manager.translate_lines(lines, src, tgt)
 
     def get_strategy_name(self):
         return self._manager.get_strategy_name()
 
 
-def translate_text(text, source='en', target='zh'):
+def translate_text(text, source='auto', target='zh'):
     return Translator(source=source, target=target).translate(text)
 
 
 def test_baidu_api(appid, secret_key, text='Hello'):
-    """保留旧接口，供 api_setup_dialog 使用"""
     from translation.providers import BaiduProvider
     cfg = {
         'id': 'test', 'name': 'test',

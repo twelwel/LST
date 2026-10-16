@@ -93,7 +93,9 @@ DEFAULT_USER_CONFIG = {
 
     # 翻译策略
     "translation_strategy": "single_translate",
-
+    "source_lang": "auto",
+    "target_lang": "zh",
+    
     "enable_english_only": False,
 
     "enable_title_filter": False,

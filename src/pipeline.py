@@ -23,6 +23,7 @@ from layout import (
     paragraph_display_key,
     get_line_hashes,
     is_chinese_text,
+    is_target_language_text,
     filter_invalid_items,
     filter_general_content,
     filter_english_only,
@@ -163,6 +164,8 @@ class AppState:
                  enable_async_translate=True,
                  enable_window_pool=True,
                  enable_multithread_ocr=False,
+                 source_lang='auto',
+                 target_lang='zh',
                  enable_ocr_speed_opt=True):
         self.running = False
         self.region = dict(initial_region)
@@ -175,6 +178,8 @@ class AppState:
         self.enable_ocr_verify = enable_ocr_verify
         self.enable_fast_lookup = enable_fast_lookup
         self.enable_ocr_speed_opt = enable_ocr_speed_opt
+        self.source_lang = source_lang
+        self.target_lang = target_lang
         self.translation_strategy = 'single_translate'
         self.display_mode = 'overlay'
         self.fg_color = 'auto'
@@ -860,7 +865,10 @@ class Pipeline:
                 self._maybe_report_perf()
                 return
 
-        if getattr(self.state, 'enable_english_only', False):
+        # 英语特化：目标语言是英语时自动跳过（避免自相矛盾）
+        target_lang = getattr(self.state, 'target_lang', 'zh')
+        english_only_on = getattr(self.state, 'enable_english_only', False)
+        if english_only_on and target_lang != 'en':
             items = filter_english_only(items)
             if not items:
                 self._perf.tick(has_ocr=True)
@@ -896,7 +904,9 @@ class Pipeline:
         self.state.last_frame_keys = cur_keys
 
         paragraphs = merge_lines_to_paragraphs(items)
-        to_translate = [p for p in paragraphs if not is_chinese_text(p['text'])]
+        to_translate = [p for p in paragraphs
+                        if not is_target_language_text(
+                            p['text'], target_lang)]
 
         t_merge = time.time()
 

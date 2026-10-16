@@ -19,18 +19,23 @@ class BaiduProvider(BaseProvider):
         '54003': '频率受限', '54004': '余额不足', '58001': '语言方向不支持',
     }
 
-    def translate(self, text, from_lang='en', to_lang='zh'):
+    def translate(self, text, from_lang='auto', to_lang='zh'):
+        from config import BAIDU_LANG_MAP
         t0 = time.time()
         appid = (self.params.get('appid') or '').strip()
         key = (self.params.get('secret_key') or '').strip()
         if not appid or not key:
             return self._err('未配置 APPID 或密钥')
+
+        api_from = BAIDU_LANG_MAP.get(from_lang, 'auto')
+        api_to = BAIDU_LANG_MAP.get(to_lang, 'zh')
+
         salt = str(random.randint(32768, 65536))
         sign = hashlib.md5(
             (appid + text + salt + key).encode('utf-8')
         ).hexdigest()
         params = {
-            'q': text, 'from': from_lang, 'to': to_lang,
+            'q': text, 'from': api_from, 'to': api_to,
             'appid': appid, 'salt': salt, 'sign': sign,
         }
         try:
@@ -102,7 +107,8 @@ class OpenAICompatProvider(BaseProvider):
         return base + '/chat/completions'
 
     # ---------- 翻译 ----------
-    def translate(self, text, from_lang='en', to_lang='zh'):
+    def translate(self, text, from_lang='auto', to_lang='zh'):
+        from config import TARGET_LANG_NAME
         t0 = time.time()
         url = self._endpoint()
         model = (self.params.get('model') or '').strip()
@@ -110,8 +116,21 @@ class OpenAICompatProvider(BaseProvider):
             return self._err('未配置 base_url 或 model')
 
         api_key = (self.params.get('api_key') or '').strip()
-        system = (self.params.get('system_prompt') or '').strip() \
-                 or self.DEFAULT_SYSTEM
+
+        # 用户自定义 system_prompt 优先；否则根据目标语言动态生成
+        user_system = (self.params.get('system_prompt') or '').strip()
+        if user_system:
+            system = user_system
+        else:
+            target_name = TARGET_LANG_NAME.get(to_lang, '简体中文')
+            system = (
+                f"你是一个专业的翻译引擎。请将用户提供的文本翻译为"
+                f"{target_name}。\n\n"
+                "要求：\n"
+                "1. 只输出译文，不要任何解释、前缀或后缀\n"
+                "2. 保持原文的格式和标点\n"
+                "3. 专业术语保持准确"
+            )
 
         headers = {'Content-Type': 'application/json'}
         if api_key:

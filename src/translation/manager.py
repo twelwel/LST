@@ -74,19 +74,21 @@ class TranslationManager:
         with self._lock:
             return any(p.enabled for p in self._providers.values())
 
-    def translate(self, text: str) -> str:
+    def translate(self, text: str,
+                  source: str = 'auto', target: str = 'zh') -> str:
         with self._lock:
             strategy = self._strategy
         if strategy is None:
             return '[未配置翻译服务]'
         try:
-            return strategy.translate(text)
+            return strategy.translate(text, source=source, target=target)
         except Exception as e:
             print(f"[翻译管理] 策略执行异常：{e}")
             return f'[翻译异常: {e}]'
 
-    def translate_lines(self, lines: list) -> list:
-        return [self.translate(line) for line in lines]
+    def translate_lines(self, lines: list,
+                        source: str = 'auto', target: str = 'zh') -> list:
+        return [self.translate(line, source, target) for line in lines]
 
     def get_strategy_name(self) -> str:
         with self._lock:

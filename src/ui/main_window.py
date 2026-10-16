@@ -61,6 +61,8 @@ from config import (
     DEFAULT_DISPLAY_MODE,
     FG_COLOR_PRESETS,
     DEFAULT_FG_COLOR,
+    SOURCE_LANGS, TARGET_LANGS,
+    DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG,
 )
 from ocr_engine import OCREngine
 from cache import ParagraphCache
@@ -203,6 +205,15 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
         # 译文颜色
         saved_fg_color = self.user_cfg.get('fg_color', DEFAULT_FG_COLOR)
+        saved_source_lang = self.user_cfg.get(
+            'source_lang', DEFAULT_SOURCE_LANG)
+        if saved_source_lang not in SOURCE_LANGS:
+            saved_source_lang = DEFAULT_SOURCE_LANG
+
+        saved_target_lang = self.user_cfg.get(
+            'target_lang', DEFAULT_TARGET_LANG)
+        if saved_target_lang not in TARGET_LANGS:
+            saved_target_lang = DEFAULT_TARGET_LANG
         if saved_fg_color not in FG_COLOR_PRESETS:
             saved_fg_color = DEFAULT_FG_COLOR
 
@@ -229,7 +240,8 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             log.info("[启动] 打包模式（exe）")
 
         # ============ 核心组件 ============
-        self.translator = Translator()
+        self.translator = Translator(
+            source=saved_source_lang, target=saved_target_lang)
         self.ocr_engine = OCREngine()
 
         saved_accel_mode = self.user_cfg.get('accel_mode', '')
@@ -286,6 +298,8 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             enable_async_translate=saved_async,
             enable_window_pool=saved_wpool,
             enable_multithread_ocr=True,
+            source_lang=saved_source_lang,
+            target_lang=saved_target_lang,
             enable_ocr_speed_opt=self.enable_ocr_speed_opt,
         )
         self.app_state.performance_mode = saved_mode
@@ -296,6 +310,8 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.app_state.translation_strategy = saved_translation_strategy
         self.app_state.display_mode = saved_display_mode
         self.app_state.fg_color = saved_fg_color
+        self.app_state.source_lang = saved_source_lang
+        self.app_state.target_lang = saved_target_lang
 
         self.pipeline = Pipeline(
             self.ocr_engine, self.cache, self.translator, self.app_state,
@@ -686,6 +702,47 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         )
         self.vote_strategy_selector.set('相似度居中')
 
+        # ===== 语言选择 =====
+        lang_frame = ctk.CTkFrame(self, height=1)
+        lang_frame.pack(fill='x', padx=10, pady=(2, 2))
+        lang_frame.pack_propagate(True)
+
+        ctk.CTkLabel(
+            lang_frame, text="源语言：",
+            font=(FONT_NAME, 11, 'bold'),
+        ).pack(side='left', padx=(6, 4))
+
+        self.source_lang_selector = ctk.CTkOptionMenu(
+            lang_frame,
+            values=list(SOURCE_LANGS.values()),
+            command=self._on_source_lang_change,
+            font=(FONT_NAME, 11),
+            width=110,
+        )
+        self.source_lang_selector.set(SOURCE_LANGS[DEFAULT_SOURCE_LANG])
+        self.source_lang_selector.pack(side='left', padx=2)
+
+        ctk.CTkLabel(
+            lang_frame, text="目标语言：",
+            font=(FONT_NAME, 11, 'bold'),
+        ).pack(side='left', padx=(12, 4))
+
+        self.target_lang_selector = ctk.CTkOptionMenu(
+            lang_frame,
+            values=list(TARGET_LANGS.values()),
+            command=self._on_target_lang_change,
+            font=(FONT_NAME, 11),
+            width=110,
+        )
+        self.target_lang_selector.set(TARGET_LANGS[DEFAULT_TARGET_LANG])
+        self.target_lang_selector.pack(side='left', padx=2)
+
+        ctk.CTkLabel(
+            lang_frame,
+            text="💡 目标语言决定译文输出语言",
+            font=(FONT_NAME, 9), text_color='#888888', anchor='w',
+        ).pack(side='left', padx=10)
+
         hint_frame = ctk.CTkFrame(self, fg_color='transparent', height=1)
         hint_frame.pack(fill='x', padx=10, pady=(0, 2))
         hint_frame.pack_propagate(True)
@@ -808,6 +865,12 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             command=self.open_about,
         ).pack(side='left', padx=3)
 
+        ctk.CTkButton(
+            btn_frame2, text="延迟测试", width=80, height=28,
+            fg_color='#e67e22', hover_color='#d35400',
+            command=self.open_latency_test,
+        ).pack(side='left', padx=3)
+
         self.region_label = ctk.CTkLabel(
             self, text='', font=(FONT_NAME, 9), text_color='gray',
         )
@@ -840,6 +903,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._sync_strategy_ui()
         self._sync_display_mode_ui()
         self._sync_fg_color_ui()
+        self._sync_lang_ui()
 
     # ================= CPU / CUDA 引擎数 =================
 
@@ -1215,6 +1279,54 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         except Exception:
             pass
 
+    # ================= 语言 =================
+
+    def _on_source_lang_change(self, label):
+        rev = {v: k for k, v in SOURCE_LANGS.items()}
+        key = rev.get(label, DEFAULT_SOURCE_LANG)
+        self.app_state.source_lang = key
+        try:
+            self.translator.set_languages(source=key)
+        except Exception:
+            pass
+        self.user_cfg.set('source_lang', key)
+        self.user_cfg.save()
+        log.info(f"[源语言] 切换为 {key}")
+        self.bottom_label.configure(text=f"源语言：{label}")
+
+    def _on_target_lang_change(self, label):
+        rev = {v: k for k, v in TARGET_LANGS.items()}
+        key = rev.get(label, DEFAULT_TARGET_LANG)
+        self.app_state.target_lang = key
+        try:
+            self.translator.set_languages(target=key)
+        except Exception:
+            pass
+        self.user_cfg.set('target_lang', key)
+        self.user_cfg.save()
+
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
+        self.overlay.clear()
+        self.app_state.reset_signature()
+
+        log.info(f"[目标语言] 切换为 {key}")
+        self.bottom_label.configure(text=f"目标语言：{label}")
+
+    def _sync_lang_ui(self):
+        s = getattr(self.app_state, 'source_lang', DEFAULT_SOURCE_LANG)
+        t = getattr(self.app_state, 'target_lang', DEFAULT_TARGET_LANG)
+        try:
+            self.source_lang_selector.set(SOURCE_LANGS.get(s, '自适应'))
+        except Exception:
+            pass
+        try:
+            self.target_lang_selector.set(TARGET_LANGS.get(t, '中文'))
+        except Exception:
+            pass
+
     # ================= 译文模式 =================
 
     def _on_follow_mode_change(self, mode_name):
@@ -1297,6 +1409,20 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             dlg.grab_set()
         except Exception as e:
             log.exception(f"[关于] 打开失败：{e}")
+
+    def open_latency_test(self):
+        try:
+            from ui.latency_dialog import LatencyTestDialog
+            dlg = LatencyTestDialog(
+                self,
+                translator=self.translator,
+                ocr_engine=self.ocr_engine,
+                pipeline=self.pipeline,
+                app_state=self.app_state,
+            )
+            dlg.grab_set()
+        except Exception as e:
+            log.exception(f"[延迟测试] 打开失败：{e}")
 
     # ================= 短语表 =================
 
