@@ -11,6 +11,8 @@ OCR 模型：server / PP-OCRv6 tiny，可选高精度多引擎投票
 二次 OCR 验证：防一闪而过
 输出防抖：切换时先 reset_debouncer 再 clear overlay
 双语距离：可调滑块
+请求节流：每个 API 独立限速
+多语言：源/目标语言可选
 """
 
 import os
@@ -63,6 +65,8 @@ from config import (
     DEFAULT_FG_COLOR,
     SOURCE_LANGS, TARGET_LANGS,
     DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG,
+    DEFAULT_ENABLE_THROTTLE, DEFAULT_THROTTLE_QPS,
+    THROTTLE_QPS_MIN, THROTTLE_QPS_MAX,
 )
 from ocr_engine import OCREngine
 from cache import ParagraphCache
@@ -173,6 +177,15 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             saved_ocr_model = OCR_MODEL_SIZE_DEFAULT
         self.ocr_model_size = saved_ocr_model
 
+        # OCR 语言
+        from config import SOURCE_LANG_TO_OCR
+        saved_source_lang_for_ocr = self.user_cfg.get(
+            'source_lang', DEFAULT_SOURCE_LANG)
+        saved_ocr_lang = self.user_cfg.get(
+            'ocr_lang',
+            SOURCE_LANG_TO_OCR.get(saved_source_lang_for_ocr, 'CH'))
+        self._ocr_lang = saved_ocr_lang
+
         # 高精度 OCR
         self.high_accuracy_ocr = self.user_cfg.get(
             'enable_high_accuracy_ocr', DEFAULT_ENABLE_HIGH_ACCURACY_OCR)
@@ -205,14 +218,12 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
         # 译文颜色
         saved_fg_color = self.user_cfg.get('fg_color', DEFAULT_FG_COLOR)
+        if saved_fg_color not in FG_COLOR_PRESETS:
+            saved_fg_color = DEFAULT_FG_COLOR
+
+        # 语言
         saved_source_lang = self.user_cfg.get(
             'source_lang', DEFAULT_SOURCE_LANG)
-        # OCR 语言（用于识别）
-        from config import SOURCE_LANG_TO_OCR
-        saved_ocr_lang = self.user_cfg.get(
-            'ocr_lang',
-            SOURCE_LANG_TO_OCR.get(saved_source_lang, 'CH'))
-        self._ocr_lang = saved_ocr_lang
         if saved_source_lang not in SOURCE_LANGS:
             saved_source_lang = DEFAULT_SOURCE_LANG
 
@@ -220,8 +231,12 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             'target_lang', DEFAULT_TARGET_LANG)
         if saved_target_lang not in TARGET_LANGS:
             saved_target_lang = DEFAULT_TARGET_LANG
-        if saved_fg_color not in FG_COLOR_PRESETS:
-            saved_fg_color = DEFAULT_FG_COLOR
+
+        # 请求节流
+        saved_enable_throttle = self.user_cfg.get(
+            'enable_throttle', DEFAULT_ENABLE_THROTTLE)
+        saved_throttle_qps = self.user_cfg.get(
+            'throttle_qps', DEFAULT_THROTTLE_QPS)
 
         saved_scan = self.user_cfg.get(
             'scan_interval',
@@ -305,9 +320,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             enable_async_translate=saved_async,
             enable_window_pool=saved_wpool,
             enable_multithread_ocr=True,
+            enable_ocr_speed_opt=self.enable_ocr_speed_opt,
             source_lang=saved_source_lang,
             target_lang=saved_target_lang,
-            enable_ocr_speed_opt=self.enable_ocr_speed_opt,
         )
         self.app_state.performance_mode = saved_mode
         self.app_state.base_font_size = initial_font
@@ -325,6 +340,18 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         )
         self.pipeline.start()
 
+        # 应用请求节流
+        try:
+            from translation.throttle import get_limiter
+            limiter = get_limiter()
+            limiter.set_enabled(saved_enable_throttle)
+            limiter.set_qps(saved_throttle_qps)
+            log.info(f"[节流] "
+                     f"{'开启' if saved_enable_throttle else '关闭'} "
+                     f"QPS={saved_throttle_qps}")
+        except Exception as e:
+            log.exception(f"[节流] 初始化失败：{e}")
+
         try:
             self.pipeline.phrase_cache.set_external_path(
                 saved_phrase_table_path)
@@ -337,7 +364,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.overlay.set_pool_enabled(saved_wpool)
         self.overlay.set_async_enabled(saved_async_overlay)
 
-        # 从配置恢复双语距离
+        # 双语距离
         try:
             bg = int(self.user_cfg.get('bilingual_gap', 2))
             self.overlay.set_bilingual_gap(bg)
@@ -510,6 +537,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self._sync_strategy_ui()
             self._sync_display_mode_ui()
             self._sync_fg_color_ui()
+            self._sync_lang_ui()
 
             if frame_diff:
                 self.frame_diff_switch.select()
@@ -543,7 +571,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self._update_phrase_count()
             self._update_dict_count()
 
-            # 双语距离：从配置读取
+            # 双语距离
             try:
                 bg = int(self.user_cfg.get('bilingual_gap', 2))
                 self.bilingual_gap_slider.set(bg)
@@ -612,7 +640,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         }[mode]
         self.set_follow_mode(next_mode)
 
-    # ================= UI 构建（主框架） =================
+    # ================= UI 构建 =================
 
     def _build_ui(self):
         top = ctk.CTkFrame(self, height=1)
@@ -750,6 +778,52 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             font=(FONT_NAME, 9), text_color='#888888', anchor='w',
         ).pack(side='left', padx=10)
 
+        # ===== 请求节流 =====
+        throttle_frame = ctk.CTkFrame(self, height=1)
+        throttle_frame.pack(fill='x', padx=10, pady=(2, 2))
+        throttle_frame.pack_propagate(True)
+
+        self.throttle_switch = ctk.CTkSwitch(
+            throttle_frame,
+            text="请求节流",
+            command=self._on_throttle_toggle,
+            onvalue=True, offvalue=False,
+            font=(FONT_NAME, 11, 'bold'),
+        )
+        if self.user_cfg.get('enable_throttle', DEFAULT_ENABLE_THROTTLE):
+            self.throttle_switch.select()
+        self.throttle_switch.pack(side='left', padx=(6, 8))
+
+        ctk.CTkLabel(
+            throttle_frame, text="每个 API 每秒请求数：",
+            font=(FONT_NAME, 10),
+        ).pack(side='left', padx=(6, 2))
+
+        self.throttle_qps_value_label = ctk.CTkLabel(
+            throttle_frame, text=f"{DEFAULT_THROTTLE_QPS:.1f}",
+            width=40, font=(FONT_NAME, 10, 'bold'),
+            text_color='#3a86ff',
+        )
+        self.throttle_qps_value_label.pack(side='right', padx=(2, 10))
+
+        self.throttle_qps_slider = ctk.CTkSlider(
+            throttle_frame,
+            from_=THROTTLE_QPS_MIN, to=THROTTLE_QPS_MAX,
+            number_of_steps=int((THROTTLE_QPS_MAX - THROTTLE_QPS_MIN) * 10),
+            command=self._on_throttle_qps_change,
+            height=14, width=160,
+        )
+        self.throttle_qps_slider.set(
+            self.user_cfg.get('throttle_qps', DEFAULT_THROTTLE_QPS))
+        self.throttle_qps_slider.pack(side='right', padx=4)
+
+        ctk.CTkLabel(
+            throttle_frame,
+            text="💡 多 API 轮询时，每个 API 独立限速",
+            font=(FONT_NAME, 9), text_color='#888888',
+        ).pack(side='left', padx=8)
+
+        # ===== 提示 =====
         hint_frame = ctk.CTkFrame(self, fg_color='transparent', height=1)
         hint_frame.pack(fill='x', padx=10, pady=(0, 2))
         hint_frame.pack_propagate(True)
@@ -867,15 +941,15 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         ).pack(side='left', padx=3)
 
         ctk.CTkButton(
-            btn_frame2, text="关于", width=60, height=28,
-            fg_color='#495057', hover_color='#343a40',
-            command=self.open_about,
-        ).pack(side='left', padx=3)
-
-        ctk.CTkButton(
             btn_frame2, text="延迟测试", width=80, height=28,
             fg_color='#e67e22', hover_color='#d35400',
             command=self.open_latency_test,
+        ).pack(side='left', padx=3)
+
+        ctk.CTkButton(
+            btn_frame2, text="关于", width=60, height=28,
+            fg_color='#495057', hover_color='#343a40',
+            command=self.open_about,
         ).pack(side='left', padx=3)
 
         self.region_label = ctk.CTkLabel(
@@ -972,7 +1046,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self.bottom_label.configure(
                 text=f"CUDA 引擎数设为 {v}（切到 CUDA 时生效）")
 
-    # ================= OCR 开关统一重载 =================
+    # ================= OCR 开关 =================
 
     def _reload_ocr_safe(self, switch_widget):
         try:
@@ -1212,6 +1286,129 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._save_strategy_subparams()
         self.bottom_label.configure(text=f"投票策略：{label}")
 
+    # ================= 语言 =================
+
+    def _on_source_lang_change(self, label):
+        from config import SOURCE_LANG_TO_OCR
+
+        rev = {v: k for k, v in SOURCE_LANGS.items()}
+        key = rev.get(label, DEFAULT_SOURCE_LANG)
+
+        old_ocr_lang = getattr(self, '_ocr_lang', 'CH')
+        new_ocr_lang = SOURCE_LANG_TO_OCR.get(key, 'CH')
+
+        self.app_state.source_lang = key
+        try:
+            self.translator.set_languages(source=key)
+        except Exception:
+            pass
+        self.user_cfg.set('source_lang', key)
+        self.user_cfg.save()
+        log.info(f"[源语言] 切换为 {key} (OCR lang: {new_ocr_lang})")
+
+        if new_ocr_lang != old_ocr_lang:
+            if self.app_state.running:
+                self.bottom_label.configure(
+                    text="⚠️ 请先暂停翻译再切换源语言")
+                return
+
+            self._ocr_lang = new_ocr_lang
+            self.user_cfg.set('ocr_lang', new_ocr_lang)
+            self.user_cfg.save()
+
+            self.bottom_label.configure(
+                text=f"OCR 语言切换为 {new_ocr_lang}，正在重载...")
+            self.after(200, self._reload_ocr_for_lang)
+
+        self.bottom_label.configure(text=f"源语言：{label}")
+
+    def _reload_ocr_for_lang(self):
+        try:
+            actual = self.ocr_engine.init(
+                mode=self.ocr_engine.mode,
+                pool_size=self.cpu_engine_count,
+                dml_worker_count=self.dml_worker_count,
+                model_size=self.ocr_model_size,
+                high_accuracy=self.high_accuracy_ocr,
+                speed_opt=self.enable_ocr_speed_opt,
+                lang_name=getattr(self, '_ocr_lang', 'CH'),
+            )
+            try:
+                self.pipeline.reset_debouncer()
+            except Exception:
+                pass
+            self.overlay.clear()
+            self.bottom_label.configure(text=f"✅ OCR 重载完成：{actual}")
+        except Exception as e:
+            log.exception(f"[OCR] 重载失败：{e}")
+            self.bottom_label.configure(text=f"重载失败：{e}")
+
+    def _on_target_lang_change(self, label):
+        rev = {v: k for k, v in TARGET_LANGS.items()}
+        key = rev.get(label, DEFAULT_TARGET_LANG)
+        self.app_state.target_lang = key
+        try:
+            self.translator.set_languages(target=key)
+        except Exception:
+            pass
+        self.user_cfg.set('target_lang', key)
+        self.user_cfg.save()
+
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
+        self.overlay.clear()
+        self.app_state.reset_signature()
+
+        log.info(f"[目标语言] 切换为 {key}")
+        self.bottom_label.configure(text=f"目标语言：{label}")
+
+    def _sync_lang_ui(self):
+        s = getattr(self.app_state, 'source_lang', DEFAULT_SOURCE_LANG)
+        t = getattr(self.app_state, 'target_lang', DEFAULT_TARGET_LANG)
+        try:
+            self.source_lang_selector.set(SOURCE_LANGS.get(s, '自适应'))
+        except Exception:
+            pass
+        try:
+            self.target_lang_selector.set(TARGET_LANGS.get(t, '中文'))
+        except Exception:
+            pass
+
+    # ================= 请求节流 =================
+
+    def _on_throttle_toggle(self):
+        enabled = bool(self.throttle_switch.get())
+        try:
+            from translation.throttle import get_limiter
+            get_limiter().set_enabled(enabled)
+        except Exception as e:
+            log.exception(f"[节流] 应用失败：{e}")
+        self.user_cfg.set('enable_throttle', enabled)
+        self.user_cfg.save()
+        msg = ("请求节流：已开启" if enabled else "请求节流：已关闭")
+        self.bottom_label.configure(text=msg)
+        log.info(f"[节流] {msg}")
+
+    def _on_throttle_qps_change(self, value):
+        try:
+            qps = round(float(value), 1)
+        except Exception:
+            return
+        qps = max(THROTTLE_QPS_MIN, min(THROTTLE_QPS_MAX, qps))
+        try:
+            self.throttle_qps_value_label.configure(text=f"{qps:.1f}")
+        except Exception:
+            pass
+        try:
+            from translation.throttle import get_limiter
+            get_limiter().set_qps(qps)
+        except Exception:
+            pass
+        self.user_cfg.set('throttle_qps', qps)
+        self.user_cfg.save()
+
     # ================= 显示模式 =================
 
     def _on_display_mode_change(self, label):
@@ -1283,100 +1480,6 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         label = FG_COLOR_PRESETS.get(key, '自动（按背景反色）')
         try:
             self.fg_color_selector.set(label)
-        except Exception:
-            pass
-
-    # ================= 语言 =================
-
-    def _on_source_lang_change(self, label):
-        from config import SOURCE_LANG_TO_OCR
-
-        rev = {v: k for k, v in SOURCE_LANGS.items()}
-        key = rev.get(label, DEFAULT_SOURCE_LANG)
-
-        old_ocr_lang = getattr(self, '_ocr_lang', 'CH')
-        new_ocr_lang = SOURCE_LANG_TO_OCR.get(key, 'CH')
-
-        self.app_state.source_lang = key
-        try:
-            self.translator.set_languages(source=key)
-        except Exception:
-            pass
-        self.user_cfg.set('source_lang', key)
-        self.user_cfg.save()
-        log.info(f"[源语言] 切换为 {key} (OCR lang: {new_ocr_lang})")
-
-        # ⭐ OCR 语言变化 → 重载引擎
-        if new_ocr_lang != old_ocr_lang:
-            if self.app_state.running:
-                self.bottom_label.configure(
-                    text="⚠️ 请先暂停翻译再切换源语言")
-                # 回滚
-                self.app_state.source_lang = key
-                return
-
-            self._ocr_lang = new_ocr_lang
-            self.user_cfg.set('ocr_lang', new_ocr_lang)
-            self.user_cfg.save()
-
-            self.bottom_label.configure(
-                text=f"OCR 语言切换为 {new_ocr_lang}，正在重载...")
-            self.after(200, self._reload_ocr_for_lang)
-
-        self.bottom_label.configure(text=f"源语言：{label}")
-
-    def _reload_ocr_for_lang(self):
-        """根据当前源语言重新初始化 OCR"""
-        try:
-            actual = self.ocr_engine.init(
-                mode=self.ocr_engine.mode,
-                pool_size=self.cpu_engine_count,
-                dml_worker_count=self.dml_worker_count,
-                model_size=self.ocr_model_size,
-                high_accuracy=self.high_accuracy_ocr,
-                speed_opt=self.enable_ocr_speed_opt,
-                lang_name=getattr(self, '_ocr_lang', 'CH'),
-            )
-            try:
-                self.pipeline.reset_debouncer()
-            except Exception:
-                pass
-            self.overlay.clear()
-            self.bottom_label.configure(text=f"✅ OCR 重载完成：{actual}")
-        except Exception as e:
-            log.exception(f"[OCR] 重载失败：{e}")
-            self.bottom_label.configure(text=f"重载失败：{e}")
-
-    def _on_target_lang_change(self, label):
-        rev = {v: k for k, v in TARGET_LANGS.items()}
-        key = rev.get(label, DEFAULT_TARGET_LANG)
-        self.app_state.target_lang = key
-        try:
-            self.translator.set_languages(target=key)
-        except Exception:
-            pass
-        self.user_cfg.set('target_lang', key)
-        self.user_cfg.save()
-
-        try:
-            self.pipeline.reset_debouncer()
-        except Exception:
-            pass
-        self.overlay.clear()
-        self.app_state.reset_signature()
-
-        log.info(f"[目标语言] 切换为 {key}")
-        self.bottom_label.configure(text=f"目标语言：{label}")
-
-    def _sync_lang_ui(self):
-        s = getattr(self.app_state, 'source_lang', DEFAULT_SOURCE_LANG)
-        t = getattr(self.app_state, 'target_lang', DEFAULT_TARGET_LANG)
-        try:
-            self.source_lang_selector.set(SOURCE_LANGS.get(s, '自适应'))
-        except Exception:
-            pass
-        try:
-            self.target_lang_selector.set(TARGET_LANGS.get(t, '中文'))
         except Exception:
             pass
 

@@ -95,7 +95,10 @@ DEFAULT_USER_CONFIG = {
     "translation_strategy": "single_translate",
     "source_lang": "auto",
     "target_lang": "zh",
-    
+
+    "enable_throttle": False,
+    "throttle_qps": 1.0,
+
     "enable_english_only": False,
 
     "enable_title_filter": False,

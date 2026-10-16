@@ -1,12 +1,14 @@
-"""自适应输出防抖模块（视频字幕专用 + 日语优化）
+"""自适应输出防抖模块（视频字幕专用 + 日语优化 + 防非法留存）
 
 核心机制：
-1. **位置即身份**：用「中心点距离」判断同段，避免文本变长导致误判
+1. **位置即身份**：用「中心点距离」判断同段
 2. **多帧投票**：窗口内文本聚类，选最大簇的最长文本
-3. **显示节流**：同一段的最小更新间隔
-4. **位置防抖**：位置变化 < 8px 视为 OCR 抖动，不更新窗口
-5. **消失容忍**：连续 N 帧未出现才移除
-6. **日语模式**：更激进的节流和消失容忍
+3. **快速换句**：最近 2 帧一致 → 立即采纳（不等 4 帧）
+4. **剧变检测**：新文本与当前稳定文本相似度 < 0.3 → 视为新段，重置窗口
+5. **显示节流**：同一段的最小更新间隔
+6. **位置防抖**：位置变化 < 8px 视为 OCR 抖动
+7. **消失容忍**：连续 N 帧未出现才移除
+8. **日语模式**：更激进的节流和消失容忍
 """
 
 import threading
@@ -27,20 +29,24 @@ class EmitDebouncer:
     VOTE_WINDOW = 4
     MIN_UPDATE_INTERVAL = 0.12
 
-    # 中心点容差：判断是否同一段（容忍文本变长）
+    # 中心点容差：判断是否同一段
     CENTER_TOLERANCE = 30
 
-    # ⭐ 位置更新阈值
-    # 文本未变时，位置偏差超过此值才更新窗口（防 OCR 抖动）
-    # - 太小：窗口跟着 OCR 抖动
-    # - 太大：真移动不跟随
-    # 8px 是经验值：> POSITION_QUANTIZE(6)，< 一行字号
+    # 位置更新阈值（文本未变时）
     POS_UPDATE_THRESHOLD = 8
 
+    # 消失容忍
     MISS_TOLERANCE = 2
 
+    # 文本相似度阈值
     TEXT_SIMILARITY = 0.7
     TEXT_MIN_LEN_RATIO = 0.5
+
+    # ⭐ 剧变阈值：新文本与稳定文本相似度 < 此值 → 视为新段
+    TEXT_RESET_THRESHOLD = 0.3
+
+    # ⭐ 快速换句：最近 2 帧相似度 >= 此值 → 立即采纳
+    TEXT_FAST_MATCH = 0.9
 
     # ============ 日语专用参数 ============
     JP_VOTE_WINDOW = 3
@@ -92,8 +98,8 @@ class EmitDebouncer:
                     'stable': item,
                     'texts': deque(
                         [text],
-                        maxlen=self.JP_VOTE_WINDOW if is_jp
-                        else self.VOTE_WINDOW,
+                        maxlen=(self.JP_VOTE_WINDOW if is_jp
+                                else self.VOTE_WINDOW),
                     ),
                     'anchor': self._box(item),
                     'last_update_ts': now,
@@ -121,8 +127,6 @@ class EmitDebouncer:
 
     def _update_state(self, st, item, now):
         new_text = item.get('text', '')
-        st['texts'].append(new_text)
-
         new_box = self._box(item)
 
         # 位置大变 → 视为新段落
@@ -147,25 +151,38 @@ class EmitDebouncer:
                               else self.TEXT_SIMILARITY)
             return True
 
-        # ⭐ anchor 保留最新位置（不 blend，避免累积误差）
         st['anchor'] = new_box
+
+        # ⭐ 文本剧变检测：新文本与稳定文本相似度过低 → 视为新段
+        cur_text = st['stable'].get('text', '')
+        if new_text and cur_text:
+            sim_cur = self._text_sim_raw(new_text, cur_text)
+            if sim_cur < self.TEXT_RESET_THRESHOLD:
+                # 重置文本窗口（视为新段）
+                is_jp = _has_kana(new_text)
+                st['texts'].clear()
+                st['texts'].append(new_text)
+                st['is_jp'] = is_jp
+                st['update_interval'] = (self.JP_MIN_UPDATE_INTERVAL
+                                         if is_jp
+                                         else self.MIN_UPDATE_INTERVAL)
+
+        st['texts'].append(new_text)
 
         # 多帧投票
         voted = self._vote(
             st['texts'], st.get('text_sim', self.TEXT_SIMILARITY))
+
         cur_text = st['stable'].get('text', '')
 
         # ---------- 文本未变 ----------
         if not voted or voted == cur_text:
-            # 比较最新位置 vs 上次显示位置
             cur_pos = self._box(st['stable'])
             drift = self._pos_drift(new_box, cur_pos)
 
             if drift < self.POS_UPDATE_THRESHOLD:
-                # 抖动 → 不动
                 return False
 
-            # 真移动（>8px）→ 更新位置
             new_stable = dict(st['stable'])
             (new_stable['x1'], new_stable['y1'],
              new_stable['x2'], new_stable['y2']) = new_box
@@ -211,13 +228,36 @@ class EmitDebouncer:
         return max(abs(a[0] - b[0]), abs(a[1] - b[1]),
                    abs(a[2] - b[2]), abs(a[3] - b[3]))
 
+    @staticmethod
+    def _text_sim_raw(a, b):
+        """不带长度比例限制的相似度（用于剧变检测）"""
+        if a == b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        return SequenceMatcher(None, a, b).ratio()
+
     def _vote(self, texts, similarity=None):
+        """
+        投票：
+        1. ⭐ 最近 2 帧一致 → 立即采纳（快速换句）
+        2. 否则聚类选最大簇的最长文本
+        """
         if similarity is None:
             similarity = self.TEXT_SIMILARITY
         valid = [t for t in texts if t]
         if not valid:
             return ''
 
+        # ⭐ 快速通道：最近 2 帧一致
+        if len(valid) >= 2:
+            if valid[-1] == valid[-2]:
+                return valid[-1]
+            if self._text_sim_raw(valid[-1], valid[-2]) >= \
+                    self.TEXT_FAST_MATCH:
+                return valid[-1]
+
+        # 常规聚类投票
         clusters = []
         for t in valid:
             placed = False

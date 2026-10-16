@@ -299,3 +299,10 @@ SOURCE_LANG_TO_OCR = {
     'es':   'SPANISH',
     'ru':   'RUSSIAN',
 }
+
+# ==================== 请求节流 ====================
+
+DEFAULT_ENABLE_THROTTLE = False
+DEFAULT_THROTTLE_QPS = 1.0       # 每个 API 每秒请求数
+THROTTLE_QPS_MIN = 0.2
+THROTTLE_QPS_MAX = 20.0

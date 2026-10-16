@@ -418,8 +418,19 @@ class Pipeline:
                 ecy = (ey1 + ey2) / 2
                 d = ((cx - ecx) ** 2 + (cy - ecy) ** 2) ** 0.5
 
-                # 文本相同 + 位置相近 → 强匹配
                 e_text_norm = norm(e.get('text', ''))
+
+                # ⭐ 文本剧变检测：位置近但文本完全不同 → 不复用
+                # 防止旧字幕消失、新字幕出现的过渡期复用 key
+                if (cur_text_norm and e_text_norm and
+                        d < POSITION_MATCH_TOLERANCE):
+                    from difflib import SequenceMatcher as _SM
+                    sim = _SM(None, cur_text_norm, e_text_norm).ratio()
+                    if sim < 0.3:
+                        # 视为不同段，跳过
+                        continue
+
+                # 文本相同 + 位置相近 → 强匹配
                 same_text = (cur_text_norm and e_text_norm and
                              cur_text_norm == e_text_norm)
 
