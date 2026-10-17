@@ -79,3 +79,23 @@ htmlcov/
 *.bak
 *.tmp
 *.swp
+
+# ============ 模型文件 ============
+models/
+*.onnx
+*.onnx_data
+*.onnx_data_*
+*.bin
+*.safetensors
+
+# ============ Python/虚拟环境 ============
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# ============ 打包与日志 ============
+build/
+dist/
+*.spec
+*.log
