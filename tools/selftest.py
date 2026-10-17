@@ -44,7 +44,8 @@ MODULES = [
     'translator', 'pipeline', 'latency_tester',
     # 界面
     'ui', 'ui.constants', 'ui.widgets', 'ui.panels', 'ui.main_window',
-    'ui.latency_dialog', 'ui.model_manager_dialog', 'ui.model_picker_dialog',
+    'ui.download_task', 'ui.latency_dialog', 'ui.model_manager_dialog',
+    'ui.model_picker_dialog',
     'region_manager', 'overlay', 'hotkeys',
     'api_setup_dialog', 'about_dialog',
 ]

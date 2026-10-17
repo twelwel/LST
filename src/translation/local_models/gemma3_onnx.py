@@ -76,7 +76,11 @@ class Gemma3ONNXModel(BaseTranslationModel):
             
             try:
                 from transformers import AutoTokenizer
-                from optimum.onnxruntime import ORTModelForCausalLM
+                # 直接导入具体模块，避免 optimum 的 _LazyModule 在
+                # PyInstaller 冻结环境中解析不到模块。
+                from optimum.onnxruntime.modeling_decoder import (
+                    ORTModelForCausalLM,
+                )
                 self._tokenizer = AutoTokenizer.from_pretrained(str(model_path))
                 if self._tokenizer.pad_token is None: self._tokenizer.pad_token = self._tokenizer.eos_token
             except Exception as e:

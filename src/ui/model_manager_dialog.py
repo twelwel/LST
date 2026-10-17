@@ -9,16 +9,26 @@
 
 import os
 import shutil
-import threading
 from pathlib import Path
 
 import customtkinter as ctk
 
 from config import FONT_NAME
 from logger import get_logger
+from ui.download_task import DownloadTask
 
 
 log = get_logger('ui.model_manager')
+
+
+def _format_bytes(num_bytes: float) -> str:
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / 1024 ** 3:.2f} GB"
+    if num_bytes >= 1024 ** 2:
+        return f"{num_bytes / 1024 ** 2:.1f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{max(0, int(num_bytes))} B"
 
 
 class ModelManagerDialog(ctk.CTkToplevel):
@@ -30,10 +40,11 @@ class ModelManagerDialog(ctk.CTkToplevel):
         self.attributes('-topmost', True)
 
         self._downloader = None
-        self._download_thread = None
+        self._download_task = None
         self._downloading = False
         self._closing = False
         self._current_download_id = None
+        self._last_download_ok = False
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -55,23 +66,22 @@ class ModelManagerDialog(ctk.CTkToplevel):
         if self._closing:
             return
         self._closing = True
-
-        if self._downloading and self._downloader:
-            try:
-                self._downloader.cancel()
-            except Exception:
-                pass
-
-        if self._download_thread and self._download_thread.is_alive():
-            try:
-                self._download_thread.join(timeout=2.0)
-            except Exception:
-                pass
-
         try:
             self.destroy()
         except Exception:
             pass
+
+    def destroy(self):
+        """停止事件轮询；不等待阻塞中的网络线程，避免 UI 卡死。"""
+        self._closing = True
+        task = getattr(self, '_download_task', None)
+        self._download_task = None
+        if task is not None:
+            try:
+                task.close()
+            except Exception:
+                pass
+        super().destroy()
 
     def _set_progress(self, text: str):
         if self._closing:
@@ -347,8 +357,19 @@ class ModelManagerDialog(ctk.CTkToplevel):
                 ModelCacheManager, get_models_dir)
             mgr = ModelCacheManager()
             size_mb = mgr.get_cache_size_mb()
-            count = len(mgr.list_models())
-            path = str(get_models_dir())
+            models = mgr.list_models()
+            count = len(models)
+            if models:
+                bases = []
+                for m in models:
+                    base = m.get('base') or ''
+                    if base and base not in bases:
+                        bases.append(base)
+                path = bases[0]
+                if len(bases) > 1:
+                    path += f" 等 {len(bases)} 个目录"
+            else:
+                path = str(get_models_dir())
             if len(path) > 55:
                 path = '...' + path[-52:]
             self.cache_label.configure(
@@ -377,44 +398,62 @@ class ModelManagerDialog(ctk.CTkToplevel):
         self._start_download(model_id, variant)
 
     def _start_download(self, model_id: str, variant: str = 'quantized'):
+        if self._closing:
+            return
         try:
             from translation.local_models import ModelDownloader
+            downloader = ModelDownloader()
         except Exception as e:
             self._set_progress(f"下载器加载失败：{e}")
             return
 
         self._downloading = True
         self._current_download_id = model_id
-        self._downloader = ModelDownloader()
+        self._downloader = downloader
         self.progress_bar.set(0)
 
         self._show_downloading_view(model_id, variant)
         self._set_ui_downloading(True)
 
-        def progress_cb(p):
-            self._safe_after(0, lambda: self._update_progress(p))
+        download_variant = (
+            'gpu' if variant in ('fp32', 'gpu') else 'cpu')
 
-        def status_cb(s):
-            self._safe_after(0, lambda: self._set_progress(s))
+        def work(progress_cb, status_cb):
+            # 下载线程：只访问 downloader 和普通参数，不能碰 Tk。
+            return downloader.download(
+                model_id, variant=download_variant,
+                progress_cb=progress_cb, status_cb=status_cb)
 
-        def worker():
-            try:
-                self._downloader.download(
-                    model_id, variant=variant,
-                    progress_cb=progress_cb, status_cb=status_cb)
-            except Exception as e:
-                log.exception(f"[模型管理] 下载异常：{e}")
-            self._safe_after(0, self._on_download_done)
+        task = DownloadTask(
+            self,
+            on_progress=self._update_progress,
+            on_status=self._set_progress,
+            on_done=self._on_download_done,
+        )
+        self._download_task = task
 
-        self._download_thread = threading.Thread(
-            target=worker, daemon=True)
-        self._download_thread.start()
+        if not task.start(work, cancel_cb=downloader.cancel):
+            self._downloading = False
+            self._download_task = None
+            self._downloader = None
+            self._set_ui_downloading(False)
+            self._set_progress("无法启动下载线程，请查看日志")
+            self._safe_after(300, self._refresh_list)
 
-    def _update_progress(self, p):
+    def _update_progress(self, p, speed_mb=0.0,
+                         done_bytes=0, total_bytes=0):
         if self._closing:
             return
         try:
             self.progress_bar.set(p)
+            if total_bytes > 0:
+                detail = (f"{p * 100:5.1f}%  ·  "
+                          f"{_format_bytes(done_bytes)} / "
+                          f"{_format_bytes(total_bytes)}  ·  "
+                          f"{speed_mb:.1f} MB/s")
+            else:
+                detail = f"{p * 100:5.1f}%  ·  {speed_mb:.1f} MB/s"
+            self.progress_label.configure(text=detail)
         except Exception:
             pass
 
@@ -468,18 +507,28 @@ class ModelManagerDialog(ctk.CTkToplevel):
         if not self._downloading:
             return
 
-        if self._downloader:
+        task = self._download_task
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        elif self._downloader:
             try:
                 self._downloader.cancel()
             except Exception:
                 pass
 
+        # 保持 _downloading=True，等后台线程真正结束后再开放按钮。
+        # 否则用户可在旧线程仍占用全局下载锁时再次点击。
         self._set_progress("正在取消下载（后台会清理临时文件）...")
-        self._downloading = False
-        self._set_ui_downloading(False)
-        self._safe_after(300, self._refresh_list)
+        try:
+            self.btn_close.configure(text="正在取消...", state='disabled')
+        except Exception:
+            pass
 
-    def _on_download_done(self):
+    def _on_download_done(self, ok=False, result=None,
+                          error=None, cancelled=False):
         if self._closing:
             return
         if not self._downloading:
@@ -487,17 +536,43 @@ class ModelManagerDialog(ctk.CTkToplevel):
 
         self._downloading = False
         self._current_download_id = None
+        self._last_download_ok = bool(ok)
+        self._download_task = None
+        self._downloader = None
+
+        if cancelled:
+            self._set_progress("下载已取消")
+        elif error:
+            self._set_progress(f"❌ 下载异常：{error[:120]}")
+
         try:
-            self.progress_bar.set(1.0)
+            if self._last_download_ok:
+                self.progress_bar.set(1.0)
         except Exception:
             pass
         self._set_ui_downloading(False)
         self._safe_after(300, self._refresh_list)
 
+        if self._last_download_ok:
+            try:
+                from translation.api_config import sync_downloaded_models
+                result = sync_downloaded_models()
+                added = result.get('added', [])
+                if added:
+                    log.info(f"[模型管理] 自动注册本地模型：{added}")
+            except Exception as e:
+                log.exception(f"[模型管理] 自动同步失败：{e}")
+
         try:
             master = self.master
-            if master and hasattr(master, '_refresh_local_models'):
-                self._safe_after(500, master._refresh_local_models)
+            if (master is not None
+                    and master.winfo_exists()
+                    and hasattr(master, '_refresh_local_models')):
+                try:
+                    master.translator.reload_config()
+                except Exception:
+                    pass
+                master.after(0, master._refresh_local_models)
         except Exception:
             pass
 

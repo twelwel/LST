@@ -1,14 +1,48 @@
 """段落缓存：翻译结果与段落复用（本地记忆 / SQLite 持久化）"""
 
 import os
-import time  # 👈 加上这一行
+import sys
+import tempfile
+import time
 import sqlite3
 import threading
 from collections import OrderedDict
 
+
+def _candidate_cache_dirs():
+    """按优先级返回可写的缓存目录。
+
+    与日志同理：部分安全软件会阻止未签名 exe 写用户目录，
+    此时回退到临时目录，避免 SQLite 打不开数据库导致启动失败。
+    """
+    yield os.path.join(os.path.expanduser('~'), '.screen_translator', 'cache')
+    yield os.path.join(tempfile.gettempdir(), 'LST', 'cache')
+
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    yield os.path.join(base_dir, 'LST_data', 'cache')
+
+
+def _resolve_cache_dir():
+    for path in _candidate_cache_dirs():
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, '.write_test')
+            with open(probe, 'w', encoding='utf-8') as f:
+                f.write('ok')
+            os.remove(probe)
+            return path
+        except OSError:
+            continue
+    return None
+
+
 CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.screen_translator')
-CACHE_DIR = os.path.join(CONFIG_DIR, 'cache')
-DB_PATH = os.path.join(CACHE_DIR, 'translation_cache.db')
+CACHE_DIR = _resolve_cache_dir()
+DB_PATH = (os.path.join(CACHE_DIR, 'translation_cache.db')
+           if CACHE_DIR else None)
 
 
 class ParagraphCache:
@@ -22,14 +56,23 @@ class ParagraphCache:
         self.line_index = {}
         
         self._lock = threading.Lock()
-        
-        # 初始化本地数据库
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        self._init_db()
-        self._load_recent_to_memory()
+        self.db_path = None
+
+        # 初始化本地数据库（失败时退化为纯内存缓存，不影响启动）
+        try:
+            if CACHE_DIR:
+                os.makedirs(CACHE_DIR, exist_ok=True)
+            self._init_db()
+            self.db_path = DB_PATH
+            self._load_recent_to_memory()
+        except Exception as e:
+            self.db_path = None
+            print(f"[缓存] 数据库初始化失败，使用内存缓存：{e}")
 
     def _init_db(self):
         """创建表结构和索引"""
+        if not DB_PATH:
+            return
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS cache (
@@ -46,6 +89,8 @@ class ParagraphCache:
 
     def _load_recent_to_memory(self):
         """启动时加载最近的部分数据到内存，避免全部加载卡顿"""
+        if not self.db_path:
+            return
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 cursor = conn.execute(
@@ -72,8 +117,10 @@ class ParagraphCache:
                 return item['translation']
                 
             # 2. 查数据库
+            if not self.db_path:
+                return None
             try:
-                with sqlite3.connect(DB_PATH) as conn:
+                with sqlite3.connect(self.db_path) as conn:
                     cur = conn.execute('SELECT translation, line_hashes FROM cache WHERE p_hash=?', (p_hash,))
                     row = cur.fetchone()
                     if row:
@@ -130,16 +177,17 @@ class ParagraphCache:
                     self.line_index.setdefault(lh, []).append(p_hash)
 
             # 写入数据库
-            try:
-                lh_str = ','.join(line_hashes) if line_hashes else ''
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.execute('''
-                        INSERT OR REPLACE INTO cache (p_hash, translation, line_hashes, last_access)
-                        VALUES (?, ?, ?, ?)
-                    ''', (p_hash, translation, lh_str, time.time()))
-                    conn.commit()
-            except Exception as e:
-                print(f"[缓存] 写入失败：{e}")
+            if self.db_path:
+                try:
+                    lh_str = ','.join(line_hashes) if line_hashes else ''
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute('''
+                            INSERT OR REPLACE INTO cache (p_hash, translation, line_hashes, last_access)
+                            VALUES (?, ?, ?, ?)
+                        ''', (p_hash, translation, lh_str, time.time()))
+                        conn.commit()
+                except Exception as e:
+                    print(f"[缓存] 写入失败：{e}")
 
             # 自动清理
             if self.auto_clean:
@@ -158,8 +206,10 @@ class ParagraphCache:
                         del self.line_index[lh]
 
         # 数据库清理（保留最近的 max_size 条）
+        if not self.db_path:
+            return
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with sqlite3.connect(self.db_path) as conn:
                 cur = conn.execute('SELECT COUNT(*) FROM cache')
                 count = cur.fetchone()[0]
                 if count > self.max_size:
@@ -183,8 +233,10 @@ class ParagraphCache:
 
     def size(self):
         """返回当前总条数（包含数据库）"""
+        if not self.db_path:
+            return len(self.paragraph_cache)
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with sqlite3.connect(self.db_path) as conn:
                 cur = conn.execute('SELECT COUNT(*) FROM cache')
                 return cur.fetchone()[0]
         except Exception:
@@ -192,10 +244,12 @@ class ParagraphCache:
 
     def get_file_size_mb(self):
         """获取数据库文件实际占用空间 (MB)"""
+        if not self.db_path:
+            return 0.0
         try:
-            size_bytes = os.path.getsize(DB_PATH)
+            size_bytes = os.path.getsize(self.db_path)
             # 加上 WAL 文件的大小
-            wal_path = DB_PATH + '-wal'
+            wal_path = self.db_path + '-wal'
             if os.path.exists(wal_path):
                 size_bytes += os.path.getsize(wal_path)
             return size_bytes / (1024 * 1024)
@@ -206,8 +260,10 @@ class ParagraphCache:
         with self._lock:
             self.paragraph_cache.clear()
             self.line_index.clear()
+            if not self.db_path:
+                return
             try:
-                with sqlite3.connect(DB_PATH) as conn:
+                with sqlite3.connect(self.db_path) as conn:
                     conn.execute('DELETE FROM cache')
                     conn.commit()
                     conn.execute('VACUUM')

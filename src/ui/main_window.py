@@ -76,6 +76,7 @@ from .constants import (
     TICK_MS, BOUNDARY_PADDING, CACHE_DEFAULT,
     CACHE_MIN, CACHE_MAX
 )
+from .download_task import DownloadTask
 from .widgets import CollapsibleFrame
 from .panels import DisplayPanelMixin, HotkeyPanelMixin
 
@@ -91,8 +92,11 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._ui_ready = False
         self._downloading = False
         self._downloader = None
+        self._download_task = None
         self._downloading_model_id = None
         self._downloading_variant = None
+        self._download_ok = False
+        self._download_status_text = ''
         self._current_model_label = None
         self._model_id_by_label = {}
 
@@ -832,6 +836,13 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             command=self._open_models_dir,
         ).pack(side='left', padx=2)
 
+        ctk.CTkButton(
+            lm_frame, text="刷新", width=55, height=26,
+            font=(FONT_NAME, 10),
+            fg_color='#6c757d', hover_color='#5a6268',
+            command=self._refresh_local_models,
+        ).pack(side='left', padx=2)
+
         # ⭐ 本地模型设备（本地模型行下方）
         device_frame = ctk.CTkFrame(self, height=1)
         device_frame.pack(fill='x', padx=10, pady=(0, 2))
@@ -1329,6 +1340,13 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self._update_local_model_device_hint()
             return
 
+        try:
+            from translation.local_models import get_model_roots
+            roots = [str(p) for p in get_model_roots()]
+            log.debug(f"[本地模型] 扫描目录：{roots}")
+        except Exception:
+            pass
+
         labels = []
         self._model_id_by_label = {}
 
@@ -1363,6 +1381,24 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             labels.append(label)
             self._model_id_by_label[label] = mid
 
+        if labels:
+            log.info(f"[本地模型] 检测到 {len(labels)} 个可用模型")
+            try:
+                from translation.api_config import sync_downloaded_models
+                result = sync_downloaded_models()
+                changed = result.get('added') or result.get('removed')
+                if changed:
+                    log.info(f"[本地模型] Provider 同步：{result}")
+                    try:
+                        self.translator.reload_config()
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.debug(f"[本地模型] Provider 同步失败：{e}")
+        else:
+            log.info(
+                "[本地模型] 未检测到可用模型（已扫描："
+                f"{roots if 'roots' in locals() else '未知'}）")
         if not labels:
             try:
                 self.local_model_selector.configure(values=['（未下载任何模型）'])
@@ -1451,10 +1487,22 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             dlg = ModelPickerDialog(
                 self, on_download=self._start_model_download)
             dlg.grab_set()
+            dlg.bind('<Destroy>', lambda e: self._on_model_dialog_destroyed(
+                e, dlg))
         except Exception as e:
             log.exception(f"[本地模型] 打开选择对话框失败：{e}")
             self.bottom_label.configure(
                 text=f"打开选择对话框失败：{e}")
+
+    def _on_model_dialog_destroyed(self, event, dialog):
+        """只在对话框本身销毁时刷新，避免每个子控件触发一次刷新。"""
+        if event.widget is not dialog:
+            return
+        try:
+            if self.winfo_exists():
+                self.after(300, self._refresh_local_models)
+        except Exception:
+            pass
 
     def _start_model_download(self, model_id: str, variant: str = 'cpu'):
         """从选择对话框触发的下载"""
@@ -1483,6 +1531,8 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._downloading = True
         self._downloading_model_id = model_id
         self._downloading_variant = variant
+        self._download_ok = False
+        self._download_status_text = ''
         self._downloader = ModelDownloader()
 
         try:
@@ -1494,49 +1544,81 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         except Exception:
             pass
 
-        def _safe_after(delay, fn):
+        downloader = self._downloader
+
+        def work(progress_cb, status_cb):
+            # 下载线程：只访问 downloader 和普通参数，不能碰 Tk。
+            return downloader.download(
+                model_id, variant=variant,
+                progress_cb=progress_cb, status_cb=status_cb)
+
+        task = DownloadTask(
+            self,
+            on_progress=self._update_model_download_progress,
+            on_status=self._on_model_download_status,
+            on_done=self._on_download_finished,
+        )
+        self._download_task = task
+
+        if not task.start(work, cancel_cb=downloader.cancel):
+            self._downloading = False
+            self._download_task = None
+            self._downloader = None
             try:
-                if self.winfo_exists():
-                    self.after(delay, fn)
+                self.local_model_btn.configure(
+                    text="下载", state='normal')
+                self.local_model_del_btn.configure(state='normal')
+                self.local_model_progress.set(0)
+                self.bottom_label.configure(
+                    text="❌ 无法启动下载线程，请查看日志",
+                    text_color='#cc0000')
             except Exception:
                 pass
 
-        def progress_cb(p):
-            _safe_after(0, lambda: self.local_model_progress.set(p))
-
-        def status_cb(s):
-            _safe_after(0, lambda: self.bottom_label.configure(text=s))
-
-        def worker():
-            try:
-                self._downloader.download(
-                    model_id, variant=variant,
-                    progress_cb=progress_cb, status_cb=status_cb)
-            except Exception as e:
-                log.exception(f"[本地模型] 下载线程异常：{e}")
-            finally:
-                _safe_after(0, self._on_download_finished)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_download_finished(self):
-        """下载完成或失败"""
+    def _update_model_download_progress(self, p, speed_mb=0.0,
+                                        done_bytes=0, total_bytes=0):
         try:
-            self._downloading = False
+            if not self.winfo_exists():
+                return
+            self.local_model_progress.set(p)
+            if total_bytes > 0:
+                detail = (f"{p * 100:5.1f}% · "
+                          f"{done_bytes / 1024 / 1024:.0f}/"
+                          f"{total_bytes / 1024 / 1024:.0f} MB · "
+                          f"{speed_mb:.1f} MB/s")
+            else:
+                detail = f"{p * 100:5.1f}% · {speed_mb:.1f} MB/s"
+            self.local_model_status.configure(text=detail)
+        except Exception:
+            pass
+
+    def _on_model_download_status(self, text):
+        self._download_status_text = text
+        try:
+            if self.winfo_exists():
+                self.bottom_label.configure(text=text)
+        except Exception:
+            pass
+
+    def _on_download_finished(self, ok=False, result=None,
+                              error=None, cancelled=False):
+        """下载完成或失败（始终在 Tk 主线程执行）"""
+        self._downloading = False
+        self._download_ok = bool(ok)
+        self._download_task = None
+        self._downloader = None
+        if error:
+            self._download_status_text = f"❌ 下载异常：{error[:120]}"
+
+        try:
             if self.winfo_exists():
                 self.local_model_btn.configure(state='normal')
-                self.local_model_progress.set(1.0)
+                if self._download_ok:
+                    self.local_model_progress.set(1.0)
         except Exception:
             pass
 
-        was_cancelled = False
-        try:
-            if self._downloader and self._downloader.is_cancelled():
-                was_cancelled = True
-        except Exception:
-            pass
-
-        if was_cancelled:
+        if cancelled:
             try:
                 if self.winfo_exists():
                     self.bottom_label.configure(text="下载已取消")
@@ -1552,6 +1634,19 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         variant = getattr(self, '_downloading_variant', 'cpu')
         self._downloading_model_id = None
         self._downloading_variant = None
+
+        if not getattr(self, '_download_ok', False):
+            try:
+                if self.winfo_exists():
+                    self.bottom_label.configure(
+                        text=self._download_status_text
+                        or "❌ 下载失败，请查看日志",
+                        text_color='#cc0000')
+                    self.local_model_progress.set(0)
+                    self.after(800, self._refresh_local_models)
+            except Exception:
+                pass
+            return
 
         # ⭐ 下载完成后，根据 variant 自动设置设备
         try:
@@ -1657,17 +1752,20 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             from ui.model_manager_dialog import ModelManagerDialog
             dlg = ModelManagerDialog(self)
             dlg.grab_set()
-            dlg.bind('<Destroy>', lambda e: self.after(
-                300, self._refresh_local_models))
+            dlg.bind('<Destroy>', lambda e: self._on_model_dialog_destroyed(
+                e, dlg))
         except Exception as e:
             log.exception(f"[本地模型] 打开管理面板失败：{e}")
 
     def _open_models_dir(self):
         try:
             from translation.local_models import open_models_dir
-            ok = open_models_dir()
+            label = getattr(self, '_current_model_label', None)
+            mid = getattr(self, '_model_id_by_label', {}).get(label)
+            ok = open_models_dir(mid)
             if ok:
-                self.bottom_label.configure(text="已打开模型目录")
+                self.bottom_label.configure(
+                    text=f"已打开模型目录：{mid}" if mid else "已打开模型目录")
             else:
                 self.bottom_label.configure(text="⚠️ 打开目录失败")
         except Exception as e:

@@ -10,6 +10,7 @@ import os
 import sys
 import atexit
 import logging
+import tempfile
 import threading
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -38,6 +39,7 @@ _initialized = False
 _init_lock = threading.Lock()
 _start_time = None
 _current_log_path = None
+_active_log_dir = None
 _session_id = None
 _exit_registered = False
 # =================================================
@@ -49,15 +51,32 @@ def _build_log_filename():
     return f"{LOG_PREFIX}{ts}{LOG_EXT}"
 
 
-def _clean_old_logs():
+def _candidate_log_dirs():
+    """依次尝试的日志目录。
+
+    某些安全软件会阻止未签名程序写入用户目录，导致日志初始化失败。
+    日志不应影响程序启动，因此依次回退到临时目录和程序所在目录。
+    """
+    yield LOG_DIR
+    yield os.path.join(tempfile.gettempdir(), 'LST', 'logs')
+
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    yield os.path.join(base_dir, 'logs')
+
+
+def _clean_old_logs(log_dir=None):
     """清理旧日志，只保留最近 MAX_LOG_FILES 份"""
+    log_dir = log_dir or _active_log_dir or LOG_DIR
     try:
-        if not os.path.isdir(LOG_DIR):
+        if not os.path.isdir(log_dir):
             return
         files = []
-        for fn in os.listdir(LOG_DIR):
+        for fn in os.listdir(log_dir):
             if fn.startswith(LOG_PREFIX) and LOG_EXT in fn:
-                full = os.path.join(LOG_DIR, fn)
+                full = os.path.join(log_dir, fn)
                 if os.path.isfile(full):
                     files.append((os.path.getmtime(full), full))
         # 按修改时间倒序（新的在前）
@@ -72,10 +91,9 @@ def _clean_old_logs():
         pass
 
 
-def _build_file_handler():
-    os.makedirs(LOG_DIR, exist_ok=True)
+def _build_file_handler(log_path):
     handler = RotatingFileHandler(
-        _current_log_path,
+        log_path,
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT,
         encoding='utf-8',
@@ -86,7 +104,13 @@ def _build_file_handler():
 
 
 def _build_console_handler():
-    handler = logging.StreamHandler(sys.stdout)
+    # PyInstaller 的 windowed 模式下 stdout/stderr 可能都是 None；
+    # 此时退化为 NullHandler，避免日志系统本身抛异常。
+    stream = sys.stdout or sys.stderr
+    if stream is None:
+        return logging.NullHandler()
+
+    handler = logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     handler.setLevel(LOG_LEVEL)
     return handler
@@ -135,7 +159,7 @@ def _on_exit():
 def setup(name='app', level=logging.INFO, to_console=True):
     """初始化日志系统（幂等）"""
     global _initialized, _start_time, _current_log_path, _session_id
-    global _exit_registered
+    global _active_log_dir, _exit_registered
 
     with _init_lock:
         if _initialized:
@@ -145,10 +169,12 @@ def setup(name='app', level=logging.INFO, to_console=True):
         if _start_time is None:
             _start_time = datetime.now()
             _session_id = _start_time.strftime('%Y%m%d_%H%M%S')
-            _current_log_path = os.path.join(LOG_DIR, _build_log_filename())
 
-        os.makedirs(LOG_DIR, exist_ok=True)
-        _clean_old_logs()
+        log_filename = (
+            os.path.basename(_current_log_path)
+            if _current_log_path
+            else _build_log_filename()
+        )
 
         root = logging.getLogger()
         root.setLevel(level)
@@ -156,7 +182,27 @@ def setup(name='app', level=logging.INFO, to_console=True):
         for h in list(root.handlers):
             root.removeHandler(h)
 
-        root.addHandler(_build_file_handler())
+        # 日志目录可能被安全软件拦截；逐级回退，且绝不阻断程序启动。
+        file_handler = None
+        last_error = None
+        for log_dir in _candidate_log_dirs():
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, log_filename)
+                handler = _build_file_handler(log_path)
+            except OSError as exc:
+                last_error = exc
+                continue
+
+            _active_log_dir = log_dir
+            _current_log_path = log_path
+            file_handler = handler
+            break
+
+        if file_handler is not None:
+            root.addHandler(file_handler)
+            _clean_old_logs(_active_log_dir)
+
         if to_console:
             root.addHandler(_build_console_handler())
 
@@ -169,7 +215,9 @@ def setup(name='app', level=logging.INFO, to_console=True):
         logger.info("=" * 60)
         logger.info(f"会话开始 | Session ID: {_session_id}")
         logger.info(f"启动时间：{_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"日志文件：{_current_log_path}")
+        logger.info(f"日志文件：{_current_log_path or '（未能创建文件日志）'}")
+        if file_handler is None:
+            logger.warning(f"无法创建日志文件，已跳过文件日志：{last_error}")
         logger.info("=" * 60)
 
         # 只注册一次退出回调
@@ -212,11 +260,12 @@ def log_exception(msg, name='app'):
 
 def get_log_path():
     """当前会话的日志文件路径"""
-    return _current_log_path or os.path.join(LOG_DIR, 'app.log')
+    log_dir = _active_log_dir or LOG_DIR
+    return _current_log_path or os.path.join(log_dir, 'app.log')
 
 
 def get_log_dir():
-    return LOG_DIR
+    return _active_log_dir or LOG_DIR
 
 
 def get_session_id():
@@ -233,7 +282,8 @@ def clear_logs():
     """清空所有日志文件"""
     global _initialized
     try:
-        if not os.path.isdir(LOG_DIR):
+        log_dir = get_log_dir()
+        if not os.path.isdir(log_dir):
             return False
 
         # 关闭 handler 释放文件锁
@@ -248,10 +298,10 @@ def clear_logs():
 
         # 删除所有 app_*.log 及其轮转备份
         removed = 0
-        for fname in os.listdir(LOG_DIR):
+        for fname in os.listdir(log_dir):
             if fname.startswith(LOG_PREFIX) and LOG_EXT in fname:
                 try:
-                    os.remove(os.path.join(LOG_DIR, fname))
+                    os.remove(os.path.join(log_dir, fname))
                     removed += 1
                 except Exception:
                     pass
@@ -270,13 +320,14 @@ def clear_logs():
 def open_log_dir():
     """用资源管理器打开日志目录"""
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        log_dir = get_log_dir()
+        os.makedirs(log_dir, exist_ok=True)
         if sys.platform == 'win32':
-            os.startfile(LOG_DIR)
+            os.startfile(log_dir)
         elif sys.platform == 'darwin':
-            os.system(f'open "{LOG_DIR}"')
+            os.system(f'open "{log_dir}"')
         else:
-            os.system(f'xdg-open "{LOG_DIR}"')
+            os.system(f'xdg-open "{log_dir}"')
         return True
     except Exception as e:
         print(f"[日志] 打开目录失败：{e}")

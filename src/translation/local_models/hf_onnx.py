@@ -96,7 +96,11 @@ class HFONNXModel(BaseTranslationModel):
             
             try:
                 from transformers import AutoTokenizer
-                from optimum.onnxruntime import ORTModelForSeq2SeqLM
+                # 直接导入具体模块，避免 optimum 的 _LazyModule 在
+                # PyInstaller 冻结环境中解析不到模块。
+                from optimum.onnxruntime.modeling_seq2seq import (
+                    ORTModelForSeq2SeqLM,
+                )
                 self._tokenizer = AutoTokenizer.from_pretrained(str(model_path))
             except Exception as e:
                 self.last_error = f"初始化失败：{e}"

@@ -2,8 +2,8 @@
 所有版本号统一在这里修改
 """
 
-__version__ = "1.40.5"
-__version_tuple__ = (1, 40, 5)
+__version__ = "1.40.6"
+__version_tuple__ = (1, 40, 6)
 __author__ = "twelwel"
 __email__ = "2033697674@qq.com"
 __license__ = "MIT"
@@ -15,6 +15,9 @@ REPO_URL = "https://github.com/twelwel/LST"
 RELEASE_URL = REPO_URL + "/releases"
 
 VERSION_INFO = {
+    "1.40.6": "v1.40.6：修复下载模型时 UI 崩溃/卡死；"
+              "下载线程与 Tk 主线程解耦；"
+              "完善模型目录检测、下载进度与打包版兼容",
     "1.40.5": "v1.40.5：DirectML 自动选择独显（不再默认核显）；"
               "修复运行中卸载/切换本地模型导致的 0xC0000005 崩溃；"
               "OCR 与翻译均显式指定高性能显卡；限制本地模型重复生成",

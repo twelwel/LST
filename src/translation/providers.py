@@ -251,9 +251,15 @@ class LocalModelProvider(BaseProvider):
             return self._err(f'未知模型：{model_id}')
 
         if not instance.is_loaded:
+            # 已下载但加载失败时，不能误导用户去重新下载；
+            # 把 Factory / 模型类的真实原因带到界面。
+            detail = (getattr(instance, 'last_error', '') or '').strip()
+            if detail:
+                return self._err(
+                    f'本地模型加载失败：{model_id}（{detail}）')
             return self._err(
                 f'模型未加载：{model_id}。'
-                f'请到「本地模型」面板下载')
+                f'请检查模型文件是否完整（config.json 与 onnx 权重）')
 
         if not instance.supports(from_lang, to_lang):
             return self._err(

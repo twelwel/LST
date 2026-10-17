@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 
 from logger import get_logger
-from .downloader import get_models_dir, iter_models_dirs, has_model_weights
+from .downloader import get_models_dir, get_model_roots, has_model_weights
 
 
 log = get_logger('local_models.cache')
@@ -17,7 +17,7 @@ class ModelCacheManager:
         self.max_size_bytes = int(max_size_gb * 1024 ** 3)
 
     def _dirs(self):
-        dirs = list(iter_models_dirs())
+        dirs = list(get_model_roots())
         return dirs or [self.cache_dir]
 
     def get_cache_size(self) -> int:
