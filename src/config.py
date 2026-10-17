@@ -35,8 +35,8 @@ PERFORMANCE_MODES = {
     'fast': {
         'name': '快',
         'scan_interval': 0.15,
-        'change_ratio_threshold': 0.02,
-        'full_frame_ratio': 0.15,
+        'change_ratio_threshold': 0.00015,
+        'full_frame_ratio': 0.10,
         'bbox_padding': 80,
         'max_ocr_width': 1600,
         'max_ocr_height': 700,
@@ -45,8 +45,8 @@ PERFORMANCE_MODES = {
     'medium': {
         'name': '中',
         'scan_interval': 0.30,
-        'change_ratio_threshold': 0.03,
-        'full_frame_ratio': 0.25,
+        'change_ratio_threshold': 0.0002,
+        'full_frame_ratio': 0.12,
         'bbox_padding': 60,
         'max_ocr_width': 1400,
         'max_ocr_height': 600,
@@ -55,8 +55,8 @@ PERFORMANCE_MODES = {
     'slow': {
         'name': '慢',
         'scan_interval': 0.80,
-        'change_ratio_threshold': 0.05,
-        'full_frame_ratio': 0.35,
+        'change_ratio_threshold': 0.0003,
+        'full_frame_ratio': 0.15,
         'bbox_padding': 40,
         'max_ocr_width': 1000,
         'max_ocr_height': 500,
@@ -67,8 +67,12 @@ PERFORMANCE_MODES = {
 DEFAULT_MODE = 'medium'
 
 # ==================== 优化功能开关 ====================
-DEFAULT_ENABLE_FRAME_DIFF = True
-DEFAULT_ENABLE_BLOCK_OCR = True
+# 帧差检测与分块 OCR 合并为“智能 OCR”：
+# 开启 → 只在画面变化时 OCR，并只识别变化的区块；
+# 关闭 → 每帧整屏 OCR。
+DEFAULT_ENABLE_SMART_OCR = True
+DEFAULT_ENABLE_FRAME_DIFF = DEFAULT_ENABLE_SMART_OCR
+DEFAULT_ENABLE_BLOCK_OCR = DEFAULT_ENABLE_SMART_OCR
 DEFAULT_ENABLE_FILTER = True
 DEFAULT_ENABLE_ASYNC_TRANSLATE = True
 DEFAULT_ENABLE_WINDOW_POOL = True
@@ -319,3 +323,8 @@ LOCAL_MODEL_DEVICES = {
 }
 
 DEFAULT_LOCAL_MODEL_DEVICE = 'auto'
+
+# ==================== 缓存范围 ====================
+CACHE_MIN = 100
+CACHE_MAX = 5000
+CACHE_DEFAULT = 1000

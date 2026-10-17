@@ -1,464 +1,366 @@
-"""模型下载器（ONNX 版，只下载，不转换）
-
-支持两种变体：
-- quantized / q4（默认，约 40MB~764MB）
-- fp32（约 800MB~1GB，GPU 友好）
-"""
+"""模型下载器（ONNX 版，只下载，不转换，含完整校验和实时速度监控）"""
 
 import os
 import sys
 import shutil
 import threading
+import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, List
 
 from logger import get_logger
-from .registry import get_registry_entry, MODEL_REGISTRY
-
+from .registry import get_registry_entry
 
 log = get_logger('local_models.downloader')
 
-
-# ==================== 下载白名单 ====================
-
+# ==================== 文件白名单 ====================
 _COMMON_PATTERNS = [
-    'config.json',
-    'generation_config.json',
-    'tokenizer.json',
-    'tokenizer_config.json',
-    'added_tokens.json',
-    'vocab.json',
-    'special_tokens_map.json',
-    'source.spm',
-    'target.spm',
-    '*.model',
+    'config.json', 'generation_config.json', 'tokenizer.json',
+    'tokenizer_config.json', 'vocab.json', 'special_tokens_map.json',
+    'source.spm', 'target.spm', '*.model',
 ]
 
-# Opus-MT
-QUANTIZED_PATTERNS = _COMMON_PATTERNS + [
+OPUS_INT8_PATTERNS = _COMMON_PATTERNS + [
     'onnx/encoder_model_quantized.onnx',
     'onnx/decoder_model_quantized.onnx',
     'onnx/decoder_with_past_model_quantized.onnx',
 ]
-
-FP32_PATTERNS = _COMMON_PATTERNS + [
+OPUS_FP32_PATTERNS = _COMMON_PATTERNS + [
     'onnx/encoder_model.onnx',
     'onnx/decoder_model.onnx',
     'onnx/decoder_with_past_model.onnx',
 ]
 
-# Gemma3：下载整个 onnx 目录
 GEMMA3_Q4_PATTERNS = _COMMON_PATTERNS + [
-    'onnx/model_q4.onnx',
-    'onnx/model_q4.onnx_data',
-    'onnx/model_q4.onnx_data_0',
-    'onnx/model_q4.onnx_data_1',
-    'onnx/model_q4.onnx_data_2',
-    'onnx/model_q4.onnx_data_3',
-    'onnx/model_quantized.onnx',
+    'onnx/model_q4.onnx', 'onnx/model_q4.onnx_data*',
 ]
-
 GEMMA3_FP32_PATTERNS = _COMMON_PATTERNS + [
-    'onnx/model.onnx',
-    'onnx/model.onnx_data',
-    'onnx/model.onnx_data_0',
-    'onnx/model.onnx_data_1',
-    'onnx/model.onnx_data_2',
-    'onnx/model.onnx_data_3',
-    'onnx/model_fp16.onnx',
+    'onnx/model.onnx', 'onnx/model.onnx_data*',
 ]
 
 
-# ==================== 全局下载锁 ====================
-
+# ==================== 全局锁 ====================
 _download_lock = threading.Lock()
 _downloading_model: Optional[str] = None
 
-
 def is_downloading() -> bool:
-    with _download_lock:
-        return _downloading_model is not None
-
+    with _download_lock: return _downloading_model is not None
 
 def get_downloading_model() -> Optional[str]:
-    with _download_lock:
-        return _downloading_model
-
+    with _download_lock: return _downloading_model
 
 def _set_downloading(model_id: Optional[str]):
     global _downloading_model
-    with _download_lock:
-        _downloading_model = model_id
+    with _download_lock: _downloading_model = model_id
 
 
-# ==================== 路径 ====================
-
+# ==================== 路径管理 ====================
 def get_app_root() -> Path:
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).resolve().parent
-    else:
-        return Path(__file__).resolve().parent.parent.parent.parent
-
-
-def get_app_models_dir() -> Path:
-    """软件目录下的 models/"""
-    return get_app_root() / 'models'
-
+    return Path(__file__).resolve().parent.parent.parent.parent
 
 def get_user_models_dir() -> Path:
-    """用户目录下的 models/（软件目录不可写时的回退位置）"""
-    return Path(os.path.expanduser('~/.screen_translator/models'))
-
+    fallback = Path(os.path.expanduser('~/.screen_translator/models'))
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 def get_models_dir() -> Path:
-    """首选写入目录（软件目录优先，不可写则回退用户目录）"""
-    base = get_app_models_dir()
+    base = get_app_root()
+    models_dir = base / 'models'
     try:
-        base.mkdir(parents=True, exist_ok=True)
-        test_file = base / '.write_test'
+        models_dir.mkdir(parents=True, exist_ok=True)
+        test_file = models_dir / '.write_test'
         test_file.write_text('ok')
         test_file.unlink()
-        return base
-    except Exception as e:
-        log.warning(f"[下载] 软件目录无写权限：{e}，回退用户目录")
-        fallback = get_user_models_dir()
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-
-
-def iter_models_dirs():
-    """所有候选模型目录（首选在前，去重，仅返回已存在的）
-
-    ⭐ 关键：下载位置与读取位置可能不同（软件目录 / 用户回退目录），
-    只认一个目录会导致「明明下载了却找不到模型」。
-    """
-    seen = set()
-    for d in (get_models_dir(), get_user_models_dir(),
-              get_app_models_dir()):
-        try:
-            key = str(d.resolve()).lower()
-        except Exception:
-            key = str(d).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            if d.is_dir():
-                yield d
-        except Exception:
-            continue
-
-
-def has_model_weights(path) -> bool:
-    """目录里是否存在真实模型权重（ONNX / CT2）
-
-    只看 config.json 会把「只下了一半」的目录误判为已下载。
-    """
-    p = Path(path)
-    if not p.is_dir():
-        return False
-    try:
-        for f in p.rglob('*.onnx'):
-            try:
-                if f.stat().st_size > 0:
-                    return True
-            except Exception:
-                continue
+        return models_dir
     except Exception:
-        pass
-    try:
-        if (p / 'model.bin').exists():
-            return True
-    except Exception:
-        pass
-    return False
+        return get_user_models_dir()
 
+def get_app_models_dir() -> Path: return get_models_dir()
 
-def find_model_dir(model_id: str):
-    """在所有候选目录中查找含真实权重的模型目录"""
-    if not model_id:
-        return None
-    for base in iter_models_dirs():
-        p = base / model_id
-        try:
-            if p.is_dir() and has_model_weights(p):
-                return p
-        except Exception:
-            continue
-    return None
-
-
-def dir_size_bytes(path) -> int:
-    """目录总字节数（含下载中的临时分片）"""
-    total = 0
-    try:
-        for f in Path(path).rglob('*'):
-            try:
-                if f.is_file():
-                    total += f.stat().st_size
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return total
-
+def iter_models_dirs() -> List[Path]:
+    base = get_models_dir()
+    if not base.exists(): return []
+    return [d for d in base.iterdir() if d.is_dir() and not d.name.startswith('.')]
 
 def get_model_path(model_id: str) -> Optional[Path]:
-    meta = get_registry_entry(model_id)
-    if not meta:
-        return None
-    return find_model_dir(model_id)
+    path = get_models_dir() / model_id
+    if path.exists() and (path / 'config.json').exists():
+        return path
+    return None
 
-
+# ==================== 状态检测 ====================
 def is_downloaded(model_id: str) -> bool:
     return get_model_path(model_id) is not None
 
 
-def is_quantized_downloaded(model_id: str) -> bool:
-    for base in iter_models_dirs():
-        p = base / model_id
-        if not p.is_dir():
+def list_downloaded_ids() -> List[str]:
+    """已下载且包含真实 ONNX 权重的内置模型 id（供 API 配置自动同步）。"""
+    from .registry import MODEL_REGISTRY
+    result = []
+    for mid in MODEL_REGISTRY:
+        path = get_models_dir() / mid
+        if not path.exists() or not (path / 'config.json').exists():
             continue
-        # Opus-MT int8
-        if (p / 'onnx' / 'encoder_model_quantized.onnx').exists():
-            return True
-        # Gemma3 q4
-        if (p / 'onnx' / 'model_q4.onnx').exists():
-            return True
-        if (p / 'onnx' / 'model_quantized.onnx').exists():
-            return True
-    return False
-
-
-def is_fp32_downloaded(model_id: str) -> bool:
-    for base in iter_models_dirs():
-        p = base / model_id
-        if not p.is_dir():
-            continue
-        # Opus-MT FP32
-        if (p / 'onnx' / 'encoder_model.onnx').exists():
-            return True
-        # Gemma3 FP32
-        if (p / 'onnx' / 'model.onnx').exists():
-            return True
-    return False
-
-
-def list_downloaded_ids() -> set:
-    """扫描全部候选目录，返回已下载且含权重的内置模型 id 集合"""
-    found = set()
-    for base in iter_models_dirs():
         try:
-            for d in base.iterdir():
-                if not d.is_dir() or d.name.startswith('.'):
-                    continue
-                if d.name not in MODEL_REGISTRY:
-                    continue
-                if has_model_weights(d):
-                    found.add(d.name)
+            if has_model_weights(path):
+                result.append(mid)
         except Exception:
             continue
-    return found
+    return result
 
+def is_cpu_variant_downloaded(model_id: str) -> bool:
+    p = get_models_dir() / model_id
+    if not p.exists(): return False
+    return ((p / 'onnx' / 'encoder_model_quantized.onnx').exists() or 
+            (p / 'onnx' / 'model_q4.onnx').exists())
+
+def is_gpu_variant_downloaded(model_id: str) -> bool:
+    p = get_models_dir() / model_id
+    if not p.exists(): return False
+    return ((p / 'onnx' / 'encoder_model.onnx').exists() or 
+            (p / 'onnx' / 'model.onnx').exists())
+
+def is_quantized_downloaded(model_id: str) -> bool: return is_cpu_variant_downloaded(model_id)
+def is_fp32_downloaded(model_id: str) -> bool: return is_gpu_variant_downloaded(model_id)
 
 def open_models_dir() -> bool:
     try:
-        # 优先打开真正存放模型的目录，否则打开首选写入目录
-        target = get_models_dir()
-        for base in iter_models_dirs():
-            try:
-                has_any = any(
-                    d.is_dir() and not d.name.startswith('.')
-                    and has_model_weights(d)
-                    for d in base.iterdir()
-                )
-            except Exception:
-                has_any = False
-            if has_any:
-                target = base
-                break
-
-        path = str(target)
-        if sys.platform == 'win32':
-            os.startfile(path)
-        elif sys.platform == 'darwin':
-            os.system(f'open "{path}"')
-        else:
-            os.system(f'xdg-open "{path}"')
+        path = str(get_models_dir())
+        if sys.platform == 'win32': os.startfile(path)
+        elif sys.platform == 'darwin': os.system(f'open "{path}"')
+        else: os.system(f'xdg-open "{path}"')
         return True
-    except Exception as e:
-        log.error(f"[下载] 打开目录失败：{e}")
+    except Exception: return False
+
+
+# ==================== 完整性校验 ====================
+def validate_model_files(model_id: str, variant: str) -> tuple[bool, str]:
+    p = get_models_dir() / model_id
+    if not p.exists(): return False, "目录不存在"
+
+    if not (p / 'config.json').exists():
+        return False, "缺少配置文件 (config.json)"
+
+    if variant == 'cpu':
+        if (p / 'onnx' / 'encoder_model_quantized.onnx').exists():
+            if (p / 'onnx' / 'encoder_model_quantized.onnx').stat().st_size < 1024:
+                return False, "文件损坏"
+        elif (p / 'onnx' / 'model_q4.onnx').exists():
+            if (p / 'onnx' / 'model_q4.onnx').stat().st_size < 1024:
+                return False, "文件损坏"
+        else:
+            return False, "未找到 CPU 模型权重"
+            
+    elif variant == 'gpu':
+        if (p / 'onnx' / 'encoder_model.onnx').exists():
+            if (p / 'onnx' / 'encoder_model.onnx').stat().st_size < 1024:
+                return False, "文件损坏"
+        elif (p / 'onnx' / 'model.onnx').exists():
+            if (p / 'onnx' / 'model.onnx').stat().st_size < 1024:
+                return False, "文件损坏"
+        else:
+            return False, "未找到 GPU 模型权重"
+
+    return True, "完整"
+
+
+# ==================== 辅助：判断目录是否含真实权重 ====================
+def has_model_weights(model_dir) -> bool:
+    """目录内是否存在真实 ONNX 权重（用于区分完整模型与下载残骸）"""
+    try:
+        d = Path(model_dir)
+        if not d.is_dir():
+            return False
+        # 下载残骸也可能留下几百 KB 的 .onnx 占位文件，按 1MB 过滤
+        return any(f.is_file() and f.stat().st_size > 1024 * 1024
+                   for f in d.rglob('*.onnx'))
+    except Exception:
         return False
 
 
+# ==================== 辅助：计算目录大小 ====================
+def _get_dir_size(path: Path) -> int:
+    total = 0
+    if not path.exists(): return 0
+    for f in path.rglob('*'):
+        if f.is_file():
+            try: total += f.stat().st_size
+            except: pass
+    return total
+
+
+# ==================== 缓存管理 ====================
+class ModelCacheManager:
+    def __init__(self, max_size_gb: float = 5.0):
+        self.cache_dir = get_models_dir()
+        self.max_size_bytes = int(max_size_gb * 1024 ** 3)
+
+    def get_cache_size(self) -> int:
+        return _get_dir_size(self.cache_dir)
+
+    def get_cache_size_mb(self) -> float:
+        return self.get_cache_size() / (1024 * 1024)
+
+    def list_models(self) -> list:
+        result = []
+        if not self.cache_dir.exists(): return result
+        for d in self.cache_dir.iterdir():
+            if not d.is_dir() or d.name.startswith('.'): continue
+            has_model = ((d / 'config.json').exists() or any(d.rglob('*.onnx')))
+            if not has_model: continue
+            try:
+                size = sum(f.stat().st_size for f in d.rglob('*') if f.is_file())
+                result.append({
+                    'id': d.name, 'path': str(d),
+                    'size_mb': size / (1024 * 1024),
+                    'mtime': d.stat().st_mtime,
+                })
+            except Exception: continue
+        return result
+
+    def delete_model(self, model_id: str) -> bool:
+        path = self.cache_dir / model_id
+        if not path.exists(): return False
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            return True
+        except Exception as e:
+            log.error(f'[缓存] 删除失败：{e}')
+            return False
+
+
 # ==================== 下载器 ====================
-
 class ModelDownloader:
-
     def __init__(self):
         self._cancel = threading.Event()
         self._model_id: Optional[str] = None
-        self._variant: str = 'quantized'
 
-    def cancel(self):
-        self._cancel.set()
+    def cancel(self): self._cancel.set()
+    def is_cancelled(self): return self._cancel.is_set()
 
-    def is_cancelled(self):
-        return self._cancel.is_set()
-
-    def download(self, model_id: str,
-                 variant: str = 'quantized',
-                 progress_cb: Optional[Callable] = None,
-                 status_cb: Optional[Callable] = None
-                 ) -> Optional[Path]:
-
+    def download(self, model_id: str, variant: str = 'cpu',
+                 progress_cb: Optional[Callable[[float, float], None]] = None,
+                 status_cb: Optional[Callable[[str], None]] = None) -> Optional[Path]:
+        """
+        progress_cb(p: float, speed_mb: float) -> None
+        """
         meta = get_registry_entry(model_id)
         if not meta:
-            if status_cb:
-                status_cb(f'未知模型：{model_id}')
+            if status_cb: status_cb(f'未知模型：{model_id}')
             return None
-
         if is_downloading():
-            other = get_downloading_model()
-            if status_cb:
-                status_cb(f'已有下载任务：{other}')
+            if status_cb: status_cb(f'已有任务进行中：{get_downloading_model()}')
             return None
 
-        if variant not in ('quantized', 'fp32'):
-            variant = 'quantized'
+        if variant not in ('cpu', 'gpu'):
+            variant = 'cpu'
 
         self._cancel.clear()
         self._model_id = model_id
-        self._variant = variant
         _set_downloading(f"{model_id} ({variant})")
 
         try:
-            return self._do_download(
-                model_id, meta, variant, progress_cb, status_cb)
+            return self._do_download(model_id, meta, variant, progress_cb, status_cb)
         finally:
             _set_downloading(None)
 
-    def _do_download(self, model_id: str, meta: dict,
-                     variant: str,
-                     progress_cb: Optional[Callable],
-                     status_cb: Optional[Callable]) -> Optional[Path]:
-
-        base = get_models_dir()
-        dest = base / model_id
+    def _do_download(self, model_id, meta, variant, progress_cb, status_cb):
+        dest = get_models_dir() / model_id
         dest.mkdir(parents=True, exist_ok=True)
-
+        
         try:
             from huggingface_hub import snapshot_download
         except ImportError:
-            if status_cb:
-                status_cb('缺少 huggingface_hub，请 pip install '
-                          'huggingface_hub')
+            if status_cb: status_cb('缺少 huggingface_hub')
             return None
 
-        os.environ.setdefault('HF_ENDPOINT',
-                              'https://hf-mirror.com')
-
+        os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
         loader = meta.get('loader', 'hf_onnx')
 
-        # ⭐ 根据 loader + variant 选择 patterns + 预期体积
         if loader == 'gemma3':
-            if variant == 'fp32':
-                patterns = GEMMA3_FP32_PATTERNS
-                expected_mb = meta.get('fp32_mb', 1124)
-                variant_label = 'GPU 版（FP32）'
+            if variant == 'gpu':
+                patterns, size_mb, v_label = GEMMA3_FP32_PATTERNS, 1024, 'GPU版 (FP32)'
             else:
-                patterns = GEMMA3_Q4_PATTERNS
-                expected_mb = meta.get('download_mb', 802)
-                variant_label = '标准版（q4）'
+                patterns, size_mb, v_label = GEMMA3_Q4_PATTERNS, 764, 'CPU版 (q4)'
         else:
-            if variant == 'fp32':
-                patterns = FP32_PATTERNS
-                expected_mb = meta.get('fp32_mb', 647)
-                variant_label = 'GPU 版（FP32）'
+            if variant == 'gpu':
+                patterns, size_mb, v_label = OPUS_FP32_PATTERNS, 800, 'GPU版 (FP32)'
             else:
-                patterns = QUANTIZED_PATTERNS
-                expected_mb = meta.get(
-                    'download_mb', meta.get('size_mb', 0)) or 171
-                variant_label = '标准版（int8）'
+                patterns, size_mb, v_label = OPUS_INT8_PATTERNS, 40, 'CPU版 (int8)'
 
-        # ⭐ 进度轮询：snapshot_download 不提供进度回调，
-        #    靠定时统计目标目录体积来驱动进度条，避免界面看起来卡死
-        stop_evt = threading.Event()
+        # ⭐ 启动监控线程
+        stop_monitor = threading.Event()
+        
+        def monitor_task():
+            last_size = _get_dir_size(dest)
+            last_time = time.time()
+            total_bytes = max(size_mb * 1024 * 1024, last_size)
 
-        def _monitor():
-            while not stop_evt.wait(0.6):
-                got_mb = dir_size_bytes(dest) / (1024 * 1024)
-                if progress_cb and expected_mb > 0:
-                    try:
-                        progress_cb(min(0.95, got_mb / expected_mb))
-                    except Exception:
-                        pass
-                if status_cb:
-                    try:
-                        if expected_mb > 0:
-                            status_cb(f'下载中… {got_mb:.0f} / '
-                                      f'~{expected_mb:.0f} MB')
-                        else:
-                            status_cb(f'下载中… {got_mb:.0f} MB')
-                    except Exception:
-                        pass
+            while not stop_monitor.is_set():
+                time.sleep(0.8) # 每 0.8 秒刷新一次
+                if stop_monitor.is_set(): break
+                
+                current_size = _get_dir_size(dest)
+                now = time.time()
+                dt = now - last_time
+                
+                if dt > 0:
+                    speed_bytes = (current_size - last_size) / dt
+                    speed_mb = speed_bytes / (1024 * 1024)
+                    
+                    # 动态更新 total_bytes，防止预估偏小导致进度条超出
+                    if current_size > total_bytes: total_bytes = current_size
+                    
+                    progress = current_size / total_bytes if total_bytes > 0 else 0
+                    if progress > 0.99: progress = 0.99 # 预留 1% 给校验
+                    
+                    if progress_cb:
+                        try:
+                            progress_cb(progress, speed_mb)
+                        except Exception:
+                            pass
+                            
+                    last_size = current_size
+                    last_time = now
+                    
+        mon_thread = threading.Thread(target=monitor_task, daemon=True)
+        mon_thread.start()
 
         try:
-            if status_cb:
-                status_cb(
-                    f"下载 {meta['name']} · {variant_label}"
-                    f"（约 {expected_mb:.0f} MB）...")
-            log.info(f"[下载] {model_id} ({variant}) ← {meta['hf_repo']}"
-                     f" | 预期 {expected_mb:.0f} MB")
-
-            mon = threading.Thread(target=_monitor, daemon=True)
-            mon.start()
-            try:
-                snapshot_download(
-                    repo_id=meta['hf_repo'],
-                    local_dir=str(dest),
-                    allow_patterns=patterns,
-                    max_workers=4,
-                )
-            finally:
-                stop_evt.set()
-
+            if status_cb: status_cb(f"下载 {meta['name']} · {v_label}...")
+            log.info(f"[下载] {model_id} ({variant}) ← {meta['hf_repo']}")
+            
+            snapshot_download(
+                repo_id=meta['hf_repo'],
+                local_dir=str(dest),
+                allow_patterns=patterns,
+                resume_download=True,
+                max_workers=4,
+            )
+            
+            stop_monitor.set() # 停止监控
+            
             if self._cancel.is_set():
-                self._cleanup(dest, status_cb, '已取消')
+                if status_cb: status_cb('已取消')
                 return None
 
-            # ⭐ 用真实权重校验：只看 config.json 会把半成品当成功
-            if not has_model_weights(dest):
-                log.error("[下载] 缺少 onnx 权重，判定下载失败")
-                if status_cb:
-                    status_cb('❌ 模型文件不完整（缺少 onnx 权重）')
-                self._cleanup(dest, status_cb)
+            if status_cb: status_cb("正在校验文件完整性...")
+            if progress_cb: progress_cb(1.0, 0.0)
+            
+            is_ok, reason = validate_model_files(model_id, variant)
+            if is_ok:
+                if status_cb: status_cb(f'✅ 下载成功，文件校验通过')
+                log.info(f"[下载] 成功：{model_id} ({variant})")
+                return dest
+            else:
+                if status_cb: status_cb(f'❌ 校验失败：{reason}')
+                log.error(f"[下载] 校验失败：{model_id} - {reason}")
                 return None
-
-            got_mb = dir_size_bytes(dest) / (1024 * 1024)
-            if progress_cb:
-                progress_cb(1.0)
-            if status_cb:
-                status_cb(f'✅ 下载完成（{variant_label}，'
-                          f'{got_mb:.0f} MB）')
-            log.info(f"[下载] 完成：{model_id} ({variant}) "
-                     f"{got_mb:.0f} MB")
-            return dest
 
         except Exception as e:
-            stop_evt.set()
-            log.error(f"[下载] 失败：{e}")
-            if status_cb:
-                status_cb(f'❌ 下载失败：{e}')
-            self._cleanup(dest, status_cb)
+            stop_monitor.set()
+            log.error(f"[下载] 网络或IO异常：{e}")
+            if status_cb: status_cb(f'❌ 下载失败：{str(e)[:50]}...')
             return None
-
-    def _cleanup(self, path: Path, status_cb=None, msg: str = None):
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-            log.info(f"[下载] 已清理：{path}")
-        except Exception as e:
-            log.warning(f"[下载] 清理失败：{e}")
-
-        if status_cb and msg:
-            status_cb(msg)

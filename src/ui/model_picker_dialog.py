@@ -1,315 +1,186 @@
-"""模型选择对话框：点击下载后弹出，列出所有可下载模型
+"""模型选择对话框：区分 CPU/GPU 变体，包含下载进度与实时速度"""
 
-⭐ 新手保护：
-- 每个模型显示两个下载按钮：
-    · 轻量版（int8，约 40MB）→ 只能 CPU 运行
-    · GPU 版（FP32，约 800MB）→ 支持显卡加速
-- 轻量版体积小、CPU 快，但无法用 DirectML 加速
-- GPU 版体积大，但能避免量化模型在 DML 上的算子崩溃
-"""
-
+import threading
 import customtkinter as ctk
-
+from tkinter import messagebox
 from config import FONT_NAME
 from logger import get_logger
 
-
 log = get_logger('ui.model_picker')
 
-
 class ModelPickerDialog(ctk.CTkToplevel):
-    """下载模型选择对话框"""
-
     def __init__(self, master, on_download=None):
         super().__init__(master)
-        self.title("选择要下载的模型")
-        self.geometry("900x640")
+        self.title("模型管理中心")
+        self.geometry("920x680")
         self.attributes('-topmost', True)
-
         self.on_download = on_download
         self._closing = False
-
+        self._downloading = False
+        self._downloader = None
+        
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-
         self._build_ui()
         self._refresh_list()
 
     def _on_close(self):
+        if self._downloading:
+            if not messagebox.askyesno("确认", "正在下载中，强行关闭会中断下载，确定吗？", parent=self):
+                return
+            if self._downloader: self._downloader.cancel()
         self._closing = True
-        try:
-            self.destroy()
-        except Exception:
-            pass
-
-    def _safe_after(self, delay, fn):
-        if self._closing:
-            return
-        try:
-            if self.winfo_exists():
-                self.after(delay, fn)
-        except Exception:
-            pass
+        self.destroy()
 
     def _build_ui(self):
         pad = 14
-
-        # 顶部提示
         top = ctk.CTkFrame(self, fg_color='transparent')
         top.pack(fill='x', padx=pad, pady=(pad, 6))
 
-        ctk.CTkLabel(
-            top,
-            text="💡 轻量版体积小、CPU 运行；GPU 版体积大，支持显卡加速",
-            font=(FONT_NAME, 10, 'bold'),
-            text_color='#3a86ff',
-        ).pack(side='left', padx=8)
+        ctk.CTkLabel(top, text="💡 int8/q4 版体积小，但【仅限 CPU】运行；FP32 版体积大，【支持 GPU 加速】。", 
+                     font=(FONT_NAME, 11, 'bold'), text_color='#3a86ff').pack(side='left', padx=8)
 
-        self.cache_label = ctk.CTkLabel(
-            top, text="", font=(FONT_NAME, 9),
-            text_color='#666666',
-        )
+        self.cache_label = ctk.CTkLabel(top, text="", font=(FONT_NAME, 10), text_color='#666666')
         self.cache_label.pack(side='right')
 
-        self.list_frame = ctk.CTkScrollableFrame(
-            self, fg_color='transparent',
-        )
-        self.list_frame.pack(fill='both', expand=True,
-                              padx=pad, pady=4)
+        self.list_frame = ctk.CTkScrollableFrame(self, fg_color='transparent')
+        self.list_frame.pack(fill='both', expand=True, padx=pad, pady=4)
 
-        btn_frame = ctk.CTkFrame(self, fg_color='transparent')
-        btn_frame.pack(fill='x', padx=pad, pady=(4, pad))
-
-        ctk.CTkButton(
-            btn_frame, text="关闭", width=80,
-            fg_color='#6c757d', hover_color='#5a6268',
-            command=self._on_close,
-        ).pack(side='right', padx=3)
-
-    # ==================== 列表 ====================
+        ctk.CTkButton(self, text="关闭", width=100, fg_color='#6c757d', 
+                      command=self._on_close).pack(pady=(4, pad))
 
     def _refresh_list(self):
-        for w in self.list_frame.winfo_children():
-            w.destroy()
-
+        if self._closing: return
+        for w in self.list_frame.winfo_children(): w.destroy()
+        
         try:
-            from translation.local_models import get_available_models
+            from translation.local_models import get_available_models, validate_model_files
             models = get_available_models()
         except Exception as e:
             log.exception(f"[模型选择] 读取失败：{e}")
-            ctk.CTkLabel(
-                self.list_frame,
-                text=f"加载失败：{e}",
-                text_color='#cc0000',
-            ).pack(pady=20)
+            ctk.CTkLabel(self.list_frame, text=f"加载失败：{e}", text_color='#cc0000').pack(pady=20)
             return
 
         builtin = [m for m in models if not m.get('is_custom')]
 
-        # 分区
-        not_downloaded = []
-        quant_only = []
-        fp32_ready = []
-
         for m in builtin:
             try:
-                from translation.local_models import (
-                    is_quantized_downloaded, is_fp32_downloaded)
-                has_q = is_quantized_downloaded(m['id'])
-                has_f = is_fp32_downloaded(m['id'])
+                has_cpu, _ = validate_model_files(m['id'], 'cpu')
+                has_gpu, _ = validate_model_files(m['id'], 'gpu')
             except Exception:
-                has_q = has_f = False
-
-            if not has_q and not has_f:
-                not_downloaded.append(m)
-            elif has_q and not has_f:
-                quant_only.append(m)
-            else:
-                fp32_ready.append(m)
-
-        if not_downloaded:
-            ctk.CTkLabel(
-                self.list_frame,
-                text=f"—— 未下载（{len(not_downloaded)} 个）——",
-                font=(FONT_NAME, 10, 'bold'),
-                text_color='#28a745',
-            ).pack(pady=(6, 4))
-            for m in not_downloaded:
-                self._render_model(m, has_quant=False, has_fp32=False)
-
-        if quant_only:
-            ctk.CTkLabel(
-                self.list_frame,
-                text=f"—— 已下载轻量版（{len(quant_only)} 个）——",
-                font=(FONT_NAME, 10, 'bold'),
-                text_color='#3a86ff',
-            ).pack(pady=(12, 4))
-            for m in quant_only:
-                self._render_model(m, has_quant=True, has_fp32=False)
-
-        if fp32_ready:
-            ctk.CTkLabel(
-                self.list_frame,
-                text=f"—— 已下载 GPU 版（{len(fp32_ready)} 个）——",
-                font=(FONT_NAME, 10, 'bold'),
-                text_color='#e67e22',
-            ).pack(pady=(12, 4))
-            for m in fp32_ready:
-                self._render_model(m, has_quant=True, has_fp32=True)
+                has_cpu = has_gpu = False
+            
+            self._render_model(m, has_cpu, has_gpu)
 
         self._update_cache_label()
 
-    def _render_model(self, meta: dict,
-                       has_quant: bool, has_fp32: bool):
+    def _render_model(self, meta: dict, has_cpu: bool, has_gpu: bool):
         mid = meta['id']
         name = meta.get('name', mid)
-        size_mb = meta.get('size_mb', 0)
-        langs = meta.get('languages', [])
+        langs = ', '.join(f"{s}→{t}" for s, t in meta.get('languages', []))
         desc = meta.get('description', '')
         recommended = meta.get('recommended', False)
-
-        # ⭐ 用注册表里的真实体积，不再硬编码 40MB / 800MB
-        quant_mb = meta.get('download_mb') or size_mb or 0
+        quant_mb = meta.get('download_mb') or meta.get('size_mb') or 0
         fp32_mb = meta.get('fp32_mb') or 0
 
-        card = ctk.CTkFrame(
-            self.list_frame,
-            fg_color=('gray90', 'gray18') if recommended
-            else ('gray95', 'gray14'),
-        )
+        card = ctk.CTkFrame(self.list_frame, fg_color=('gray90', 'gray18') if recommended else ('gray95', 'gray14'))
         card.pack(fill='x', padx=4, pady=4)
 
         left = ctk.CTkFrame(card, fg_color='transparent')
-        left.pack(side='left', fill='both', expand=True,
-                  padx=12, pady=10)
+        left.pack(side='left', fill='both', expand=True, padx=12, pady=10)
 
         row1 = ctk.CTkFrame(left, fg_color='transparent')
         row1.pack(anchor='w', fill='x')
-
-        ctk.CTkLabel(
-            row1, text=name,
-            font=(FONT_NAME, 12, 'bold'), anchor='w',
-        ).pack(side='left')
-
+        ctk.CTkLabel(row1, text=name, font=(FONT_NAME, 12, 'bold')).pack(side='left')
         if recommended:
-            ctk.CTkLabel(
-                row1, text="  [推荐]",
-                font=(FONT_NAME, 10, 'bold'),
-                text_color='#28a745',
-            ).pack(side='left')
+            ctk.CTkLabel(row1, text=" [推荐]", font=(FONT_NAME, 10, 'bold'), text_color='#28a745').pack(side='left')
 
-        if langs:
-            lang_str = ', '.join(f"{s}→{t}" for s, t in langs)
-            ctk.CTkLabel(
-                left, text=f"🌐 {lang_str}",
-                font=(FONT_NAME, 10), text_color='#666666',
-                anchor='w',
-            ).pack(anchor='w', pady=(2, 0))
+        ctk.CTkLabel(left, text=f"🌐 {langs}  |  💡 {desc}", font=(FONT_NAME, 9), text_color='#666666').pack(anchor='w', pady=(2, 0))
 
-        info_parts = []
-        if size_mb > 0:
-            info_parts.append(f"📦 {size_mb:.0f} MB")
-        if desc:
-            info_parts.append(f"💡 {desc}")
-        if info_parts:
-            ctk.CTkLabel(
-                left, text="  |  ".join(info_parts),
-                font=(FONT_NAME, 9), text_color='#888888',
-                anchor='w',
-            ).pack(anchor='w', pady=(2, 0))
-
-        # 已下载标签
-        tags = []
-        if has_quant:
-            tags.append("✓ 轻量版")
-        if has_fp32:
-            tags.append("✓ GPU 版")
-        if tags:
-            ctk.CTkLabel(
-                left, text='  '.join(tags),
-                font=(FONT_NAME, 9, 'bold'),
-                text_color='#28a745',
-                anchor='w',
-            ).pack(anchor='w', pady=(2, 0))
-
-        # 右侧按钮
         right = ctk.CTkFrame(card, fg_color='transparent')
         right.pack(side='right', padx=12, pady=10)
 
-        # 轻量版
-        if not has_quant:
-            ctk.CTkButton(
-                right,
-                text=(f"下载轻量版\n({quant_mb:.0f}MB, CPU)"
-                      if quant_mb else "下载轻量版\n(CPU)"),
-                width=110, height=44,
-                font=(FONT_NAME, 9, 'bold'),
-                fg_color='#16a085', hover_color='#138d75',
-                command=lambda: self._on_download_clicked(
-                    mid, name, 'quantized'),
-            ).pack(side='left', padx=3)
-        else:
-            ctk.CTkLabel(
-                right, text="✓ 轻量版\n已下载",
-                font=(FONT_NAME, 9, 'bold'),
-                text_color='#28a745', justify='center',
-            ).pack(side='left', padx=3)
+        status_frame = ctk.CTkFrame(left, fg_color='transparent', height=24)
+        status_frame.pack(fill='x', pady=(5, 0))
+        
+        status_label = ctk.CTkLabel(status_frame, text="", font=(FONT_NAME, 9), text_color='#cc0000')
+        status_label.pack(side='left')
+        
+        progress_bar = ctk.CTkProgressBar(status_frame, width=160, height=8)
+        progress_bar.set(0)
+        
+        speed_label = ctk.CTkLabel(status_frame, text="", font=(FONT_NAME, 9), text_color='#3a86ff', width=70)
 
-        # GPU 版
-        if not has_fp32:
-            ctk.CTkButton(
-                right,
-                text=(f"下载 GPU 版\n({fp32_mb:.0f}MB, 显卡)"
-                      if fp32_mb else "下载 GPU 版\n(显卡)"),
-                width=120, height=44,
-                font=(FONT_NAME, 9, 'bold'),
-                fg_color='#e67e22', hover_color='#d35400',
-                command=lambda: self._on_download_clicked(
-                    mid, name, 'fp32'),
-            ).pack(side='left', padx=3)
-        else:
-            ctk.CTkLabel(
-                right, text="✓ GPU 版\n已下载",
-                font=(FONT_NAME, 9, 'bold'),
-                text_color='#28a745', justify='center',
-            ).pack(side='left', padx=3)
+        # CPU 版按钮 (int8)
+        btn_cpu = ctk.CTkButton(
+            right, text=(f"下载 CPU版 (int8)\n({quant_mb:.0f}MB)" if not has_cpu else "✓ int8版已就绪"),
+            width=120, height=44, font=(FONT_NAME, 9, 'bold'),
+            fg_color='#16a085' if not has_cpu else 'gray50', hover_color='#138d75',
+            state='normal' if not has_cpu else 'disabled',
+            command=lambda: self._start_download(mid, name, 'cpu', btn_cpu, progress_bar, speed_label, status_label)
+        )
+        btn_cpu.pack(side='left', padx=3)
+
+        # GPU 版按钮 (FP32)
+        btn_gpu = ctk.CTkButton(
+            right, text=(f"下载 GPU版 (FP32)\n({fp32_mb:.0f}MB)" if not has_gpu else "✓ FP32版已就绪"),
+            width=130, height=44, font=(FONT_NAME, 9, 'bold'),
+            fg_color='#e67e22' if not has_gpu else 'gray50', hover_color='#d35400',
+            state='normal' if not has_gpu else 'disabled',
+            command=lambda: self._start_download(mid, name, 'gpu', btn_gpu, progress_bar, speed_label, status_label)
+        )
+        btn_gpu.pack(side='left', padx=3)
+
+    def _start_download(self, model_id, name, variant, btn, progress_bar, speed_label, status_label):
+        if self._downloading:
+            messagebox.showwarning("提示", "已有下载任务正在进行中", parent=self)
+            return
+
+        try:
+            from translation.local_models import ModelDownloader
+            self._downloader = ModelDownloader()
+        except Exception as e:
+            status_label.configure(text=f"初始化下载器失败：{e}")
+            return
+
+        self._downloading = True
+        btn.configure(state='disabled', text="下载中...")
+        progress_bar.pack(side='left', padx=(10, 0))
+        speed_label.pack(side='left', padx=(6, 0))
+        status_label.configure(text="准备连接...", text_color='#3a86ff')
+
+        def progress_cb(p: float, speed_mb: float):
+            if self._closing: return
+            def update():
+                progress_bar.set(p)
+                if speed_mb > 0.01: speed_label.configure(text=f"{speed_mb:.1f} MB/s")
+                elif p >= 1.0: speed_label.configure(text="")
+            self.after(0, update)
+
+        def status_cb(s: str):
+            if self._closing: return
+            color = '#cc0000' if '❌' in s or '失败' in s else ('#28a745' if '✅' in s else '#3a86ff')
+            self.after(0, lambda: status_label.configure(text=s, text_color=color))
+
+        def worker():
+            try:
+                self._downloader.download(model_id, variant, progress_cb, status_cb)
+            except Exception as e:
+                log.exception(f"[UI下载] 异常：{e}")
+            finally:
+                if not self._closing:
+                    self.after(0, self._on_download_finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_download_finish(self):
+        self._downloading = False
+        self._update_cache_label()
+        if not self._closing:
+            self.after(1500, self._refresh_list)
 
     def _update_cache_label(self):
         try:
             from translation.local_models import ModelCacheManager
             mgr = ModelCacheManager()
-            size_mb = mgr.get_cache_size_mb()
-            count = len(mgr.list_models())
-            self.cache_label.configure(
-                text=f"缓存：{count} 个 · {size_mb:.0f} MB")
-        except Exception:
-            pass
-
-    def _on_download_clicked(self, model_id: str, name: str,
-                              variant: str):
-        if self._closing:
-            return
-
-        try:
-            from translation.local_models.downloader import (
-                is_downloading, get_downloading_model)
-            if is_downloading():
-                other = get_downloading_model()
-                self._show_message(f"⚠️ 已有任务进行中：{other}")
-                return
-        except Exception:
-            pass
-
-        if self.on_download:
-            try:
-                self.on_download(model_id, variant)
-            except Exception as e:
-                log.exception(f"[模型选择] 触发下载失败：{e}")
-
-        self._on_close()
-
-    def _show_message(self, msg: str):
-        try:
-            from tkinter import messagebox
-            messagebox.showinfo("提示", msg, parent=self)
-        except Exception:
-            pass
+            self.cache_label.configure(text=f"磁盘占用：{mgr.get_cache_size_mb():.0f} MB")
+        except Exception: pass

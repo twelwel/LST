@@ -32,6 +32,10 @@ class TranslationModelFactory:
     _load_locks: dict = {}
     _load_failures: dict = {}
     _global_lock = threading.Lock()
+    # ⭐ 生命周期锁：加载 / 卸载 / 切换设备必须互斥。
+    #    否则切换设备时旧 DML 会话正在析构，新会话已经开始创建，
+    #    会在 onnxruntime / 显卡驱动层触发 0xC0000005（Python 无法捕获）。
+    _lifecycle_lock = threading.RLock()
 
     # 加载失败后的重试冷却（秒）：避免每次翻译都重跑一次昂贵的加载
     RETRY_COOLDOWN = 5.0
@@ -40,6 +44,13 @@ class TranslationModelFactory:
     def create(cls, model_id: str,
                model_path: Optional[Path] = None
                ) -> Optional[BaseTranslationModel]:
+        with cls._lifecycle_lock:
+            return cls._create_unlocked(model_id, model_path)
+
+    @classmethod
+    def _create_unlocked(cls, model_id: str,
+                         model_path: Optional[Path] = None
+                         ) -> Optional[BaseTranslationModel]:
         meta = get_registry_entry(model_id)
         is_custom = False
 
@@ -128,23 +139,38 @@ class TranslationModelFactory:
             return instance
 
     @classmethod
-    def invalidate(cls, model_id: str = None):
-        """丢弃缓存（下载完成 / 删除 / 切换设备后调用），强制下次重新加载"""
-        with cls._global_lock:
-            if model_id is None:
-                items = list(cls._instances.items())
-                cls._instances.clear()
-                cls._load_failures.clear()
-            else:
-                inst = cls._instances.pop(model_id, None)
-                cls._load_failures.pop(model_id, None)
-                items = [(model_id, inst)] if inst is not None else []
+    def invalidate(cls, model_id: str = None, force: bool = True) -> bool:
+        """丢弃缓存（下载完成 / 删除 / 切换设备后调用），强制下次重新加载。
 
-        for _, inst in items:
-            try:
-                inst.unload()
-            except Exception:
-                pass
+        force=False：存在已加载模型时跳过卸载（避免运行期销毁 DML 会话
+        触发驱动级 0xC0000005），返回 False。
+        """
+        with cls._lifecycle_lock:
+            with cls._global_lock:
+                if model_id is None:
+                    items = list(cls._instances.items())
+                else:
+                    inst = cls._instances.get(model_id)
+                    items = [(model_id, inst)] if inst is not None else []
+
+            if not force and cls.has_loaded_gpu_models():
+                log.info("[Factory] 存在已加载的 GPU 模型，跳过缓存失效（重启后生效）")
+                return False
+
+            with cls._global_lock:
+                if model_id is None:
+                    cls._instances.clear()
+                    cls._load_failures.clear()
+                else:
+                    cls._instances.pop(model_id, None)
+                    cls._load_failures.pop(model_id, None)
+
+            for _, inst in items:
+                try:
+                    inst.unload()
+                except Exception:
+                    pass
+            return True
 
     @classmethod
     def get_if_loaded(cls, model_id: str):
@@ -153,24 +179,63 @@ class TranslationModelFactory:
 
     @classmethod
     def unload(cls, model_id: str):
-        with cls._global_lock:
-            inst = cls._instances.pop(model_id, None)
-        if inst is not None:
-            try:
-                inst.unload()
-            except Exception:
-                pass
+        with cls._lifecycle_lock:
+            with cls._global_lock:
+                inst = cls._instances.pop(model_id, None)
+            if inst is not None:
+                try:
+                    inst.unload()
+                except Exception:
+                    pass
 
     @classmethod
-    def unload_all(cls):
+    def has_loaded_models(cls) -> bool:
+        """是否有已加载模型（用于判断能否安全热切换设备）。"""
         with cls._global_lock:
-            items = list(cls._instances.items())
-            cls._instances.clear()
-        for _, inst in items:
-            try:
-                inst.unload()
-            except Exception:
-                pass
+            items = list(cls._instances.values())
+        return any(getattr(inst, 'is_loaded', False) for inst in items)
+
+    @classmethod
+    def has_loaded_gpu_models(cls) -> bool:
+        """是否有已加载的 GPU 模型。
+
+        只有 GPU（DirectML/CUDA）会话在运行期销毁才会触发驱动级崩溃；
+        CPU 会话可以安全卸载，因此 CPU -> GPU 切换可以立即生效。
+        """
+        with cls._global_lock:
+            items = list(cls._instances.values())
+        for inst in items:
+            if not getattr(inst, 'is_loaded', False):
+                continue
+            device = str(getattr(inst, 'device', '') or '').lower()
+            if 'directml' in device or 'dml' in device or 'cuda' in device:
+                return True
+        return False
+
+    @classmethod
+    def unload_all(cls, force: bool = True) -> bool:
+        """卸载全部模型。
+
+        force=False：只要还有已加载模型就跳过卸载并返回 False。
+        这是运行期设备切换的安全路径：该 NVIDIA 驱动下，OCR DML 会话
+        存活时销毁翻译 DML 会话会直接 0xC0000005，Python 无法捕获。
+        """
+        with cls._lifecycle_lock:
+            with cls._global_lock:
+                items = list(cls._instances.items())
+
+            if not force and cls.has_loaded_gpu_models():
+                log.info("[Factory] 存在已加载的 GPU 模型，跳过运行期卸载（重启后生效）")
+                return False
+
+            with cls._global_lock:
+                cls._instances.clear()
+            for _, inst in items:
+                try:
+                    inst.unload()
+                except Exception:
+                    pass
+            return True
 
 
 def get_model_instance(model_id: str,

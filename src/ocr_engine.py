@@ -1,7 +1,7 @@
 """OCR 引擎池
 - CPU：多引擎并行（1-8 可调）
 - CUDA：多引擎并行（1-4 可调）
-- DirectML：单引擎
+- DirectML：单引擎（与本地翻译模型共用 dml_gate 串行执行，避免驱动崩溃）
 - 支持 server / tiny 两种模型（PP-OCRv6）
 - 支持多语言（CH / EN / JAPAN / KOREAN / FRENCH / GERMAN / SPANISH / RUSSIAN）
 - 支持高精度模式（双引擎投票融合）
@@ -13,6 +13,7 @@ import gc
 import threading
 import time
 from collections import Counter
+from contextlib import nullcontext
 
 import numpy as np
 import mss
@@ -21,6 +22,8 @@ from cuda_setup import (
     check_onnxruntime_variant,
     load_cuda_dlls,
 )
+from dml_gate import dml_guard
+from dml_device import dml_provider_option_dict, describe_dml_device
 
 
 # ==================== 枚举探测 ====================
@@ -84,6 +87,45 @@ def _find_lang_enums():
         except Exception:
             continue
     return None, None
+
+
+def _patch_rapidocr_dml_options():
+    """修正 RapidOCR 的 dml_ep_cfg 类型。
+
+    RapidOCR 的 ProviderConfig.dml_ep_cfg() 直接把 OmegaConf 的 DictConfig
+    传给 onnxruntime。ORT 只接受原生 dict，会报：
+        'providers' values must be either strings or (string, dict) tuples
+    然后在无提示的情况下降级到 CPU。这里把 DictConfig 转成普通 dict。
+    """
+    try:
+        from rapidocr.inference_engine.onnxruntime.provider_config import (
+            ProviderConfig,
+        )
+    except Exception:
+        return
+
+    if getattr(ProviderConfig, '_lst_dml_plain_patch', False):
+        return
+
+    def _dml_ep_cfg(self):
+        cfg = self.cfg.dml_ep_cfg
+        if cfg is not None:
+            try:
+                from omegaconf import OmegaConf
+                if OmegaConf.is_config(cfg):
+                    return OmegaConf.to_container(cfg, resolve=True)
+            except Exception:
+                pass
+            try:
+                return dict(cfg)
+            except Exception:
+                return cfg
+        if self.is_cuda_available():
+            return self.cuda_ep_cfg()
+        return self.cpu_ep_cfg()
+
+    ProviderConfig.dml_ep_cfg = _dml_ep_cfg
+    ProviderConfig._lst_dml_plain_patch = True
 
 
 def _resolve_enum(enum_cls, names):
@@ -248,23 +290,28 @@ class OCREngine:
         with self._lock:
             self._reloading = True
 
+        # DirectML：旧引擎释放 + 新引擎创建/预热都必须与翻译模型等 DML 推理串行
+        old_mode = self.mode
+        guard = (dml_guard() if old_mode == 'directml' or mode == 'directml'
+                 else nullcontext())
         try:
-            old_engines = self.engines
-            old_aux = self.aux_engines
-            self.engines = []
-            self.aux_engines = []
+            with guard:
+                old_engines = self.engines
+                old_aux = self.aux_engines
+                self.engines = []
+                self.aux_engines = []
 
-            self._retire_engines(old_engines)
-            self._retire_engines(old_aux)
+                self._retire_engines(old_engines)
+                self._retire_engines(old_aux)
 
-            return self._do_init(
-                mode=mode, pool_size=pool_size,
-                dml_worker_count=dml_worker_count,
-                model_size=model_size,
-                high_accuracy=high_accuracy,
-                speed_opt=speed_opt,
-                lang_name=lang_name,
-            )
+                return self._do_init(
+                    mode=mode, pool_size=pool_size,
+                    dml_worker_count=dml_worker_count,
+                    model_size=model_size,
+                    high_accuracy=high_accuracy,
+                    speed_opt=speed_opt,
+                    lang_name=lang_name,
+                )
         finally:
             with self._lock:
                 self._reloading = False
@@ -381,17 +428,20 @@ class OCREngine:
     # ================= 引擎清理 =================
 
     def _cleanup_current(self):
-        for e in self.engines + self.aux_engines:
+        # DirectML 引擎析构会触碰 DML 资源，需与翻译等 DML 推理互斥
+        guard = dml_guard() if self.mode == 'directml' else nullcontext()
+        with guard:
+            for e in self.engines + self.aux_engines:
+                try:
+                    del e
+                except Exception:
+                    pass
+            self.engines = []
+            self.aux_engines = []
             try:
-                del e
+                gc.collect()
             except Exception:
                 pass
-        self.engines = []
-        self.aux_engines = []
-        try:
-            gc.collect()
-        except Exception:
-            pass
 
     def _retire_engines(self, engines_list):
         if not engines_list:
@@ -406,10 +456,12 @@ class OCREngine:
                     self._retiring.remove(engines_list)
                 except Exception:
                     pass
-            try:
-                gc.collect()
-            except Exception:
-                pass
+            # 被退休的引擎可能包含 DML 会话，GC 前先取得闸门
+            with dml_guard():
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
             print(f"[OCR] 退休引擎已释放（{len(engines_list)} 个）")
 
         threading.Thread(target=_gc_later, daemon=True).start()
@@ -461,8 +513,11 @@ class OCREngine:
 
     def _init_engines_directml(self):
         from rapidocr import RapidOCR
+        _patch_rapidocr_dml_options()
         params = {
             "EngineConfig.onnxruntime.use_dml": True,
+            # ⭐ 必须显式指定独显；默认 device_id=0 在混合显卡机器上是核显
+            "EngineConfig.onnxruntime.dml_ep_cfg": dml_provider_option_dict(),
             "Det.use_dml": True,
             "Rec.use_dml": True,
             "Cls.use_dml": False,
@@ -470,19 +525,38 @@ class OCREngine:
         params.update(self._build_model_params_for_current())
         params.update(self._speed_params())
 
-        print(f"[OCR] 创建 DirectML 单引擎"
-              f"（模型：{self.model_size}，语言：{self.lang_name}）...")
-        t0 = time.time()
-        engine = RapidOCR(params=params)
-        print(f"[OCR] session 创建完成 ({time.time()-t0:.1f}s)，预热中...")
+        print(f"[OCR] 创建 DirectML 单引擎（模型：{self.model_size}，语言：{self.lang_name}，"
+              f"{describe_dml_device()}）...")
+        engine = None
+        try:
+            with dml_guard():
+                try:
+                    t0 = time.time()
+                    engine = RapidOCR(params=params)
+                    print(f"[OCR] session 创建完成 ({time.time()-t0:.1f}s)，预热中...")
 
-        dummy = np.zeros((32, 128, 3), dtype=np.uint8)
-        t0 = time.time()
-        _ = engine(dummy)
-        print(f"[OCR] 预热完成 ({time.time()-t0:.1f}s)")
+                    # ⭐ 关键：预热探测 DML 是否真的可用
+                    dummy = np.zeros((32, 128, 3), dtype=np.uint8)
+                    _ = engine(dummy)
+                    print(f"[OCR] 预热完成")
 
-        self.engines = [engine]
-        print("[OCR] DirectML 单引擎就绪")
+                    self.engines = [engine]
+                    self.mode = 'directml'
+                    print("[OCR] DirectML 单引擎就绪")
+                except Exception:
+                    # 半初始化的 DML 会话必须在闸门内释放
+                    engine = None
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    raise
+        except Exception as e:
+            print(f"[OCR] ❌ DirectML 初始化或预热失败: {e}")
+            print("[OCR] ⚠️ 正在自动回退到 CPU 多线程模式...")
+            self.mode = 'cpu_multi'
+            self.last_error = f"DirectML 失败，已回退 CPU。原因: {str(e)[:100]}"
+            self._init_engines_cpu()
 
     def _init_engines_cuda(self):
         from rapidocr import RapidOCR
@@ -635,11 +709,17 @@ class OCREngine:
 
     def _recognize_aux(self, images, aux):
         engine = aux[0]
-        return [self._recognize_one(engine, img) for img in images]
+        # 辅助引擎固定为 CPU：不需要 DML 闸门，避免无谓阻塞翻译
+        return [self._recognize_one(engine, img, use_dml=False) for img in images]
 
-    def _recognize_one(self, engine, image_np):
+    def _recognize_one(self, engine, image_np, use_dml=None):
+        # DirectML：OCR 推理必须与翻译模型等其它 DML 会话串行执行
+        if use_dml is None:
+            use_dml = (self.mode == 'directml')
+        guard = dml_guard() if use_dml else nullcontext()
         try:
-            result = engine(image_np)
+            with guard:
+                result = engine(image_np)
             if result is None or not result.txts:
                 return []
             items = []
@@ -737,9 +817,11 @@ class OCREngine:
         with self._lock:
             self._reloading = True
         try:
-            self._cleanup_current()
-            with self._lock:
-                self._retiring.clear()
+            # DirectML：释放全部会话（含已退休引擎）时持有闸门
+            with dml_guard():
+                self._cleanup_current()
+                with self._lock:
+                    self._retiring.clear()
         finally:
             with self._lock:
                 self._reloading = False

@@ -49,8 +49,30 @@ from emit_debouncer import EmitDebouncer
 log = get_logger('pipeline')
 
 
-THUMB_SIZE = 40
-PIXEL_DIFF_THRESHOLD = 20
+# ==================== 帧差检测 ====================
+# 固定尺寸灰度缩略图 + 面积平均缩放。
+# 旧实现用 NEAREST 抽样到 40x40，小字 / 细线经常一个采样点都命中不了，
+# 导致帧差“不灵敏”；现在改为 160x90 + INTER_AREA，任何像素变化都会被
+# 平均进单元格，再配合更低的像素阈值与变化比例阈值。
+FRAME_THUMB_WIDTH = 160
+FRAME_THUMB_HEIGHT = 90
+FRAME_DIFF_PIXEL_THRESHOLD = 6
+FRAME_DIFF_MIN_CHANGED_PIXELS = 4
+FRAME_DIFF_MIN_COMPONENT_AREA = 6
+FRAME_DIFF_PADDING_RATIO = 0.5
+FRAME_DIFF_MAX_COMPONENTS = 6
+FRAME_DIFF_MAX_ROIS = 4
+FRAME_DIFF_ROI_MERGE_GAP = 24
+FRAME_DIFF_MAX_ROI_AREA_RATIO = 0.55
+
+# 分块 OCR 的兜底：每隔一段时间强制整屏补扫一次，
+# 修正漏识别 / 切屏后未被分块覆盖的文本。
+FULL_OCR_REFRESH_SEC = 8.0
+
+# 兼容旧名称（外部脚本可能引用）
+THUMB_SIZE = FRAME_THUMB_WIDTH
+PIXEL_DIFF_THRESHOLD = FRAME_DIFF_PIXEL_THRESHOLD
+
 INPAINT_CACHE_MAX = 200
 
 MULTITHREAD_OCR_MIN_AREA = 600 * 150
@@ -63,10 +85,6 @@ PERF_REPORT_INTERVAL = 10.0
 
 POSITION_MATCH_TOLERANCE = 40
 TRACKER_TIMEOUT = 1.5
-
-FRAME_DIFF_MIN_COMPONENT_AREA = 4
-FRAME_DIFF_PADDING_RATIO = 0.3
-FRAME_DIFF_MAX_COMPONENTS = 5
 
 OCR_VERIFY_PADDING = 8
 OCR_VERIFY_SIMILARITY = 0.6
@@ -214,6 +232,8 @@ class AppState:
         self.position_quantize = position_quantize
         self.last_frame_keys = None
         self.last_frame_pixels = None
+        self.last_full_scan_ts = 0.0
+        self.scene_reset_pending = False
         self.idle_count = 0
         self.idle_skip_counter = 0
         self.performance_mode = 'medium'
@@ -264,6 +284,8 @@ class AppState:
     def reset_signature(self):
         self.last_frame_keys = None
         self.last_frame_pixels = None
+        self.last_full_scan_ts = 0.0
+        self.scene_reset_pending = False
         self.idle_count = 0
         self.idle_skip_counter = 0
         self.pending_change = False
@@ -488,36 +510,58 @@ class Pipeline:
         return '#FFFFFF' if luminance < 128 else '#000000'
 
     def _make_thumbnail(self, img):
+        """生成帧差用的灰度缩略图。
+
+        使用固定 160x90 + INTER_AREA / BOX 缩放，而不是跳点抽样：
+        即使只有几个像素的文字变化，也会被平均进缩略图单元格，
+        避免小字、细线、单行字幕变化被漏检。
+        """
+        if img is None or getattr(img, 'size', 0) == 0:
+            return np.zeros((FRAME_THUMB_HEIGHT, FRAME_THUMB_WIDTH),
+                            dtype=np.int16)
+
         if _CV2_OK:
             try:
+                if img.ndim == 3 and img.shape[2] >= 3:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = img
                 small = cv2.resize(
-                    img, (THUMB_SIZE, THUMB_SIZE),
-                    interpolation=cv2.INTER_NEAREST,
+                    gray, (FRAME_THUMB_WIDTH, FRAME_THUMB_HEIGHT),
+                    interpolation=cv2.INTER_AREA,
                 )
-                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                return gray.astype(np.int16)
+                return small.astype(np.int16)
             except Exception:
                 pass
-        try:
-            h, w = img.shape[:2]
-            sy = max(1, h // THUMB_SIZE)
-            sx = max(1, w // THUMB_SIZE)
-            sampled = img[::sy, ::sx][:THUMB_SIZE, :THUMB_SIZE]
-            gray = (sampled[:, :, 2] * 0.299 +
-                    sampled[:, :, 1] * 0.587 +
-                    sampled[:, :, 0] * 0.114)
-            return gray.astype(np.int16)
-        except Exception:
-            pass
-        small = PILImage.fromarray(img).convert('L').resize(
-            (THUMB_SIZE, THUMB_SIZE),
-            PILImage.Resampling.NEAREST,
-        )
-        return np.asarray(small, dtype=np.int16)
 
-    def _get_changed_bbox(self, img):
-        full_frame = (0, 0, img.shape[1], img.shape[0])
+        try:
+            if img.ndim == 3 and img.shape[2] >= 3:
+                pil = PILImage.fromarray(img[:, :, :3]).convert('L')
+            else:
+                pil = PILImage.fromarray(img).convert('L')
+            small = pil.resize(
+                (FRAME_THUMB_WIDTH, FRAME_THUMB_HEIGHT),
+                PILImage.Resampling.BOX,
+            )
+            return np.asarray(small, dtype=np.int16)
+        except Exception:
+            return np.zeros((FRAME_THUMB_HEIGHT, FRAME_THUMB_WIDTH),
+                            dtype=np.int16)
+
+    def _get_changed_rois(self, img):
+        """返回本帧需要 OCR 的区域列表；None 表示画面静止可跳过。
+
+        与旧实现相比：
+        - 使用面积平均缩略图，小文本变化也能被检测到；
+        - 支持返回多个变化区块（而不是一个巨大的外接框）；
+        - 大范围变化 / 定期补扫时直接返回整屏，保证切屏后不漏文本。
+        """
+        h, w = img.shape[:2]
+        full_frame = [(0, 0, w, h)]
+        now = time.monotonic()
+
         if not self.state.enable_frame_diff:
+            self.state.last_full_scan_ts = now
             return full_frame
 
         crt = self.state.change_ratio_threshold
@@ -526,88 +570,190 @@ class Pipeline:
 
         thumb = self._make_thumbnail(img)
         prev = self.state.last_frame_pixels
-        self.state.last_frame_pixels = thumb
 
-        if prev is None:
-            return full_frame
-        if thumb.shape != prev.shape:
+        if prev is None or thumb.shape != prev.shape:
+            self.state.last_frame_pixels = thumb
+            self.state.last_full_scan_ts = now
             return full_frame
 
         diff = np.abs(thumb - prev)
-        mask = diff > PIXEL_DIFF_THRESHOLD
-        changed_ratio = mask.sum() / diff.size
+        mask = diff > FRAME_DIFF_PIXEL_THRESHOLD
+        changed_pixels = int(mask.sum())
 
+        # 分块 OCR 兜底：无论当前有没有变化，到时间就整屏补扫一次，
+        # 修正上一次分块漏识别 / 未覆盖的文本。
+        if self.state.enable_block_ocr:
+            last_full = getattr(self.state, 'last_full_scan_ts', 0.0)
+            if now - last_full >= FULL_OCR_REFRESH_SEC:
+                self.state.last_frame_pixels = thumb
+                self.state.last_full_scan_ts = now
+                log.debug(f"[帧差] 距上次整屏 {now - last_full:.1f}s，"
+                          "执行整屏补扫")
+                return full_frame
+
+        if changed_pixels < FRAME_DIFF_MIN_CHANGED_PIXELS:
+            # 不更新基准帧：很小的变化会累积到下一次比较，
+            # 避免慢速渐变 / 逐帧轻微变化永远达不到阈值。
+            return None
+
+        changed_ratio = changed_pixels / float(diff.size)
         if changed_ratio < crt:
             return None
+
         if not self.state.enable_block_ocr:
+            self.state.last_frame_pixels = thumb
+            self.state.last_full_scan_ts = now
             return full_frame
+
+        # 大范围变化（切屏 / 换页 / 场景切换）直接整屏 OCR，
+        # 避免分块只覆盖一部分，导致新出现的英文没有被翻译。
         if changed_ratio > ffr:
+            self.state.last_frame_pixels = thumb
+            self.state.last_full_scan_ts = now
+            self.state.scene_reset_pending = True
+            log.debug(f"[帧差] 大范围变化 {changed_ratio:.1%} > "
+                      f"{ffr:.1%}，整屏 OCR")
             return full_frame
 
-        if _CV2_OK and changed_ratio < ffr * 0.5:
-            try:
-                mask_u8 = (mask.astype(np.uint8) * 255)
-                kernel = np.ones((3, 3), np.uint8)
-                mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
-
-                n_labels, labels, stats, _ = \
-                    cv2.connectedComponentsWithStats(
-                        mask_u8, connectivity=8)
-
-                comps = []
-                for i in range(1, n_labels):
-                    area = stats[i, cv2.CC_STAT_AREA]
-                    if area < FRAME_DIFF_MIN_COMPONENT_AREA:
-                        continue
-                    comps.append((area, i))
-                comps.sort(reverse=True)
-                top_n = comps[:FRAME_DIFF_MAX_COMPONENTS]
-
-                if not top_n:
-                    return None
-
-                xs_list = []
-                ys_list = []
-                for area, i in top_n:
-                    cx = stats[i, cv2.CC_STAT_LEFT]
-                    cy = stats[i, cv2.CC_STAT_TOP]
-                    cw = stats[i, cv2.CC_STAT_WIDTH]
-                    ch = stats[i, cv2.CC_STAT_HEIGHT]
-                    xs_list.extend([cx, cx + cw])
-                    ys_list.extend([cy, cy + ch])
-
-                sx = img.shape[1] / THUMB_SIZE
-                sy = img.shape[0] / THUMB_SIZE
-
-                t_x1 = min(xs_list)
-                t_y1 = min(ys_list)
-                t_x2 = max(xs_list)
-                t_y2 = max(ys_list)
-
-                change_h = (t_y2 - t_y1) * sy
-                pad = max(base_pad,
-                          int(change_h * FRAME_DIFF_PADDING_RATIO))
-
-                x1 = max(0, int(t_x1 * sx) - pad)
-                y1 = max(0, int(t_y1 * sy) - pad)
-                x2 = min(img.shape[1], int(t_x2 * sx) + pad)
-                y2 = min(img.shape[0], int(t_y2 * sy) + pad)
-                return (x1, y1, x2 - x1, y2 - y1)
-            except Exception as e:
-                log.debug(f"[帧差] 连通域分析失败：{e}")
-
-        ys, xs = np.where(mask)
-        if len(xs) == 0:
+        rois = self._build_changed_rois(mask, w, h, base_pad)
+        if not rois:
             return None
 
-        sx = img.shape[1] / THUMB_SIZE
-        sy = img.shape[0] / THUMB_SIZE
+        if rois == full_frame:
+            self.state.last_frame_pixels = thumb
+            self.state.last_full_scan_ts = now
+            log.debug("[帧差] 变化区块过多，整屏 OCR")
+            return full_frame
 
-        x1 = max(0, int(xs.min() * sx) - base_pad)
-        y1 = max(0, int(ys.min() * sy) - base_pad)
-        x2 = min(img.shape[1], int(xs.max() * sx) + base_pad)
-        y2 = min(img.shape[0], int(ys.max() * sy) + base_pad)
+        total = sum(rw * rh for _, _, rw, rh in rois)
+        if total >= FRAME_DIFF_MAX_ROI_AREA_RATIO * w * h:
+            self.state.last_frame_pixels = thumb
+            self.state.last_full_scan_ts = now
+            log.debug(f"[帧差] 变化区域占 {total / (w * h):.1%}，"
+                      "整屏 OCR")
+            return full_frame
+
+        self.state.last_frame_pixels = thumb
+        log.debug(f"[帧差] 变化 {changed_ratio:.2%}，分块 {len(rois)} 区")
+        return rois
+
+    def _build_changed_rois(self, mask, img_w, img_h, base_pad):
+        """把变化 mask 转成若干带外扩的 OCR 区块。"""
+        th, tw = mask.shape[:2]
+        sx = img_w / float(tw)
+        sy = img_h / float(th)
+
+        if not _CV2_OK:
+            ys, xs = np.where(mask)
+            if len(xs) == 0:
+                return []
+            x1 = int(xs.min()) * sx
+            y1 = int(ys.min()) * sy
+            x2 = (int(xs.max()) + 1) * sx
+            y2 = (int(ys.max()) + 1) * sy
+            roi = self._pad_roi(x1, y1, x2 - x1, y2 - y1,
+                                base_pad, base_pad, img_w, img_h)
+            return [roi] if roi else []
+
+        try:
+            mask_u8 = (mask.astype(np.uint8) * 255)
+            kernel = np.ones((3, 3), np.uint8)
+            mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+            n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+                mask_u8, connectivity=8)
+        except Exception as e:
+            log.debug(f"[帧差] 连通域分析失败：{e}")
+            return []
+
+        comps = []
+        for i in range(1, n_labels):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area >= FRAME_DIFF_MIN_COMPONENT_AREA:
+                comps.append((area, i))
+
+        if not comps:
+            return []
+
+        comps.sort(reverse=True)
+        if len(comps) > FRAME_DIFF_MAX_COMPONENTS:
+            # 变化点太分散，逐块 OCR 反而更慢，直接整屏。
+            return [(0, 0, img_w, img_h)]
+
+        rois = []
+        for _area, i in comps:
+            cx = int(stats[i, cv2.CC_STAT_LEFT]) * sx
+            cy = int(stats[i, cv2.CC_STAT_TOP]) * sy
+            cw = max(1.0, int(stats[i, cv2.CC_STAT_WIDTH]) * sx)
+            ch = max(1.0, int(stats[i, cv2.CC_STAT_HEIGHT]) * sy)
+            pad_x = max(base_pad, int(cw * 0.2))
+            pad_y = max(base_pad,
+                        int(ch * FRAME_DIFF_PADDING_RATIO))
+            roi = self._pad_roi(cx, cy, cw, ch,
+                                pad_x, pad_y, img_w, img_h)
+            if roi:
+                rois.append(roi)
+
+        merged = self._merge_rois(rois, FRAME_DIFF_ROI_MERGE_GAP)
+        if not merged:
+            return []
+        if len(merged) > FRAME_DIFF_MAX_ROIS:
+            return [(0, 0, img_w, img_h)]
+        return merged
+
+
+    @staticmethod
+    def _pad_roi(x, y, w, h, pad_x, pad_y, img_w, img_h):
+        x1 = max(0, int(round(x - pad_x)))
+        y1 = max(0, int(round(y - pad_y)))
+        x2 = min(img_w, int(round(x + w + pad_x)))
+        y2 = min(img_h, int(round(y + h + pad_y)))
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            return None
         return (x1, y1, x2 - x1, y2 - y1)
+
+    @staticmethod
+    def _merge_rois(rois, gap=FRAME_DIFF_ROI_MERGE_GAP):
+        """合并重叠或间距小于 gap 的区块，减少 OCR 调用次数。"""
+        boxes = [[r[0], r[1], r[0] + r[2], r[1] + r[3]]
+                 for r in rois if r]
+        merged = True
+        while merged:
+            merged = False
+            out = []
+            while boxes:
+                a = boxes.pop()
+                i = 0
+                while i < len(boxes):
+                    b = boxes[i]
+                    overlap = not (
+                        a[2] + gap < b[0] or b[2] + gap < a[0] or
+                        a[3] + gap < b[1] or b[3] + gap < a[1]
+                    )
+                    if overlap:
+                        a = [min(a[0], b[0]), min(a[1], b[1]),
+                             max(a[2], b[2]), max(a[3], b[3])]
+                        boxes.pop(i)
+                        merged = True
+                    else:
+                        i += 1
+                out.append(a)
+            boxes = out
+        return [(b[0], b[1], max(1, b[2] - b[0]),
+                 max(1, b[3] - b[1])) for b in boxes]
+
+    def _get_changed_bbox(self, img):
+        """兼容旧接口：始终返回单个外接框。"""
+        rois = self._get_changed_rois(img)
+        if rois is None:
+            return None
+        if len(rois) == 1:
+            return rois[0]
+        x1 = min(r[0] for r in rois)
+        y1 = min(r[1] for r in rois)
+        x2 = max(r[0] + r[2] for r in rois)
+        y2 = max(r[1] + r[3] for r in rois)
+        return (x1, y1, x2 - x1, y2 - y1)
+
 
     def _make_frame_keys(self, items):
         q = self.state.position_quantize
@@ -626,11 +772,10 @@ class Pipeline:
         prev = self.state.last_frame_keys
         if not prev or not cur_keys:
             return False
-        inter = len(cur_keys & prev)
-        union = len(cur_keys | prev)
-        if union == 0:
-            return True
-        return inter / union >= self.state.frame_similarity_threshold
+        # 只要有新文本就必须继续处理；仅当本帧文本是上一帧的子集时才算未变化。
+        # 旧实现用 Jaccard >= 0.9，切屏后“大量相同文本 + 少量新英文”会被
+        # 误判为未变化，导致新增英文没有被翻译。
+        return not (cur_keys - prev)
 
     def _shrink_for_ocr(self, crop):
         max_w = self.state.max_ocr_width
@@ -900,10 +1045,10 @@ class Pipeline:
             return
 
         t_start = time.time()
-        bbox = self._get_changed_bbox(img)
+        rois = self._get_changed_rois(img)
         t_frame_diff = time.time()
 
-        if bbox is None:
+        if rois is None:
             self.state.idle_count += 1
             self._perf.tick(skipped=True)
             self._maybe_report_perf()
@@ -912,28 +1057,40 @@ class Pipeline:
         self.state.idle_count = 0
         self.state.idle_skip_counter = 0
         self.state.pending_change = True
+        if getattr(self.state, 'scene_reset_pending', False):
+            # 切屏 / 大范围变化：清空防抖状态和旧译文，避免旧屏幕的内容
+            # 遮挡新屏幕，或旧异步翻译任务回填到新画面。
+            self.state.scene_reset_pending = False
+            self.reset_debouncer()
+        scan_generation = self._generation
+        self._scan_generation = scan_generation
+        region = self.state.snapshot_region()
 
-        x, y, w, h = bbox
-        if w < 10 or h < 10:
-            self._perf.tick(skipped=True)
-            self._maybe_report_perf()
-            return
+        items = []
+        used_mt = False
+        for x, y, w, h in rois:
+            if w < 10 or h < 10:
+                continue
+            use_mt = (self.state.enable_multithread_ocr and
+                      self.ocr.pool_size > 1 and
+                      w * h >= MULTITHREAD_OCR_MIN_AREA)
+            if use_mt:
+                used_mt = True
+                items.extend(self._ocr_multithread(img, x, y, w, h))
+            else:
+                crop = img[y:y+h, x:x+w]
+                crop_small, scale = self._shrink_for_ocr(crop)
+                raw = self.ocr.recognize(crop_small)
+                items.extend(self._remap_items(raw, x, y, scale))
 
-        use_mt = (self.state.enable_multithread_ocr and
-                  self.ocr.pool_size > 1 and
-                  w * h >= MULTITHREAD_OCR_MIN_AREA)
-
-        if use_mt:
-            items = self._ocr_multithread(img, x, y, w, h)
-        else:
-            crop = img[y:y+h, x:x+w]
-            crop_small, scale = self._shrink_for_ocr(crop)
-            raw = self.ocr.recognize(crop_small)
-            items = self._remap_items(raw, x, y, scale)
-
+        # 多个变化区块可能有重叠，统一去重，避免同一段被翻译两次
+        items = self._dedupe(items)
         t_ocr = time.time()
 
         if not items:
+            # OCR 没有识别到文本：清掉本次扫描区域内的旧译文，
+            # 防止切屏后旧覆盖层停留在新画面上。
+            self._emit_paragraphs([], img, region, rois)
             self._perf.tick(has_ocr=True)
             self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
             self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
@@ -941,12 +1098,11 @@ class Pipeline:
             self._maybe_report_perf()
             return
 
-        region = self.state.snapshot_region()
-
         if self.state.enable_filter:
             items = filter_invalid_items(
                 items, region['width'], region['height'])
             if not items:
+                self._emit_paragraphs([], img, region, rois)
                 self._perf.tick(has_ocr=True)
                 self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
                 self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
@@ -957,6 +1113,7 @@ class Pipeline:
         if self.state.enable_general_filter:
             items = filter_general_content(items)
             if not items:
+                self._emit_paragraphs([], img, region, rois)
                 self._perf.tick(has_ocr=True)
                 self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
                 self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
@@ -969,6 +1126,7 @@ class Pipeline:
         if english_only_on and target_lang != 'en':
             items = filter_english_only(items)
             if not items:
+                self._emit_paragraphs([], img, region, rois)
                 self._perf.tick(has_ocr=True)
                 self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
                 self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
@@ -979,6 +1137,7 @@ class Pipeline:
         if getattr(self.state, 'enable_title_filter', False):
             items = filter_title_logo(items)
             if not items:
+                self._emit_paragraphs([], img, region, rois)
                 self._perf.tick(has_ocr=True)
                 self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
                 self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
@@ -991,14 +1150,6 @@ class Pipeline:
         self._prefill_from_phrases(items)
 
         cur_keys = self._make_frame_keys(items)
-        if self._is_frame_unchanged(cur_keys):
-            self._perf.tick(has_ocr=True)
-            self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
-            self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
-            self._perf.add('t_filter', (t_filter - t_ocr) * 1000)
-            self._perf.add('t_total', (t_filter - t_start) * 1000)
-            self._maybe_report_perf()
-            return
         self.state.last_frame_keys = cur_keys
 
         paragraphs = merge_lines_to_paragraphs(items)
@@ -1010,6 +1161,9 @@ class Pipeline:
         t_merge = time.time()
 
         if not to_translate:
+            # 即使没有需要翻译的文本，也要按本次扫描区域更新 known_items，
+            # 否则分块 OCR 下已经消失的旧译文会一直残留。
+            self._emit_paragraphs(to_translate, img, region, rois)
             self._perf.tick(has_ocr=True)
             self._perf.add('t_frame_diff', (t_frame_diff - t_start) * 1000)
             self._perf.add('t_ocr', (t_ocr - t_frame_diff) * 1000)
@@ -1041,7 +1195,7 @@ class Pipeline:
                 continue
             need_api.append((p, p_hash, line_hashes))
 
-        self._emit_paragraphs(to_translate, img, region)
+        self._emit_paragraphs(to_translate, img, region, rois)
 
         t_emit = time.time()
         total_ms = (t_emit - t_start) * 1000
@@ -1068,12 +1222,14 @@ class Pipeline:
             )
 
         if need_api:
-            mt_tag = " [多线程OCR]" if use_mt else ""
+            mt_tag = " [多线程OCR]" if used_mt else ""
             fast_tag = " [快档]" if self.state.fast_mode else ""
+            roi_tag = " / ".join(f"{rw}x{rh}"
+                                 for _, _, rw, rh in rois)
             log.info(f"[段落] 共 {len(to_translate)} 段 | "
                      f"需 API {len(need_api)} | "
                      f"策略 {strategy_name} ({strategy}) | "
-                     f"变化区 {w}x{h}{mt_tag}{fast_tag}")
+                     f"变化区 {roi_tag}{mt_tag}{fast_tag}")
 
             if self.state.fast_mode:
                 for p, p_hash, lh in need_api:
@@ -1082,17 +1238,20 @@ class Pipeline:
                     self._pending_translates.add(p_hash)
                     self.translate_pool.submit(
                         self._translate_one_and_emit,
-                        p, p_hash, lh, to_translate, img, region,
+                        p, p_hash, lh, to_translate, img, region, rois,
+                        scan_generation,
                     )
             else:
                 if self.state.enable_async_translate:
                     self.translate_pool.submit(
                         self._translate_and_emit,
-                        need_api, to_translate, img, region,
+                        need_api, to_translate, img, region, rois,
+                        scan_generation,
                     )
                 else:
                     self._translate_and_emit(
-                        need_api, to_translate, img, region,
+                        need_api, to_translate, img, region, rois,
+                        scan_generation,
                     )
 
     def _maybe_report_perf(self):
@@ -1124,7 +1283,8 @@ class Pipeline:
         )
 
     def _translate_one_and_emit(self, p, p_hash, lh, all_paragraphs,
-                                img, region):
+                                img, region, scan_rois=None,
+                                expected_generation=None):
         try:
             text = p['text']
             zh = self.translator.translate_lines([text])[0]
@@ -1133,13 +1293,15 @@ class Pipeline:
                 self.phrase_cache.put(text, zh)
             if self.state.freeze_overlay:
                 return
-            self._emit_paragraphs(all_paragraphs, img, region)
+            self._emit_paragraphs(all_paragraphs, img, region, scan_rois,
+                                  expected_generation)
         except Exception as e:
             log.exception(f"[单段翻译错误] {e}")
         finally:
             self._pending_translates.discard(p_hash)
 
-    def _translate_and_emit(self, need_api, all_paragraphs, img, region):
+    def _translate_and_emit(self, need_api, all_paragraphs, img, region,
+                            scan_rois=None, expected_generation=None):
         if self.state.freeze_overlay:
             return
         try:
@@ -1152,13 +1314,22 @@ class Pipeline:
                     self.phrase_cache.put(t, zh)
             if self.state.freeze_overlay:
                 return
-            self._emit_paragraphs(all_paragraphs, img, region)
+            self._emit_paragraphs(all_paragraphs, img, region, scan_rois,
+                                  expected_generation)
         except Exception as e:
             log.exception(f"[异步翻译错误] {e}")
 
-    def _emit_paragraphs(self, paragraphs, img, region):
-        if not paragraphs or self.state.freeze_overlay:
+    def _emit_paragraphs(self, paragraphs, img, region, scan_rois=None,
+                         expected_generation=None):
+        if self.state.freeze_overlay:
             return
+        if expected_generation is None:
+            expected_generation = getattr(self, '_scan_generation', None)
+        if expected_generation is not None:
+            with self._known_lock:
+                if expected_generation != self._generation:
+                    # 切屏 / 区域变更后，旧的异步翻译结果不能再回填。
+                    return
 
         use_inpaint = self.state.use_inpainting and CV2_AVAILABLE
         fine_enabled = self.state.enable_fine_text and CV2_AVAILABLE
@@ -1298,17 +1469,64 @@ class Pipeline:
                 log.info(f"[去重] {display_mode} {before} → {after}")
 
         with self._known_lock:
+            if (expected_generation is not None and
+                    expected_generation != self._generation):
+                return
             gen_at_start = self._generation
-            self._known_items = dict(cur_items)
+            if scan_rois and not self._is_full_scan(scan_rois, region):
+                # 分块 OCR 只重新识别变化区域：保留扫描区域之外的旧译文，
+                # 避免 overlay 因 cur_items 只包含局部段落而删掉其他区域，
+                # 造成“切屏后有些英文没有翻译/覆盖层消失”。
+                kept = {}
+                for key, old in self._known_items.items():
+                    if not self._item_in_rois(old, scan_rois, region):
+                        kept[key] = old
+                kept.update(cur_items)
+                self._known_items = kept
+            else:
+                # 整屏扫描（含整屏补扫）时完全替换，清掉旧屏幕残留的译文。
+                self._known_items = dict(cur_items)
             all_known = list(self._known_items.values())
 
         stable = self.emit_debouncer.process(all_known)
+        if stable is None:
+            if all_known:
+                return
+            # 整屏扫描后没有任何译文：显式发送空列表，
+            # 让覆盖层清掉旧屏幕残留的窗口。
+            stable = []
 
-        if stable is not None:
-            with self._known_lock:
-                if self._generation != gen_at_start:
-                    return
-            self.result_queue.put(('items', stable))
+        with self._known_lock:
+            if self._generation != gen_at_start:
+                return
+        self.result_queue.put(('items', stable))
+
+    @staticmethod
+    def _is_full_scan(rois, region):
+        if not rois or len(rois) != 1:
+            return False
+        rx, ry, rw, rh = rois[0]
+        return (rx <= 0 and ry <= 0 and
+                rw >= region.get('width', 0) and
+                rh >= region.get('height', 0))
+
+    @staticmethod
+    def _item_in_rois(item, rois, region):
+        """判断一个 overlay item（绝对坐标）是否落在本次 OCR 区块内。"""
+        ax1 = item.get('x1', 0)
+        ay1 = item.get('y1', 0)
+        ax2 = item.get('x2', 0)
+        ay2 = item.get('y2', 0)
+        left = region.get('left', 0)
+        top = region.get('top', 0)
+        for rx, ry, rw, rh in rois:
+            bx1 = left + rx
+            by1 = top + ry
+            bx2 = bx1 + rw
+            by2 = by1 + rh
+            if ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1:
+                return True
+        return False
 
     def _get_inpaint_cached(self, p_hash, img, x1, y1, x2, y2):
         with self._inpaint_lock:

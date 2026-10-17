@@ -25,8 +25,7 @@ from config import (
     DEFAULT_PHRASE_TABLE_PATH,
     PERFORMANCE_MODES, DEFAULT_MODE,
     IDLE_THRESHOLD_FOR_SLOWDOWN, IDLE_SLOWDOWN_FACTOR,
-    DEFAULT_ENABLE_FRAME_DIFF, DEFAULT_ENABLE_FILTER,
-    DEFAULT_ENABLE_BLOCK_OCR,
+    DEFAULT_ENABLE_SMART_OCR, DEFAULT_ENABLE_FILTER,
     DEFAULT_ENABLE_ASYNC_TRANSLATE, DEFAULT_ENABLE_WINDOW_POOL,
     CPU_ENGINE_COUNT_MIN,
     CPU_ENGINE_COUNT_MAX,
@@ -114,9 +113,13 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         saved_hotkeys = self.user_cfg.get_hotkeys()
 
         saved_frame_diff = self.user_cfg.get(
-            'enable_frame_diff', DEFAULT_ENABLE_FRAME_DIFF)
+            'enable_frame_diff', DEFAULT_ENABLE_SMART_OCR)
         saved_block = self.user_cfg.get(
-            'enable_block_ocr', DEFAULT_ENABLE_BLOCK_OCR)
+            'enable_block_ocr', DEFAULT_ENABLE_SMART_OCR)
+        # 两个旧开关合并为一个“智能 OCR”开关；旧配置按“两者都开启”迁移。
+        saved_smart = self.user_cfg.get(
+            'enable_smart_ocr',
+            bool(saved_frame_diff) and bool(saved_block))
         saved_filter = self.user_cfg.get(
             'enable_filter', DEFAULT_ENABLE_FILTER)
         saved_general_filter = self.user_cfg.get(
@@ -311,9 +314,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             enable_ocr_verify=saved_ocr_verify,
             enable_fast_lookup=saved_fast_lookup,
             mode_cfg=default_cfg,
-            enable_frame_diff=saved_frame_diff,
+            enable_frame_diff=saved_smart,
             enable_filter=saved_filter,
-            enable_block_ocr=saved_block,
+            enable_block_ocr=saved_smart,
             enable_async_translate=saved_async,
             enable_window_pool=saved_wpool,
             enable_multithread_ocr=True,
@@ -424,7 +427,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             saved_fast_lookup,
             saved_phrase_table_path,
             saved_translation_strategy,
-            saved_frame_diff, saved_block, saved_filter, saved_async,
+            saved_smart, saved_filter, saved_async,
             saved_wpool, saved_cache_max, saved_auto_clean,
             self.enable_ocr_speed_opt,
         )
@@ -443,7 +446,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                                 title_filter, ocr_verify,
                                 fast_lookup, phrase_table_path,
                                 translation_strategy,
-                                frame_diff, block, filt, async_t,
+                                smart_ocr, filt, async_t,
                                 wpool, cache_max, auto_clean,
                                 ocr_speed_opt):
         try:
@@ -538,14 +541,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             except Exception as e:
                 log.exception(f"[UI] 恢复本地模型设备失败：{e}")
 
-            if frame_diff:
-                self.frame_diff_switch.select()
+            if smart_ocr:
+                self.smart_ocr_switch.select()
             else:
-                self.frame_diff_switch.deselect()
-            if block:
-                self.block_ocr_switch.select()
-            else:
-                self.block_ocr_switch.deselect()
+                self.smart_ocr_switch.deselect()
             if filt:
                 self.filter_switch.select()
             else:
@@ -1107,7 +1106,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             from translation.local_models import (
                 set_preferred_device, unload_all_models)
             set_preferred_device(key)
-            unload_all_models()
+            # 默认 force=False：有已加载模型时不会在运行期销毁 DML 会话
+            if not unload_all_models():
+                log.info("[本地模型] 模型已加载，设备变更将在重启后生效")
         except Exception as e:
             log.exception(f"[本地模型] 设置设备失败：{e}")
         try:
@@ -1118,11 +1119,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
     def _apply_model_device_constraint(self) -> bool:
         """
-        新手保护：
-        - Opus-MT → 强制 CPU，禁用选择器（模型已屏蔽 GPU）
-        - Gemma3 只有 q4 → 强制 CPU
-        - Gemma3 有 FP32 → 允许自由选择
-        返回 True 表示已强制并设置了 hint
+        ⭐ 安全机制：绝对禁止 int8 模型运行在 GPU 上
         """
         label = getattr(self, '_current_model_label', None)
         if not label or label.startswith('（'):
@@ -1130,65 +1127,41 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             return False
 
         mid = self._model_id_by_label.get(label)
-        if not mid:
+        if not mid or mid.startswith('custom_'):
             self._set_device_selector_enabled(True)
             return False
 
-        if mid.startswith('custom_'):
-            self._set_device_selector_enabled(True)
-            return False
-
-        # 判断 loader
         try:
-            from translation.local_models.registry import get_registry_entry
-            meta = get_registry_entry(mid)
-            loader = meta.get('loader', 'hf_onnx') if meta else 'hf_onnx'
-        except Exception:
-            loader = 'hf_onnx'
-
-        if loader == 'gemma3':
-            # Gemma3：探测变体
-            try:
-                from translation.local_models.downloader import (
-                    get_model_path)
-                mp = get_model_path(mid)
-                onnx_dir = (Path(mp) / 'onnx') if mp else None
-                has_fp32 = ((onnx_dir / 'model.onnx').exists()
-                            if onnx_dir else False)
-                has_q4 = ((onnx_dir / 'model_q4.onnx').exists()
-                          if onnx_dir else False)
-            except Exception:
-                has_fp32 = has_q4 = False
-
-            if has_fp32:
-                self._set_device_selector_enabled(True)
-                return False
-            elif has_q4:
-                self._set_device_selector_enabled(False)
-                self._set_device_strict('cpu')
-                self._set_device_hint(
-                    "💡 q4 量化版仅支持 CPU。"
-                    "如需 GPU 加速，请下载 GPU 版（FP32）",
-                    '#cc6600')
-                return True
-            else:
-                self._set_device_selector_enabled(True)
-                return False
-
-        # Opus-MT：强制 CPU
-        self._set_device_selector_enabled(False)
-        try:
+            from translation.local_models.downloader import validate_model_files
             from translation.local_models import get_preferred_device
-            if get_preferred_device() != 'cpu':
-                self._set_device_strict('cpu')
+            has_cpu, _ = validate_model_files(mid, 'cpu')
+            has_gpu, _ = validate_model_files(mid, 'gpu')
+            pref = get_preferred_device()
         except Exception:
-            pass
+            return False
 
-        self._set_device_hint(
-            "💡 Opus-MT 已禁用 GPU 加速（兼容性）。"
-            "如需 GPU，请下载 Gemma3 模型",
-            '#cc6600')
-        return True
+        # 如果用户选的是 GPU 相关的设备 (非纯 CPU)
+        if pref != 'cpu':
+            # 如果只有 int8，没有 FP32，直接拦截并强制切回 CPU
+            if has_cpu and not has_gpu:
+                self._set_device_selector_enabled(True)
+                self._set_device_hint(
+                    "⚠️ 当前仅下载了 int8 模型，已强行锁定为 CPU。如需 GPU，请去下载 FP32 版本",
+                    '#cc0000')
+                self._set_device_strict('cpu')
+                return True
+            
+            # 如果连 GPU 版都没有
+            if not has_gpu:
+                self._set_device_selector_enabled(True)
+                self._set_device_hint(
+                    "⚠️ 想用 GPU 加速必须下载 GPU 版 (FP32) 模型！当前无 FP32 权重",
+                    '#cc0000')
+                return True
+
+        # 正常状态
+        self._set_device_selector_enabled(True)
+        return False
 
     def _update_local_model_device_hint(self):
         """刷新模型运算设备提示"""
@@ -1216,14 +1189,19 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             hint = f"💡 强制 CUDA → 当前：{actual or '未加载'}"
             color = '#28a745' if actual == 'CUDA' else '#cc6600'
         elif pref == 'directml':
-            hint = f"💡 强制 DirectML → 当前：{actual or '未加载'}"
+            try:
+                from dml_device import describe_dml_device
+                dml_tag = f"（{describe_dml_device()}）"
+            except Exception:
+                dml_tag = ''
+            hint = f"💡 DirectML{dml_tag} → 当前：{actual or '未加载'}"
             color = ('#28a745' if actual == 'DirectML' else '#cc6600')
         else:
             hint = f"💡 强制 CPU → 当前：{actual or '未加载'}"
             if variant_tag == 'GPU':
                 hint += "（FP32 模型）"
             elif variant_tag == 'CPU':
-                hint += "（量化模型）"
+                hint += "（int8 模型）"
             color = '#666666'
 
         self._set_device_hint(hint, color)
@@ -1238,29 +1216,14 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             return ''
 
         try:
-            from translation.local_models.registry import get_registry_entry
-            meta = get_registry_entry(mid)
-            loader = meta.get('loader', 'hf_onnx') if meta else 'hf_onnx'
-        except Exception:
-            loader = 'hf_onnx'
-
-        try:
-            from translation.local_models.downloader import get_model_path
-            mp = get_model_path(mid)
-            if not mp:
-                return ''
-            onnx_dir = Path(mp) / 'onnx'
-
-            if loader == 'gemma3':
-                if (onnx_dir / 'model.onnx').exists():
-                    return 'GPU'
-                if (onnx_dir / 'model_q4.onnx').exists():
-                    return 'CPU'
-            else:
-                if (onnx_dir / 'encoder_model.onnx').exists():
-                    return 'CPU'
-                if (onnx_dir / 'encoder_model_quantized.onnx').exists():
-                    return 'CPU'
+            from translation.local_models.downloader import validate_model_files
+            has_cpu, _ = validate_model_files(mid, 'cpu')
+            has_gpu, _ = validate_model_files(mid, 'gpu')
+            
+            if has_gpu:
+                return 'GPU'
+            if has_cpu:
+                return 'CPU'
         except Exception:
             pass
         return ''
@@ -1280,14 +1243,53 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         rev = {v: k for k, v in LOCAL_MODEL_DEVICES.items()}
         key = rev.get(label, DEFAULT_LOCAL_MODEL_DEVICE)
 
+        # ⭐ 安全检测：如果目标设备不是纯 CPU，必须检查当前模型是否包含 FP32 权重
+        if key != 'cpu':
+            model_label = getattr(self, '_current_model_label', None)
+            mid = self._model_id_by_label.get(model_label) if model_label else None
+
+            if mid and not mid.startswith('custom_'):
+                try:
+                    from translation.local_models.downloader import validate_model_files
+                    has_gpu, _ = validate_model_files(mid, 'gpu')
+                    
+                    if not has_gpu:
+                        from tkinter import messagebox
+                        messagebox.showwarning(
+                            "不支持 GPU 加速", 
+                            "当前选中的模型为 int8/q4 量化版，仅支持 CPU 运行！\n\n"
+                            "如需使用显卡（DirectML/CUDA）加速，请先前往「管理」面板下载对应模型的 GPU 版 (FP32)。", 
+                            parent=self
+                        )
+                        # 强行回滚设备选择器到原配置
+                        current_pref = self.user_cfg.get('local_model_device', DEFAULT_LOCAL_MODEL_DEVICE)
+                        if current_pref not in LOCAL_MODEL_DEVICES:
+                            current_pref = DEFAULT_LOCAL_MODEL_DEVICE
+                        self.local_model_device_selector.set(LOCAL_MODEL_DEVICES[current_pref])
+                        self._update_local_model_device_hint()
+                        return
+                except Exception as e:
+                    log.exception(f"[设备切换] 安全检测失败: {e}")
+                    # 如果检测过程出错，为安全起见也回滚
+                    current_pref = self.user_cfg.get('local_model_device', DEFAULT_LOCAL_MODEL_DEVICE)
+                    if current_pref not in LOCAL_MODEL_DEVICES:
+                        current_pref = DEFAULT_LOCAL_MODEL_DEVICE
+                    self.local_model_device_selector.set(LOCAL_MODEL_DEVICES[current_pref])
+                    return
+
+        # ==========================================
+        # 检测通过，执行正常的切换逻辑
+        # ==========================================
         self.user_cfg.set('local_model_device', key)
         self.user_cfg.save()
 
+        applied_now = True
         try:
             from translation.local_models import (
                 set_preferred_device, unload_all_models)
             set_preferred_device(key)
-            unload_all_models()
+            # ⭐ 运行期不销毁已加载的 DML 会话（会触发驱动级 0xC0000005）
+            applied_now = unload_all_models()
         except Exception as e:
             log.exception(f"[本地模型] 切换设备失败：{e}")
             self.bottom_label.configure(text=f"切换失败：{e}")
@@ -1300,23 +1302,27 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
         self._update_local_model_device_hint()
 
-        log.info(f"[本地模型] 设备切换为 {key}")
-        self.bottom_label.configure(
-            text=f"✅ 本地模型设备：{label}（下次翻译生效）")
+        log.info(f"[本地模型] 设备切换为 {key}"
+                 f"{'' if applied_now else '（重启后生效）'}")
+        if applied_now:
+            self.bottom_label.configure(
+                text=f"✅ 本地模型设备：{label}（下次翻译生效）")
+        else:
+            self.bottom_label.configure(
+                text=f"✅ 本地模型设备：{label}（重启应用后生效，"
+                     f"避免运行中切换显卡导致崩溃）")
 
     # ================= 本地模型 =================
 
     def _refresh_local_models(self):
-        """下拉显示已下载模型，标签里显示 [CPU] / [GPU] 变体"""
+        """⭐ 下拉显示区：明确区分 (int8) 和 (FP32)"""
         try:
-            from translation.local_models import (
-                get_available_models, is_downloaded)
+            from translation.local_models import get_available_models
             all_models = get_available_models()
         except Exception as e:
             log.debug(f"[本地模型] 模块不可用：{e}")
             try:
-                self.local_model_selector.configure(
-                    values=['（无本地模型支持）'])
+                self.local_model_selector.configure(values=['（无本地模型支持）'])
                 self.local_model_selector.set('（无本地模型支持）')
             except Exception:
                 pass
@@ -1329,46 +1335,37 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         for m in all_models:
             mid = m['id']
             is_custom = m.get('is_custom', False)
-
-            if is_custom:
-                label = f"{m['name']} [自定义]"
-                labels.append(label)
-                self._model_id_by_label[label] = mid
-                continue
-
-            try:
-                if not is_downloaded(mid):
+            
+            if not is_custom:
+                try:
+                    from translation.local_models.downloader import validate_model_files
+                    has_cpu, _ = validate_model_files(mid, 'cpu')
+                    has_gpu, _ = validate_model_files(mid, 'gpu')
+                    if not has_cpu and not has_gpu:
+                        continue
+                except Exception:
                     continue
-            except Exception:
-                continue
-
-            # 探测变体
-            try:
-                from translation.local_models.downloader import get_model_path
-                from translation.local_models.hf_onnx import detect_variants
-                mp = get_model_path(mid)
-                variants = detect_variants(mp) if mp else {'int8': False, 'fp32': False}
-            except Exception:
-                variants = {'int8': False, 'fp32': False}
+            else:
+                has_cpu = has_gpu = True
 
             tag = ''
-            if variants.get('fp32'):
-                tag = ' [GPU]'
-            elif variants.get('int8'):
-                tag = ' [CPU]'
+            if has_gpu: tag = ' [FP32]'
+            elif has_cpu: tag = ' [int8]'
 
             size = m.get('size_mb', 0)
-            if size > 0:
-                label = f"{m['name']} ({size:.0f}MB){tag}"
+            name = m.get('name', mid)
+            
+            if is_custom:
+                label = f"{name} [自定义]"
             else:
-                label = f"{m['name']}{tag}"
+                label = f"{name} ({size:.0f}MB){tag}"
+                
             labels.append(label)
             self._model_id_by_label[label] = mid
 
         if not labels:
             try:
-                self.local_model_selector.configure(
-                    values=['（未下载任何模型）'])
+                self.local_model_selector.configure(values=['（未下载任何模型）'])
                 self.local_model_selector.set('（未下载任何模型）')
             except Exception:
                 pass
@@ -1397,19 +1394,11 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._update_local_model_status()
         self._update_local_model_device_hint()
 
-        # ⭐ 提示用户设备已经自动调整
-        variant_tag = self._get_current_model_variant_tag()
-        if variant_tag == 'CPU':
-            try:
-                from translation.local_models import get_preferred_device
-                if get_preferred_device() != 'cpu':
-                    self.bottom_label.configure(
-                        text="已切换为 CPU 版模型，设备自动锁 CPU")
-            except Exception:
-                pass
-        elif variant_tag == 'GPU':
-            self.bottom_label.configure(
-                text="已切换为 GPU 版模型（FP32）")
+        # 提示用户当前选择的类型
+        if '[int8]' in label:
+            self.bottom_label.configure(text="当前选择：int8 模型 (仅限 CPU 运行)")
+        elif '[FP32]' in label:
+            self.bottom_label.configure(text="当前选择：FP32 模型 (支持 GPU 加速)")
 
     def _update_local_model_status(self):
         label = getattr(self, '_current_model_label', None)
@@ -1467,59 +1456,41 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self.bottom_label.configure(
                 text=f"打开选择对话框失败：{e}")
 
-    def _start_model_download(self, model_id: str,
-                                variant: str = 'quantized'):
+    def _start_model_download(self, model_id: str, variant: str = 'cpu'):
         """从选择对话框触发的下载"""
-        if getattr(self, '_downloading', False):
-            self.bottom_label.configure(
-                text="⚠️ 已有下载任务进行中")
-            return
-
         try:
+            if getattr(self, '_downloading', False):
+                self.bottom_label.configure(text="⚠️ 已有下载任务进行中")
+                return
+
             from translation.local_models.downloader import (
                 is_downloading, get_downloading_model)
             if is_downloading():
                 other = get_downloading_model()
-                self.bottom_label.configure(
-                    text=f"⚠️ 其他窗口正在下载：{other}")
+                self.bottom_label.configure(text=f"⚠️ 其他窗口正在下载：{other}")
                 return
-        except Exception:
-            pass
 
-        try:
-            from translation.local_models import ModelDownloader
-        except Exception as e:
-            self.bottom_label.configure(
-                text=f"❌ 本地模型模块不可用：{e}")
-            return
-
-        try:
-            from translation.local_models import get_available_models
+            from translation.local_models import ModelDownloader, get_available_models
             all_m = get_available_models()
             m = next((x for x in all_m if x['id'] == model_id), None)
             model_name = m['name'] if m else model_id
-        except Exception:
-            model_name = model_id
+        except Exception as e:
+            log.exception("[本地模型] 下载前置检查失败")
+            self.bottom_label.configure(text=f"❌ 下载失败：{e}")
+            return
 
-        variant_label = ('GPU 版' if variant == 'fp32'
-                         else '轻量版')
-
+        variant_label = 'GPU 版' if variant == 'gpu' else 'CPU 版'
         self._downloading = True
         self._downloading_model_id = model_id
         self._downloading_variant = variant
-        self._download_result = None
         self._downloader = ModelDownloader()
 
         try:
-            self.local_model_btn.configure(
-                text="下载中...", state='disabled')
+            self.local_model_btn.configure(text="下载中...", state='disabled')
             self.local_model_del_btn.configure(state='disabled')
             self.local_model_progress.set(0)
-            self.local_model_status.configure(
-                text=f"下载{variant_label} {model_name}",
-                text_color='#3a86ff')
-            self.bottom_label.configure(
-                text=f"开始下载 {variant_label}：{model_name}")
+            self.local_model_status.configure(text=f"下载{variant_label} {model_name}", text_color='#3a86ff')
+            self.bottom_label.configure(text=f"开始下载 {variant_label}：{model_name}")
         except Exception:
             pass
 
@@ -1531,38 +1502,30 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                 pass
 
         def progress_cb(p):
-            _safe_after(0,
-                        lambda: self.local_model_progress.set(p))
+            _safe_after(0, lambda: self.local_model_progress.set(p))
 
         def status_cb(s):
-            _safe_after(0,
-                        lambda: self.bottom_label.configure(text=s))
+            _safe_after(0, lambda: self.bottom_label.configure(text=s))
 
         def worker():
             try:
-                self._download_result = self._downloader.download(
+                self._downloader.download(
                     model_id, variant=variant,
                     progress_cb=progress_cb, status_cb=status_cb)
             except Exception as e:
-                log.exception(f"[本地模型] 下载失败：{e}")
-                self._download_result = None
-            _safe_after(0, self._on_download_finished)
+                log.exception(f"[本地模型] 下载线程异常：{e}")
+            finally:
+                _safe_after(0, self._on_download_finished)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_download_finished(self):
-        self._downloading = False
-        result = getattr(self, '_download_result', None)
-        model_id = getattr(self, '_downloading_model_id', None)
-        variant = getattr(self, '_downloading_variant', 'quantized')
-        self._download_result = None
-        self._downloading_model_id = None
-        self._downloading_variant = None
-
+        """下载完成或失败"""
         try:
+            self._downloading = False
             if self.winfo_exists():
                 self.local_model_btn.configure(state='normal')
-                self.local_model_progress.set(1.0 if result else 0)
+                self.local_model_progress.set(1.0)
         except Exception:
             pass
 
@@ -1580,85 +1543,48 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                     self.local_model_btn.configure(text="下载")
             except Exception:
                 pass
+            self._downloading_model_id = None
+            self._downloading_variant = None
             if self.winfo_exists():
                 self.after(500, self._refresh_local_models)
             return
 
-        # ⭐ 下载失败时必须明确报错（此前无论成败都提示「下载完成」）
-        if not result:
-            log.warning(f"[本地模型] 下载未成功：{model_id}")
-            try:
-                if self.winfo_exists():
-                    self.local_model_btn.configure(text="重试下载")
-                    self.local_model_status.configure(
-                        text="下载失败", text_color='#cc0000')
-                    self.bottom_label.configure(
-                        text="❌ 下载失败，详情见日志（可点「重试下载」）")
-            except Exception:
-                pass
-            try:
-                if self.winfo_exists():
-                    self.after(500, self._refresh_local_models)
-            except Exception:
-                pass
-            return
-
-        # ⭐ 丢弃旧缓存，确保刚下载的模型能立即加载
-        if model_id:
-            try:
-                from translation.local_models import invalidate_model
-                invalidate_model(model_id)
-                log.info(f"[本地模型] 已失效缓存：{model_id}")
-            except Exception as e:
-                log.debug(f"[本地模型] 缓存失效失败：{e}")
+        variant = getattr(self, '_downloading_variant', 'cpu')
+        self._downloading_model_id = None
+        self._downloading_variant = None
 
         # ⭐ 下载完成后，根据 variant 自动设置设备
         try:
-            if variant == 'quantized':
+            if variant == 'cpu':
                 self._set_device_strict('cpu')
-                log.info("[本地模型] 轻量版下载完成，设备自动设为 CPU")
-            elif variant == 'fp32':
+                log.info("[本地模型] CPU 版下载完成，设备自动设为 CPU")
+            elif variant == 'gpu':
                 self._set_device_strict('auto')
                 log.info("[本地模型] GPU 版下载完成，设备自动设为 auto")
         except Exception as e:
             log.exception(f"[本地模型] 设置设备失败：{e}")
 
-        # 自动扫描同步
+        # 自动扫描同步 Provider
         try:
             from translation.api_config import sync_downloaded_models
             result = sync_downloaded_models()
             added = result.get('added', [])
             if added:
                 log.info(f"[本地模型] 自动注册：{added}")
-                try:
-                    if self.winfo_exists():
-                        self.bottom_label.configure(
-                            text=f"✅ 下载完成，已自动启用："
-                                 f"{added[0]}")
-                except Exception:
-                    pass
-            else:
-                try:
-                    if self.winfo_exists():
-                        variant_label = ('GPU 版'
-                                         if variant == 'fp32'
-                                         else '轻量版')
-                        self.bottom_label.configure(
-                            text=f"✅ {variant_label}下载完成")
-                except Exception:
-                    pass
         except Exception as e:
             log.exception(f"[本地模型] 自动同步失败：{e}")
 
         try:
             self.translator.reload_config()
-        except Exception as e:
-            log.exception(f"[本地模型] translator 重载失败：{e}")
+        except Exception:
+            pass
 
+        # 恢复 UI
         try:
             if self.winfo_exists():
+                variant_label = 'GPU 版' if variant == 'gpu' else 'CPU 版'
+                self.bottom_label.configure(text=f"✅ {variant_label}下载完成")
                 self.after(500, self._refresh_local_models)
-                self.after(500, self._update_local_model_device_hint)
         except Exception:
             pass
 
@@ -2815,7 +2741,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                     else "批量翻译")
         desc = (
             f"扫描 {cfg['scan_interval']:.2f}s | "
-            f"灵敏度 {cfg['change_ratio_threshold']:.2f} | "
+            f"灵敏度 {cfg['change_ratio_threshold'] * 100:.3f}% | "
             f"外扩 {cfg['bbox_padding']}px | "
             f"OCR {cfg['max_ocr_width']}×{cfg['max_ocr_height']} | "
             f"{mode_tag}"
@@ -2824,23 +2750,23 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
     # ================= 开关 =================
 
-    def _on_frame_diff_toggle(self):
-        enabled = bool(self.frame_diff_switch.get())
+    def _on_smart_ocr_toggle(self):
+        enabled = bool(self.smart_ocr_switch.get())
+        # 帧差检测与分块 OCR 必须同时开启才生效，合并为一个开关。
         self.app_state.enable_frame_diff = enabled
-        self.app_state.reset_signature()
-        msg = "帧差检测：已开启" if enabled else "帧差检测：已关闭"
-        self.bottom_label.configure(text=msg)
-        log.info(f"[开关] {msg}")
-        self.user_cfg.set('enable_frame_diff', enabled)
-        self.user_cfg.save()
-
-    def _on_block_ocr_toggle(self):
-        enabled = bool(self.block_ocr_switch.get())
         self.app_state.enable_block_ocr = enabled
         self.app_state.reset_signature()
-        msg = "分块 OCR：已开启" if enabled else "分块 OCR：已关闭"
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
+        msg = ("智能帧差 + 分块 OCR：已开启"
+               if enabled else "智能帧差 + 分块 OCR：已关闭（整屏识别）")
         self.bottom_label.configure(text=msg)
         log.info(f"[开关] {msg}")
+        # 同时写入新旧配置键，兼容旧版本配置。
+        self.user_cfg.set('enable_smart_ocr', enabled)
+        self.user_cfg.set('enable_frame_diff', enabled)
         self.user_cfg.set('enable_block_ocr', enabled)
         self.user_cfg.save()
 
@@ -3038,6 +2964,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         value = max(CACHE_MIN, min(CACHE_MAX, value))
         self.cache_limit_label.configure(text=str(value))
         self.cache.max_size = value
+        # 立即触发一次清理检查
+        self.cache.set_auto_clean(self.cache.auto_clean)
+        self._update_cache_label()
         self.user_cfg.set('cache_max_size', value)
         self.user_cfg.save()
 
@@ -3050,17 +2979,32 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         if hasattr(self.pipeline, 'color_cache'):
             self.pipeline.color_cache.clear()
         self._update_cache_label()
-        self.bottom_label.configure(text="缓存已清空")
+        self.bottom_label.configure(text="缓存已清空并释放了空间")
         log.info("[缓存] 手动清空")
 
     def _update_cache_label(self):
         try:
             n = self.cache.size()
-            cap = self.cache.max_size
+            mb = self.cache.get_file_size_mb()
             self.cache_size_label.configure(
-                text=f"缓存条目：{n} / {cap}")
+                text=f"已占用：{mb:.2f} MB ({n} 条)")
         except Exception:
             pass
+
+    def _open_cache_dir(self):
+        """打开缓存目录"""
+        try:
+            from cache import CACHE_DIR
+            import os, sys
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            if sys.platform == 'win32':
+                os.startfile(CACHE_DIR)
+            elif sys.platform == 'darwin':
+                os.system(f'open "{CACHE_DIR}"')
+            else:
+                os.system(f'xdg-open "{CACHE_DIR}"')
+        except Exception as e:
+            log.error(f"[缓存] 打开目录失败：{e}")
 
     def open_api_config(self):
         try:

@@ -26,6 +26,7 @@ MODULES = [
     'layout', 'cache', 'phrase_cache', 'local_dict', 'emit_debouncer',
     # 图像 / OCR / 硬件
     'inpaint', 'ocr_engine', 'ocr_worker', 'cuda_setup', 'scroll_detector',
+    'dml_gate', 'dml_device',
     # 翻译后端
     'translation',
     'translation.base', 'translation.api_config', 'translation.throttle',

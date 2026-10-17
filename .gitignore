@@ -5,28 +5,15 @@ __pycache__/
 *.so
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+.eggs/
 
 # ============ 虚拟环境 ============
 .venv/
 venv/
 ENV/
 env/
-env.bak/
-venv.bak/
 
 # ============ IDE ============
 .idea/
@@ -40,7 +27,7 @@ venv.bak/
 logs/
 .vscode/*.log
 
-# ============ 模型文件（重要！）============
+# ============ 模型文件 (关键) ============
 models/
 *.onnx
 *.onnx_data
@@ -51,10 +38,16 @@ models/
 *.pt
 *.pth
 
+# ============ 缓存文件 (关键) ============
+cache/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
 # ============ 打包产物 ============
 *.spec
-build/
-dist/
 *.exe
 
 # ============ 系统文件 ============
@@ -78,24 +71,3 @@ htmlcov/
 # ============ 其他 ============
 *.bak
 *.tmp
-*.swp
-
-# ============ 模型文件 ============
-models/
-*.onnx
-*.onnx_data
-*.onnx_data_*
-*.bin
-*.safetensors
-
-# ============ Python/虚拟环境 ============
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-
-# ============ 打包与日志 ============
-build/
-dist/
-*.spec
-*.log

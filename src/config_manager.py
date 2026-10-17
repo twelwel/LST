@@ -55,6 +55,7 @@ DEFAULT_USER_CONFIG = {
     "fg_color": "auto",
 
     # 优化开关
+    "enable_smart_ocr": True,
     "enable_frame_diff": True,
     "enable_block_ocr": True,
     "enable_filter": True,
@@ -71,7 +72,7 @@ DEFAULT_USER_CONFIG = {
 
     # 缓存
     "auto_clean": True,
-    "cache_max_size": 500,
+    "cache_max_size": 1000,
 
     "phrase_table_path": "",
 

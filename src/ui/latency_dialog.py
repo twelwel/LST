@@ -3,8 +3,9 @@
 import threading
 import customtkinter as ctk
 
-from config import FONT_NAME
+from config import FONT_NAME, TRANSLATION_STRATEGIES
 from logger import get_logger
+from latency_tester import LatencyTester  # ⭐ 修正了这里
 
 log = get_logger('ui.latency')
 
@@ -14,7 +15,7 @@ class LatencyTestDialog(ctk.CTkToplevel):
                  pipeline=None, app_state=None):
         super().__init__(master)
         self.title("延迟测试")
-        self.geometry("920x700")
+        self.geometry("920x720")
         self.attributes('-topmost', True)
 
         self.translator = translator
@@ -32,9 +33,24 @@ class LatencyTestDialog(ctk.CTkToplevel):
     def _build_ui(self):
         pad = 12
 
+        # ⭐ 顶部提示：显示当前的策略
+        strategy_frame = ctk.CTkFrame(self, fg_color='transparent')
+        strategy_frame.pack(fill='x', padx=pad, pady=(pad, 0))
+        
+        strat_key = 'single_translate'
+        if self.app_state:
+            strat_key = getattr(self.app_state, 'translation_strategy', 'single_translate')
+        strat_name = TRANSLATION_STRATEGIES.get(strat_key, strat_key)
+
+        ctk.CTkLabel(
+            strategy_frame, 
+            text=f"当前测试将使用主界面策略：{strat_name}", 
+            font=(FONT_NAME, 12, 'bold'), text_color='#3a86ff'
+        ).pack(side='left', padx=6)
+
         # ============ 测试项 ============
         opt_frame = ctk.CTkFrame(self, height=1)
-        opt_frame.pack(fill='x', padx=pad, pady=(pad, 6))
+        opt_frame.pack(fill='x', padx=pad, pady=(6, 6))
         opt_frame.pack_propagate(True)
 
         ctk.CTkLabel(
@@ -73,7 +89,7 @@ class LatencyTestDialog(ctk.CTkToplevel):
 
         self.var_api = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            opt_frame, text="API",
+            opt_frame, text="API 翻译",
             variable=self.var_api,
             font=(FONT_NAME, 10),
         ).pack(side='left', padx=4)
@@ -85,7 +101,6 @@ class LatencyTestDialog(ctk.CTkToplevel):
             font=(FONT_NAME, 10, 'bold'),
         ).pack(side='left', padx=4)
 
-        # ⭐ 全链路冷启动选项
         self.var_e2e_clean = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             opt_frame, text="冷启动(每轮清缓存)",
@@ -230,12 +245,20 @@ class LatencyTestDialog(ctk.CTkToplevel):
             self._log("[错误] 未配置 pipeline")
             return
 
+        # ⭐ 强制同步最新的翻译策略
+        if self.translator:
+            try:
+                self.translator.reload_config()
+                self._log("[策略] 已重新载入最新的主界面策略配置")
+            except Exception as e:
+                self._log(f"[策略] 配置重载失败：{e}")
+
         self._was_running = False
         try:
             if self.app_state is not None and self.app_state.running:
                 self._was_running = True
                 self.app_state.running = False
-                self._log("[提示] 已自动暂停翻译")
+                self._log("[提示] 已自动暂停主界面翻译")
         except Exception:
             pass
 
@@ -282,18 +305,18 @@ class LatencyTestDialog(ctk.CTkToplevel):
     def _run_test(self, runs, do_ocr, do_verify, do_api, api_runs,
                   do_local, local_runs, do_e2e, e2e_runs,
                   do_e2e_clean=False):
-        from latency_tester import LatencyTester
-
-        tester = LatencyTester(
-            translator=self.translator,
-            ocr_engine=self.ocr_engine if do_ocr else None,
-            pipeline=self.pipeline if do_e2e else None,
-            progress_cb=self._progress_cb,
-            log_cb=self._log_cb,
-        )
-        self._tester = tester
-
+        
+        # ⭐ 这里改为直接从 latency_tester 导入
         try:
+            tester = LatencyTester(
+                translator=self.translator,
+                ocr_engine=self.ocr_engine if do_ocr else None,
+                pipeline=self.pipeline if do_e2e else None,
+                progress_cb=self._progress_cb,
+                log_cb=self._log_cb,
+            )
+            self._tester = tester
+
             tester.run(
                 runs=runs,
                 warmup=2,
@@ -307,11 +330,12 @@ class LatencyTestDialog(ctk.CTkToplevel):
                 e2e_runs=e2e_runs,
                 e2e_clean_cache=do_e2e_clean,
             )
+            report = tester.get_report_text()
+            self.after(0, lambda: self._finish(report))
+            
         except Exception as e:
             self.after(0, lambda: self._log(f"[异常] {e}"))
-
-        report = tester.get_report_text()
-        self.after(0, lambda: self._finish(report))
+            self.after(0, lambda: self._finish("测试发生异常，请检查日志"))
 
     def _progress_cb(self, cur, total):
         self.after(0, lambda: self._update_progress(cur, total))
@@ -353,7 +377,7 @@ class LatencyTestDialog(ctk.CTkToplevel):
         try:
             if self._was_running and self.app_state is not None:
                 self.app_state.running = True
-                self._log("[提示] 已恢复翻译运行")
+                self._log("[提示] 已恢复主界面翻译运行")
         except Exception:
             pass
 

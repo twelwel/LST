@@ -26,9 +26,13 @@ def _worker_init():
 
     try:
         from rapidocr import RapidOCR
+        from dml_device import dml_provider_option_dict
+        from ocr_engine import _patch_rapidocr_dml_options
+        _patch_rapidocr_dml_options()
 
         params = {
             "EngineConfig.onnxruntime.use_dml": True,
+            "EngineConfig.onnxruntime.dml_ep_cfg": dml_provider_option_dict(),
             "Det.use_dml": True,
             "Rec.use_dml": True,
             "Cls.use_dml": False,

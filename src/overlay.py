@@ -752,6 +752,9 @@ class OverlayWindow:
     def update(self, items, base_font_size=15):
         self.base_font_size = base_font_size
         if not items:
+            # 管线在整屏扫描后没有译文时会发送空列表：
+            # 清掉旧屏幕残留的覆盖窗口。
+            self.clear()
             return
 
         new_map = {it['key']: it for it in items}

@@ -10,8 +10,7 @@ from config import (
     INITIAL_FONT_SIZE,
     CPU_ENGINE_COUNT_MIN, CPU_ENGINE_COUNT_MAX, CPU_ENGINE_COUNT_DEFAULT,
     DML_WORKER_COUNT_MIN, DML_WORKER_COUNT_MAX, DML_WORKER_COUNT_DEFAULT,
-    DEFAULT_ENABLE_FRAME_DIFF,
-    DEFAULT_ENABLE_BLOCK_OCR,
+    DEFAULT_ENABLE_SMART_OCR,
     DEFAULT_ENABLE_FILTER,
     DEFAULT_ENABLE_GENERAL_FILTER,
     DEFAULT_ENABLE_ENGLISH_ONLY,
@@ -179,24 +178,15 @@ class DisplayPanelMixin:
             parent, text="优化功能：", font=(FONT_NAME, 11, 'bold'),
         ).grid(row=9, column=0, sticky='w', padx=(15, 5), pady=(6, 4))
 
-        self.frame_diff_switch = ctk.CTkSwitch(
-            parent, text="帧差检测（静止时跳过）",
-            command=self._on_frame_diff_toggle,
+        self.smart_ocr_switch = ctk.CTkSwitch(
+            parent,
+            text="智能帧差 + 分块 OCR（只识别变化区域，静止时跳过）",
+            command=self._on_smart_ocr_toggle,
             onvalue=True, offvalue=False, font=(FONT_NAME, 10),
         )
-        if DEFAULT_ENABLE_FRAME_DIFF:
-            self.frame_diff_switch.select()
-        self.frame_diff_switch.grid(row=10, column=0, columnspan=3,
-                                    sticky='w', padx=(25, 15), pady=(0, 3))
-
-        self.block_ocr_switch = ctk.CTkSwitch(
-            parent, text="分块 OCR（只识别变化的区域）",
-            command=self._on_block_ocr_toggle,
-            onvalue=True, offvalue=False, font=(FONT_NAME, 10),
-        )
-        if DEFAULT_ENABLE_BLOCK_OCR:
-            self.block_ocr_switch.select()
-        self.block_ocr_switch.grid(row=11, column=0, columnspan=3,
+        if DEFAULT_ENABLE_SMART_OCR:
+            self.smart_ocr_switch.select()
+        self.smart_ocr_switch.grid(row=10, column=0, columnspan=3,
                                    sticky='w', padx=(25, 15), pady=(0, 3))
 
         self.filter_switch = ctk.CTkSwitch(
@@ -502,7 +492,7 @@ class DisplayPanelMixin:
 
         # ===== 缓存上限 =====
         ctk.CTkLabel(
-            parent, text="缓存上限：", font=(FONT_NAME, 11),
+            parent, text="缓存上限 (条)：", font=(FONT_NAME, 11),
         ).grid(row=33, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.cache_limit_label = ctk.CTkLabel(
@@ -521,24 +511,31 @@ class DisplayPanelMixin:
         self.cache_limit_slider.grid(row=33, column=1,
                                       sticky='ew', padx=10)
 
-        # ===== 缓存显示 =====
+        # ===== 缓存显示与操作 =====
         cache_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
         cache_row.grid(row=34, column=0, columnspan=3,
                        sticky='ew', padx=(15, 15), pady=(4, 12))
         cache_row.pack_propagate(True)
 
         self.cache_size_label = ctk.CTkLabel(
-            cache_row, text="缓存条目：0",
-            font=(FONT_NAME, 10), text_color='gray',
+            cache_row, text="已占用：0.00 MB (0 条)",
+            font=(FONT_NAME, 10), text_color='#3a86ff',
         )
         self.cache_size_label.pack(side='left')
 
         ctk.CTkButton(
-            cache_row, text="立即清理", width=80,
+            cache_row, text="打开缓存目录", width=100,
+            font=(FONT_NAME, 10),
+            fg_color='#17a2b8', hover_color='#138496',
+            command=self._open_cache_dir,
+        ).pack(side='right', padx=(6, 0))
+
+        ctk.CTkButton(
+            cache_row, text="清空缓存", width=80,
+            font=(FONT_NAME, 10),
+            fg_color='#dc3545', hover_color='#c82333',
             command=self._manual_clear_cache,
         ).pack(side='right')
-
-        parent.grid_columnconfigure(1, weight=1)
 
         self._update_phrase_count()
 
