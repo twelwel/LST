@@ -28,10 +28,15 @@ DEFAULT_PROVIDERS = [
 ]
 
 DEFAULT_STRATEGY = {
-    "mode": "local_api",
+    "mode": "single_translate",
     "hybrid_order": "translate_first",
     "vote_count": 3,
     "vote_strategy": "similarity",
+    # 主界面「本地模型」下拉框选中的模型；空 = 使用首个可用本地模型
+    "local_model_id": "",
+    # 远程策略失败后是否自动回退本地模型。
+    # 默认关闭，本地翻译由主界面「本地流式」独立按钮显式触发。
+    "local_fallback": False,
 }
 
 
@@ -162,6 +167,16 @@ def ensure_local_provider(model_id: str,
             if p.get('provider') == 'local_model':
                 cfg = p.get('config', {}) or {}
                 if cfg.get('model_id') == model_id:
+                    # 手动配置里可能把本地模型关闭了；从下拉框选中时应恢复启用。
+                    changed = False
+                    if not p.get('enabled', True):
+                        p['enabled'] = True
+                        changed = True
+                    if p.get('type') != 'translate':
+                        p['type'] = 'translate'
+                        changed = True
+                    if changed:
+                        return save_providers(providers)
                     return True
 
         has_translate = any(
@@ -185,6 +200,38 @@ def ensure_local_provider(model_id: str,
         return save_providers(providers)
 
 
+def select_local_model(model_id: str, model_name: str = '') -> bool:
+    """主界面下拉框选中本地模型：注册 Provider 并持久化选择。"""
+    model_id = (model_id or '').strip()
+    if not model_id:
+        return False
+
+    try:
+        ensure_local_provider(model_id, model_name)
+    except Exception as e:
+        print(f"[本地模型] 注册 Provider 失败：{e}")
+
+    with _lock:
+        strategy = load_strategy()
+        if str(strategy.get('local_model_id') or '').strip() == model_id:
+            return True
+        strategy['local_model_id'] = model_id
+        return save_strategy(strategy)
+
+
+def clear_local_model_selection(model_id: str = '') -> bool:
+    """清空本地模型选择；指定 model_id 时仅在匹配时清空。"""
+    with _lock:
+        strategy = load_strategy()
+        selected = str(strategy.get('local_model_id') or '').strip()
+        if not selected:
+            return False
+        if model_id and selected != (model_id or '').strip():
+            return False
+        strategy['local_model_id'] = ''
+        return save_strategy(strategy)
+
+
 def remove_local_provider(model_id: str) -> bool:
     """移除某个本地模型 Provider（不触发 reload）"""
     if not model_id:
@@ -205,7 +252,11 @@ def remove_local_provider(model_id: str) -> bool:
         if not removed:
             return False
 
-        return save_providers(new_list)
+        saved = save_providers(new_list)
+        if saved:
+            # 删除 Provider 时同步清空选择，避免策略继续指向已移除的模型。
+            clear_local_model_selection(model_id)
+        return saved
 
 
 # ==================== 自动扫描同步 ====================
@@ -233,7 +284,9 @@ def _do_sync_downloaded_models() -> dict:
     # ---- 1. 扫描已下载的内置模型（全部候选目录 + 校验真实权重）----
     try:
         from .local_models.downloader import list_downloaded_ids
+        from .local_models.registry import MODEL_REGISTRY
         downloaded = list_downloaded_ids()
+        builtin_ids = set(MODEL_REGISTRY)
     except Exception as e:
         print(f"[同步] 扫描失败：{e}")
         return result
@@ -287,9 +340,11 @@ def _do_sync_downloaded_models() -> dict:
             need_save = True
 
         # ---- 4. 移除 ----
+        # 只清理「内置模型」中已经不存在的 Provider。
+        # 自定义模型的 id 不在 MODEL_REGISTRY 里，不能因为扫描不到就删掉。
         to_remove = [
             mid for mid in existing_local
-            if mid not in downloaded
+            if mid in builtin_ids and mid not in downloaded
         ]
 
         if to_remove:
@@ -303,6 +358,16 @@ def _do_sync_downloaded_models() -> dict:
             ]
             result['removed'] = to_remove
             need_save = True
+
+            # 删除的正好是当前选中模型时，清空选择，避免下拉框指向幽灵模型。
+            try:
+                strategy = load_strategy()
+                selected = str(strategy.get('local_model_id') or '').strip()
+                if selected in to_remove:
+                    strategy['local_model_id'] = ''
+                    save_strategy(strategy)
+            except Exception:
+                pass
 
         # ---- 5. 保存 ----
         if need_save:

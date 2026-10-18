@@ -130,6 +130,20 @@ hiddenimports += [
     'threading',
     'concurrent.futures',
 
+    # torch / numpy / transformers 在运行期会 import unittest / doctest。
+    # PyInstaller 默认可能把它们当测试模块裁掉，导致打包版本地模型加载时报
+    # “No module named 'unittest'”。这里必须显式保留。
+    'unittest',
+    'unittest.case',
+    'unittest.mock',
+    'unittest.util',
+    'unittest.loader',
+    'unittest.suite',
+    'unittest.result',
+    'unittest.runner',
+    'unittest.signals',
+    'doctest',
+
     # 项目模块
     'emit_debouncer',
     'logger',
@@ -243,9 +257,10 @@ a = Analysis(
         'ipywidgets',
 
         # 测试
+        # ⚠️ 不能排除 unittest / doctest：torch 和 transformers 在
+        # 正常模型加载路径中会 import unittest，排除后打包版会报
+        # “No module named 'unittest'”（本地模型无法调用）。
         'pytest',
-        'unittest',
-        'doctest',
 
         # 打包工具
         'setuptools',
@@ -306,7 +321,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name=APP_NAME,
-    version=VERSION_INFO,           # Windows 文件属性版本（1.40.6）
+    version=VERSION_INFO,           # Windows 文件属性版本（与 src/version.py 同步）
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

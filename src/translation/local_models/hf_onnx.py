@@ -57,6 +57,15 @@ def _build_session_options(use_gpu: bool):
         return so
     except Exception: return None
 
+
+def _inference_mode():
+    """生成阶段关闭 autograd，降低显存/内存占用。"""
+    try:
+        import torch
+        return torch.inference_mode()
+    except Exception:
+        return nullcontext()
+
 def detect_variants(model_path: Path) -> dict:
     onnx_dir = Path(model_path) / 'onnx'
     return {
@@ -104,14 +113,18 @@ class HFONNXModel(BaseTranslationModel):
                 self._tokenizer = AutoTokenizer.from_pretrained(str(model_path))
             except Exception as e:
                 self.last_error = f"初始化失败：{e}"
+                # 打包版常见为缺少 hiddenimport；保留完整堆栈便于定位。
+                log.exception(f"[ONNX] 初始化失败：{self._model_id}（{e}）")
                 return False
 
             pref = get_preferred_device()
-            prefer_gpu = pref in ('auto', 'cuda', 'directml')
-            
             onnx_dir = model_path / 'onnx'
             has_fp32 = (onnx_dir / 'encoder_model.onnx').exists()
             has_int8 = (onnx_dir / 'encoder_model_quantized.onnx').exists()
+            # 自动模式只有下载了 FP32 才走 GPU；否则直接使用 int8 CPU，
+            # 避免“只下载 CPU 版”时被误判为 GPU 不可用而加载失败。
+            prefer_gpu = (pref in ('cuda', 'directml')
+                          or (pref == 'auto' and has_fp32))
 
             # ⭐ 智能选择：GPU 必须用 FP32，CPU 优先 int8
             if prefer_gpu:
@@ -162,7 +175,8 @@ class HFONNXModel(BaseTranslationModel):
 
                     # Warmup 探测（DirectML 设备真正跑一次）
                     inputs = self._tokenizer("hello", return_tensors='pt', max_length=64)
-                    _ = model.generate(**inputs, max_length=10)
+                    with _inference_mode():
+                        _ = model.generate(**inputs, max_length=10)
 
                     self._model = model
                     self._provider_name = pname
@@ -181,7 +195,7 @@ class HFONNXModel(BaseTranslationModel):
                 log.info(f"[ONNX] 加载成功：{self._model_id} @ {pname}（{self._variant_label}）")
             return True
         except Exception as e:
-            log.warning(f"[ONNX] {pname} 失败：{e}")
+            log.exception(f"[ONNX] {pname} 失败：{e}")
             return False
 
     def translate(self, text: str, src_lang: str = 'auto', tgt_lang: str = 'zh') -> str:
@@ -203,13 +217,14 @@ class HFONNXModel(BaseTranslationModel):
                         no_repeat = 2
                     else:
                         no_repeat = 3
-                    outputs = self._model.generate(
-                        **inputs,
-                        max_new_tokens=max_new,
-                        num_beams=1,
-                        no_repeat_ngram_size=no_repeat,
-                        repetition_penalty=1.15,
-                    )
+                    with _inference_mode():
+                        outputs = self._model.generate(
+                            **inputs,
+                            max_new_tokens=max_new,
+                            num_beams=1,
+                            no_repeat_ngram_size=no_repeat,
+                            repetition_penalty=1.15,
+                        )
                     return self._tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
                 except Exception as e:
                     snippet = text[:80].replace('\n', ' ')

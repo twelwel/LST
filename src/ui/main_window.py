@@ -99,6 +99,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._download_status_text = ''
         self._current_model_label = None
         self._model_id_by_label = {}
+        self._selected_local_model_id = ''
+        self._local_stream_active = False
+        self._preload_model_id = ''
+        self._local_preload_results = queue.Queue()
 
         # ============ 配置 ============
         self.user_cfg = get_config()
@@ -983,6 +987,13 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         )
         self.btn_toggle.pack(side='left', padx=3)
 
+        self.btn_local_stream = ctk.CTkButton(
+            btn_frame, text="⚡ 本地流式", width=110, height=30,
+            fg_color='#8e44ad', hover_color='#71368a',
+            command=self._toggle_local_stream,
+        )
+        self.btn_local_stream.pack(side='left', padx=3)
+
         ctk.CTkButton(
             btn_frame, text="清空译文", width=80, height=30,
             command=self.clear_overlay,
@@ -1349,6 +1360,14 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
         labels = []
         self._model_id_by_label = {}
+        selected_id = ''
+        try:
+            from translation import load_strategy
+            selected_id = str(
+                load_strategy().get('local_model_id') or '').strip()
+        except Exception:
+            pass
+        self._selected_local_model_id = selected_id
 
         for m in all_models:
             mid = m['id']
@@ -1407,11 +1426,21 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                 pass
             self._current_model_label = None
             self._model_id_by_label = {}
+            self._selected_local_model_id = ''
+            if self._local_stream_active:
+                self._deactivate_local_stream(silent=True)
             self._update_local_model_status()
             self._update_local_model_device_hint()
             return
 
-        current = getattr(self, '_current_model_label', None)
+        current = None
+        if selected_id:
+            for label, mid in self._model_id_by_label.items():
+                if mid == selected_id:
+                    current = label
+                    break
+        if current is None:
+            current = getattr(self, '_current_model_label', None)
         if current not in labels:
             current = labels[0]
 
@@ -1422,19 +1451,235 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             pass
 
         self._current_model_label = current
+        # 配置里指向的模型可能刚被删除；按钮应使用下拉框实际显示的模型。
+        current_mid = self._model_id_by_label.get(current, '')
+        if current_mid:
+            self._selected_local_model_id = current_mid
         self._update_local_model_status()
         self._update_local_model_device_hint()
 
     def _on_local_model_selected(self, label):
+        if not label or label.startswith('（'):
+            return
+
+        mid = self._model_id_by_label.get(label)
         self._current_model_label = label
         self._update_local_model_status()
         self._update_local_model_device_hint()
 
+        if not mid:
+            return
+
+        changed = (mid != getattr(self, '_selected_local_model_id', ''))
+        self._selected_local_model_id = mid
+        if changed:
+            try:
+                from translation.api_config import select_local_model
+                select_local_model(mid)
+                self.translator.reload_config()
+
+                # 换模型后旧的段落译文不能继续命中，否则看起来像“新模型没生效”。
+                try:
+                    self.cache.clear()
+                    self.pipeline.reset_debouncer()
+                    self.app_state.reset_signature()
+                    self.overlay.clear()
+                except Exception:
+                    pass
+                log.info(f"[本地模型] 已选择：{mid}")
+            except Exception as e:
+                log.exception(f"[本地模型] 保存选择失败：{e}")
+
+        # 选中后在后台预热，第一次本地流式翻译不用再等模型加载。
+        self._preload_local_model_async(mid)
+
         # 提示用户当前选择的类型
         if '[int8]' in label:
-            self.bottom_label.configure(text="当前选择：int8 模型 (仅限 CPU 运行)")
+            self.bottom_label.configure(
+                text=f"已选择 {mid}：int8（仅限 CPU）")
         elif '[FP32]' in label:
-            self.bottom_label.configure(text="当前选择：FP32 模型 (支持 GPU 加速)")
+            self.bottom_label.configure(
+                text=f"已选择 {mid}：FP32（支持 GPU）")
+        else:
+            self.bottom_label.configure(text=f"已选择本地模型：{mid}")
+
+    def _select_downloaded_local_model(self, model_id):
+        """下载完成后自动选中新模型，并让策略立即使用它。"""
+        if not model_id:
+            return
+        try:
+            from translation.api_config import select_local_model
+            select_local_model(model_id)
+            self._selected_local_model_id = model_id
+            self.translator.reload_config()
+
+            try:
+                self.cache.clear()
+                self.pipeline.reset_debouncer()
+                self.app_state.reset_signature()
+                self.overlay.clear()
+            except Exception:
+                pass
+
+            log.info(f"[本地模型] 下载完成并自动选择：{model_id}")
+            self._preload_local_model_async(model_id)
+        except Exception as e:
+            log.exception(f"[本地模型] 自动选择失败：{e}")
+
+        try:
+            if self.winfo_exists():
+                self.after(0, self._refresh_local_models)
+        except Exception:
+            pass
+
+    def _preload_local_model_async(self, model_id):
+        """后台预热本地模型，避免加载耗时阻塞 Tk 主线程。"""
+        model_id = (model_id or '').strip()
+        if not model_id or self._preload_model_id == model_id:
+            return
+        self._preload_model_id = model_id
+
+        def worker():
+            ok = False
+            detail = ''
+            try:
+                ok, detail = self.translator.preload_local_model(model_id)
+                if ok:
+                    log.info(f"[本地模型] 预热完成：{model_id}")
+                else:
+                    log.warning(
+                        f"[本地模型] 预热失败：{model_id} → {detail}")
+            except Exception as e:
+                detail = str(e)
+                log.exception(f"[本地模型] 预热异常：{model_id} → {e}")
+            finally:
+                if self._preload_model_id == model_id:
+                    self._preload_model_id = ''
+                # 不跨线程操作 Tk，结果交给主循环处理。
+                self._local_preload_results.put((model_id, ok, detail))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _get_selected_local_model_id(self):
+        model_id = (getattr(self, '_selected_local_model_id', '') or '').strip()
+        if model_id:
+            return model_id
+        try:
+            from translation import load_strategy
+            model_id = str(
+                load_strategy().get('local_model_id') or '').strip()
+        except Exception:
+            model_id = ''
+        if model_id:
+            self._selected_local_model_id = model_id
+        return model_id
+
+    def _set_local_stream_button(self, active):
+        try:
+            if active:
+                self.btn_local_stream.configure(
+                    text="⏹ 退出本地流式",
+                    fg_color='#c0392b', hover_color='#a93226')
+            else:
+                self.btn_local_stream.configure(
+                    text="⚡ 本地流式",
+                    fg_color='#8e44ad', hover_color='#71368a')
+            # 本地流式期间策略由按钮接管，避免下拉框造成误解。
+            self.strategy_selector.configure(
+                state='disabled' if active else 'normal')
+        except Exception:
+            pass
+
+    def _toggle_local_stream(self):
+        if self._local_stream_active:
+            self._deactivate_local_stream()
+        else:
+            self._activate_local_stream()
+
+    def _activate_local_stream(self):
+        model_id = self._get_selected_local_model_id()
+        if not model_id:
+            self.bottom_label.configure(
+                text="请先在「本地模型」下拉框选择并下载模型")
+            return
+
+        try:
+            # 确认 Provider 已注册（下载/删除后配置可能刚变化）。
+            from translation.api_config import select_local_model
+            if not select_local_model(model_id):
+                raise RuntimeError('本地模型 Provider 注册失败')
+            if not self.translator.set_mode_override('local_only'):
+                raise RuntimeError('无法切换到本地离线策略')
+        except Exception as e:
+            log.exception(f"[本地流式] 启动失败：{e}")
+            try:
+                self.translator.clear_mode_override()
+            except Exception:
+                pass
+            self._set_local_stream_button(False)
+            self.bottom_label.configure(text=f"本地流式启动失败：{e}")
+            return
+
+        self._local_stream_active = True
+        self._set_local_stream_button(True)
+
+        # 本地模型与 API 的缓存/段落状态互不复用，进入模式时清空。
+        try:
+            self.cache.clear()
+            self.pipeline.reset_debouncer()
+            self.app_state.reset_signature()
+            self.overlay.clear()
+            self.caption_window.clear()
+        except Exception:
+            pass
+
+        self._preload_local_model_async(model_id)
+        if not self.app_state.running:
+            self.toggle_running()
+        else:
+            self.status_label.configure(
+                text="状态：本地流式运行中", text_color='#8e44ad')
+            self.bottom_label.configure(
+                text=f"本地流式翻译：{model_id}（模型后台预热中）")
+        log.info(f"[本地流式] 已启动：{model_id}")
+
+    def _deactivate_local_stream(self, silent=False):
+        if not self._local_stream_active:
+            return
+        self._local_stream_active = False
+        self._set_local_stream_button(False)
+        try:
+            self.translator.clear_mode_override()
+        except Exception as e:
+            log.exception(f"[本地流式] 恢复策略失败：{e}")
+
+        try:
+            self.cache.clear()
+            self.pipeline.reset_debouncer()
+            self.app_state.reset_signature()
+            self.overlay.clear()
+            self.caption_window.clear()
+        except Exception:
+            pass
+
+        try:
+            if self.app_state.running:
+                self.status_label.configure(
+                    text="状态：运行中", text_color='green')
+            else:
+                self.status_label.configure(
+                    text="状态：已暂停", text_color='gray')
+        except Exception:
+            pass
+
+        try:
+            status = self.translator._manager.get_status_text()
+        except Exception:
+            status = self.translator.get_strategy_name()
+        if not silent:
+            self.bottom_label.configure(
+                text=f"已退出本地流式，恢复策略：{status}")
+        log.info(f"[本地流式] 已退出，恢复策略：{status}")
 
     def _update_local_model_status(self):
         label = getattr(self, '_current_model_label', None)
@@ -1631,6 +1876,7 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                 self.after(500, self._refresh_local_models)
             return
 
+        downloaded_id = getattr(self, '_downloading_model_id', None)
         variant = getattr(self, '_downloading_variant', 'cpu')
         self._downloading_model_id = None
         self._downloading_variant = None
@@ -1669,6 +1915,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         except Exception as e:
             log.exception(f"[本地模型] 自动同步失败：{e}")
 
+        # ⭐ 新下载的模型自动成为当前选择，避免“下载了但策略仍用旧模型/API”
+        self._select_downloaded_local_model(downloaded_id)
+
         try:
             self.translator.reload_config()
         except Exception:
@@ -1700,10 +1949,22 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                     "移除自定义模型注册？\n\n"
                     "（不会删除原文件）"):
                 return
+            if self._local_stream_active:
+                self._deactivate_local_stream(silent=True)
             try:
                 from translation.local_models import (
                     remove_custom_model)
                 remove_custom_model(mid)
+                try:
+                    from translation.api_config import (
+                        clear_local_model_selection,
+                        remove_local_provider,
+                    )
+                    clear_local_model_selection(mid)
+                    remove_local_provider(mid)
+                    self.translator.reload_config()
+                except Exception:
+                    pass
                 self.bottom_label.configure(
                     text=f"已移除注册：{label}")
             except Exception as e:
@@ -1716,6 +1977,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                 "确认", f"删除本地模型 {mid}？\n\n"
                         f"（会删除 int8 和 FP32 两种版本）"):
             return
+
+        if self._local_stream_active:
+            self._deactivate_local_stream(silent=True)
 
         try:
             from translation.local_models import ModelCacheManager
@@ -1943,6 +2207,9 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
     # ================= 翻译策略 =================
 
     def _on_strategy_change(self, label):
+        # 用户主动改策略时退出「本地流式」覆盖，避免按钮状态与下拉框不一致。
+        if self._local_stream_active:
+            self._deactivate_local_stream(silent=True)
         key = self._strategy_label_to_key.get(
             label, DEFAULT_TRANSLATION_STRATEGY)
         self.app_state.translation_strategy = key
@@ -3213,16 +3480,28 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
     def toggle_running(self):
         self.app_state.running = not self.app_state.running
         if self.app_state.running:
-            self.status_label.configure(
-                text="状态：运行中", text_color='green')
+            if self._local_stream_active:
+                self.status_label.configure(
+                    text="状态：本地流式运行中", text_color='#8e44ad')
+                self.bottom_label.configure(
+                    text="本地流式翻译中（模型后台预热）")
+            else:
+                self.status_label.configure(
+                    text="状态：运行中", text_color='green')
+                self.bottom_label.configure(text="正在扫描屏幕...")
             self.btn_toggle.configure(text="⏸ 暂停")
-            self.bottom_label.configure(text="正在扫描屏幕...")
-            log.info("状态：运行中")
+            log.info("状态：%s",
+                     "本地流式运行中" if self._local_stream_active
+                     else "运行中")
         else:
             self.status_label.configure(
-                text="状态：已暂停", text_color='gray')
+                text=("状态：已暂停（本地流式）"
+                      if self._local_stream_active else "状态：已暂停"),
+                text_color='gray')
             self.btn_toggle.configure(text="▶ 开始")
-            self.bottom_label.configure(text="已暂停")
+            self.bottom_label.configure(
+                text=("本地流式已暂停" if self._local_stream_active
+                      else "已暂停"))
             self.scroll_detector.reset()
             self.app_state.scroll_boost = False
             log.info("状态：已暂停")
@@ -3305,6 +3584,21 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
                         except Exception as e:
                             log.exception(
                                 f"[UI] 分发译文失败：{e}")
+            except queue.Empty:
+                pass
+
+            try:
+                while True:
+                    model_id, ok, detail = (
+                        self._local_preload_results.get_nowait())
+                    if (self._local_stream_active
+                            and model_id == self._get_selected_local_model_id()):
+                        if ok:
+                            self.bottom_label.configure(
+                                text=f"本地流式翻译中：{model_id}")
+                        else:
+                            self.bottom_label.configure(
+                                text=f"本地模型预热失败：{detail}")
             except queue.Empty:
                 pass
 

@@ -534,6 +534,7 @@ class ModelManagerDialog(ctk.CTkToplevel):
         if not self._downloading:
             return
 
+        download_id = self._current_download_id
         self._downloading = False
         self._current_download_id = None
         self._last_download_ok = bool(ok)
@@ -568,11 +569,16 @@ class ModelManagerDialog(ctk.CTkToplevel):
             if (master is not None
                     and master.winfo_exists()
                     and hasattr(master, '_refresh_local_models')):
-                try:
-                    master.translator.reload_config()
-                except Exception:
-                    pass
-                master.after(0, master._refresh_local_models)
+                if (self._last_download_ok and download_id
+                        and hasattr(master,
+                                    '_select_downloaded_local_model')):
+                    master._select_downloaded_local_model(download_id)
+                else:
+                    try:
+                        master.translator.reload_config()
+                    except Exception:
+                        pass
+                    master.after(0, master._refresh_local_models)
         except Exception:
             pass
 
@@ -597,6 +603,24 @@ class ModelManagerDialog(ctk.CTkToplevel):
                 invalidate_model(model_id)
             except Exception:
                 pass
+            try:
+                from translation.api_config import (
+                    clear_local_model_selection,
+                    remove_local_provider,
+                    sync_downloaded_models,
+                )
+                clear_local_model_selection(model_id)
+                remove_local_provider(model_id)
+                sync_downloaded_models()
+            except Exception as e:
+                log.exception(f"[模型管理] 清理 Provider 失败：{e}")
+            try:
+                master = self.master
+                if master is not None and master.winfo_exists():
+                    master.translator.reload_config()
+                    master.after(0, master._refresh_local_models)
+            except Exception:
+                pass
             self._set_progress(f"已删除：{model_id}")
             self._refresh_list()
         except Exception as e:
@@ -617,6 +641,22 @@ class ModelManagerDialog(ctk.CTkToplevel):
         try:
             from translation.local_models import remove_custom_model
             remove_custom_model(model_id)
+            try:
+                from translation.api_config import (
+                    clear_local_model_selection,
+                    remove_local_provider,
+                )
+                clear_local_model_selection(model_id)
+                remove_local_provider(model_id)
+            except Exception as e:
+                log.exception(f"[模型管理] 清理 Provider 失败：{e}")
+            try:
+                master = self.master
+                if master is not None and master.winfo_exists():
+                    master.translator.reload_config()
+                    master.after(0, master._refresh_local_models)
+            except Exception:
+                pass
             self._set_progress(f"已移除注册：{model_id}")
             self._refresh_list()
         except Exception as e:
@@ -650,6 +690,22 @@ class ModelManagerDialog(ctk.CTkToplevel):
             try:
                 from translation.local_models import invalidate_model
                 invalidate_model()
+            except Exception:
+                pass
+            try:
+                from translation.api_config import (
+                    clear_local_model_selection,
+                    sync_downloaded_models,
+                )
+                sync_downloaded_models()
+                clear_local_model_selection()
+            except Exception as e:
+                log.exception(f"[模型管理] 清理 Provider 失败：{e}")
+            try:
+                master = self.master
+                if master is not None and master.winfo_exists():
+                    master.translator.reload_config()
+                    master.after(0, master._refresh_local_models)
             except Exception:
                 pass
             self._set_progress(

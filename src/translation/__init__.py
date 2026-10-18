@@ -6,6 +6,7 @@ from .api_config import (
     load_strategy, save_strategy,
     new_provider_id, is_configured,
     ensure_local_provider, remove_local_provider,
+    select_local_model, clear_local_model_selection,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     'load_strategy', 'save_strategy',
     'new_provider_id', 'is_configured',
     'ensure_local_provider', 'remove_local_provider',
+    'select_local_model', 'clear_local_model_selection',
 ]

@@ -41,6 +41,15 @@ def _resolve_provider():
         return "DmlExecutionProvider", dml_provider_options()
     return "CPUExecutionProvider", None
 
+def _inference_mode():
+    """生成阶段关闭 autograd，降低显存/内存占用。"""
+    try:
+        import torch
+        return torch.inference_mode()
+    except Exception:
+        return nullcontext()
+
+
 _LANG_MAP = {'ko': 'ko', 'en': 'en', 'ja': 'ja'}
 _SUPPORTED_LANGS = [('ko', 'en'), ('en', 'ko'), ('ja', 'en'), ('en', 'ja'), ('ko', 'ja'), ('ja', 'ko')]
 
@@ -88,11 +97,12 @@ class Gemma3ONNXModel(BaseTranslationModel):
                 return False
 
             pref = get_preferred_device()
-            prefer_gpu = pref in ('auto', 'cuda', 'directml')
-            
             onnx_dir = model_path / 'onnx'
             has_fp32 = (onnx_dir / 'model.onnx').exists()
             has_q4 = (onnx_dir / 'model_q4.onnx').exists()
+            # 自动模式只有下载了 FP32 才走 GPU；否则使用量化 CPU 版。
+            prefer_gpu = (pref in ('cuda', 'directml')
+                          or (pref == 'auto' and has_fp32))
 
             # ⭐ 智能选择
             if prefer_gpu:
@@ -133,7 +143,9 @@ class Gemma3ONNXModel(BaseTranslationModel):
                     # Warmup
                     prompt = "<src:en><tgt:ko>\nhello\n###\n"
                     inputs = self._tokenizer(prompt, return_tensors='pt')
-                    _ = model.generate(**inputs, max_new_tokens=5, use_cache=False)
+                    with _inference_mode():
+                        _ = model.generate(**inputs, max_new_tokens=5,
+                                           use_cache=False)
 
                     self._model = model
                     self._provider_name = pname
@@ -151,7 +163,7 @@ class Gemma3ONNXModel(BaseTranslationModel):
                 log.info(f"[Gemma3] 加载成功：{self._model_id} @ {pname}（{self._variant_label}）")
             return True
         except Exception as e:
-            log.warning(f"[Gemma3] {pname} 失败：{e}")
+            log.exception(f"[Gemma3] {pname} 失败：{e}")
             return False
 
     def translate(self, text: str, src_lang: str = 'auto', tgt_lang: str = 'zh') -> str:
@@ -169,15 +181,16 @@ class Gemma3ONNXModel(BaseTranslationModel):
             with guard:
                 try:
                     inputs = self._tokenizer(prompt, return_tensors='pt')
-                    outputs = self._model.generate(
-                        **inputs,
-                        max_new_tokens=max(24, min(256, len(text) + 24)),
-                        do_sample=False,
-                        pad_token_id=self._tokenizer.eos_token_id,
-                        use_cache=False,
-                        no_repeat_ngram_size=4,
-                        repetition_penalty=1.1,
-                    )
+                    with _inference_mode():
+                        outputs = self._model.generate(
+                            **inputs,
+                            max_new_tokens=max(24, min(256, len(text) + 24)),
+                            do_sample=False,
+                            pad_token_id=self._tokenizer.eos_token_id,
+                            use_cache=False,
+                            no_repeat_ngram_size=4,
+                            repetition_penalty=1.1,
+                        )
                     full = self._tokenizer.decode(outputs[0], skip_special_tokens=True)
                     res = full.split('###')[-1] if '###' in full else full.replace(prompt, '')
                     for t in ('<end_of_turn>', '<eos>', '</s>', '<pad>', '<start_of_turn>'):

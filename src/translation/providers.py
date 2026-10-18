@@ -4,6 +4,7 @@ import time
 import json
 import random
 import hashlib
+import threading
 import requests
 
 from .base import BaseProvider, ProviderResult
@@ -230,6 +231,52 @@ class LocalModelProvider(BaseProvider):
     provider_type = 'translate'
     is_local = True                      # ⭐ 关键
 
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        # 缓存已加载实例，避免每行译文都走一次 Factory 查找与加锁。
+        self._instance = None
+        self._instance_lock = threading.Lock()
+
+    def _get_instance(self, model_id: str):
+        instance = self._instance
+        if (instance is not None
+                and getattr(instance, 'is_loaded', False)
+                and getattr(instance, '_model_id', model_id) == model_id):
+            return instance
+
+        from .local_models import get_model_instance
+        with self._instance_lock:
+            instance = self._instance
+            if (instance is not None
+                    and getattr(instance, 'is_loaded', False)
+                    and getattr(instance, '_model_id', model_id) == model_id):
+                return instance
+            instance = get_model_instance(model_id)
+            self._instance = instance
+            return instance
+
+    def preload(self):
+        """预加载当前模型，供 UI 在后台线程预热。"""
+        model_id = (self.params.get('model_id') or '').strip()
+        if not model_id:
+            return False, '未配置 model_id'
+        try:
+            instance = self._get_instance(model_id)
+        except ImportError as e:
+            return False, f'本地模型模块加载失败：{e}'
+        except Exception as e:
+            return False, f'模型创建失败：{e}'
+
+        if instance is None:
+            return False, f'未知模型：{model_id}'
+        if instance.is_loaded:
+            return True, ''
+
+        detail = (getattr(instance, 'last_error', '') or '').strip()
+        if detail:
+            return False, f'本地模型加载失败：{model_id}（{detail}）'
+        return False, f'模型未加载：{model_id}'
+
     def translate(self, text, from_lang='auto', to_lang='zh'):
         t0 = time.time()
 
@@ -238,12 +285,9 @@ class LocalModelProvider(BaseProvider):
             return self._err('未配置 model_id')
 
         try:
-            from .local_models import get_model_instance
+            instance = self._get_instance(model_id)
         except ImportError as e:
             return self._err(f'本地模型模块加载失败：{e}')
-
-        try:
-            instance = get_model_instance(model_id)
         except Exception as e:
             return self._err(f'模型创建失败：{e}')
 

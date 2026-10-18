@@ -158,15 +158,16 @@ TRANSLATION_STRATEGIES = {
 
 TRANSLATION_STRATEGY_DESC = {
     'local_only':          '只用本地模型 + 短语缓存，完全离线',
-    'local_api':           '优先本地模型，未命中走翻译 API',
-    'single_translate':    '主翻译 API，失败自动尝试其他翻译 API',
-    'multi_translate_rr':  '多个翻译 API 轮流使用，均衡负载',
-    'hybrid':              '翻译 API 与 AI 混合（顺序可在 API 设置里配置）',
-    'single_ai':           '主 AI 大语言模型翻译',
-    'multi_ai_vote':       '多个 AI 并发翻译，相似度/长度投票',
+    'local_api':           '优先本地模型，未命中走翻译 API / AI',
+    'single_translate':    '主翻译 API，失败尝试其他 API（本地请用「本地流式」）',
+    'multi_translate_rr':  '多个翻译 API 轮流使用（本地请用「本地流式」）',
+    'hybrid':              '翻译 API 与 AI 混合，顺序可配置（本地请用「本地流式」）',
+    'single_ai':           '主 AI 大语言模型翻译（本地请用「本地流式」）',
+    'multi_ai_vote':       '多个 AI 并发翻译投票（本地请用「本地流式」）',
 }
 
-DEFAULT_TRANSLATION_STRATEGY = 'local_api'
+# 默认使用远程翻译；本地翻译通过主界面「⚡ 本地流式」按钮显式启动。
+DEFAULT_TRANSLATION_STRATEGY = 'single_translate'
 
 # ==================== 快速响应层 ====================
 DEFAULT_ENABLE_FAST_LOOKUP = True

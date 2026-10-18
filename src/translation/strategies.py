@@ -45,6 +45,16 @@ class BaseStrategy:
     def translate(self, text, source='auto', target='zh'):
         raise NotImplementedError
 
+    def translate_lines(self, lines, source='auto', target='zh'):
+        """默认逐行翻译；单行异常不应影响同批其他文本。"""
+        results = []
+        for line in (lines or []):
+            try:
+                results.append(self.translate(line, source, target))
+            except Exception as e:
+                results.append(f'[翻译异常: {e}]')
+        return results
+
     # ---------- 本地模型 ----------
 
     def _try_local_detail(self, text, source, target):
@@ -69,6 +79,26 @@ class BaseStrategy:
 
     def _has_local(self):
         return bool(self.local_providers)
+
+    def _can_fallback_local(self):
+        """远程策略是否允许自动回退本地模型。
+
+        默认关闭：本地翻译由主界面「本地流式」按钮显式进入。
+        「离线 + API」不经过这里，仍由用户主动选择本地优先。
+        """
+        return (self._has_local()
+                and bool(self.options.get('local_fallback', True)))
+
+    def _local_or(self, text, source, target, fallback):
+        """尝试本地模型；全部失败时返回带本地原因的 fallback。"""
+        if not self._can_fallback_local():
+            return fallback
+        result, err = self._try_local_detail(text, source, target)
+        if result:
+            return result
+        if err:
+            return f'{fallback}；本地模型：{err}'
+        return fallback
 
     # ---------- 翻译 API ----------
 
@@ -112,6 +142,25 @@ class LocalOnlyStrategy(BaseStrategy):
             return f'[本地模型失败：{err}]'
         return '[离线：本地模型未命中]'
 
+    def translate_lines(self, lines, source='auto', target='zh'):
+        """本地流式批量翻译：跳过空行，同批重复文本只调用一次模型。"""
+        if not lines:
+            return []
+        cache = {}
+        results = []
+        for line in lines:
+            text = (line or '').strip()
+            if not text:
+                results.append('')
+                continue
+            if text not in cache:
+                try:
+                    cache[text] = self.translate(text, source, target)
+                except Exception as e:
+                    cache[text] = f'[翻译异常: {e}]'
+            results.append(cache[text])
+        return results
+
 
 # ============ 离线 + API（先本地，未命中走 API） ============
 class LocalAPIStrategy(BaseStrategy):
@@ -119,16 +168,18 @@ class LocalAPIStrategy(BaseStrategy):
 
     def translate(self, text, source='auto', target='zh'):
         # 1. 先本地模型
-        result = self._try_local(text, source, target)
+        result, local_err = self._try_local_detail(text, source, target)
         if result:
             return result
 
         # 2. 未命中 → 走翻译 API
+        api_err = ''
         if self._has_translate():
             primary = self._primary_translate()
             r = _throttled_translate(primary, text, source, target)
             if r.success and r.text.strip():
                 return r.text
+            api_err = f'{primary.name}: {r.error}'
             # 兜底其他 API
             for other in self.translate_providers:
                 if other is primary:
@@ -136,11 +187,27 @@ class LocalAPIStrategy(BaseStrategy):
                 r2 = _throttled_translate(other, text, source, target)
                 if r2.success and r2.text.strip():
                     return r2.text
-            return f'[离线 + API：{primary.name} 失败 - {r.error}]'
+                api_err += f'；{other.name}: {r2.error}'
 
-        # 3. 也没有 API
-        if self._has_local():
-            return '[离线 + API：本地未命中，且未配置 API]'
+        # 3. 最后尝试 AI（避免本地模型或翻译 API 故障时整条链路失效）
+        ai_err = ''
+        if self._has_ai():
+            for p in self.ai_providers:
+                r = _throttled_translate(p, text, source, target)
+                if r.success and r.text.strip():
+                    return r.text
+                if not ai_err:
+                    ai_err = f'{p.name}: {r.error}'
+
+        details = []
+        if local_err:
+            details.append(f'本地 {local_err}')
+        if api_err:
+            details.append(f'API {api_err}')
+        if ai_err:
+            details.append(f'AI {ai_err}')
+        if details:
+            return '[离线 + API 失败：' + '；'.join(details) + ']'
         return '[未配置本地模型和 API]'
 
 
@@ -150,21 +217,31 @@ class SingleTranslateStrategy(BaseStrategy):
 
     def translate(self, text, source='auto', target='zh'):
         if not self._has_translate():
-            result = self._try_local(text, source, target)
-            return result or '[无翻译 API]'
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[无翻译 API]')
+            return '[无翻译 API]'
 
         primary = self._primary_translate()
         r = _throttled_translate(primary, text, source, target)
         if r.success and r.text.strip():
             return r.text
 
+        last_err = f'{primary.name}: {r.error}'
         for other in self.translate_providers:
             if other is primary:
                 continue
             r2 = _throttled_translate(other, text, source, target)
             if r2.success and r2.text.strip():
                 return r2.text
-        return f'[翻译失败 · {primary.name}: {r.error}]'
+            last_err += f'；{other.name}: {r2.error}'
+
+        # ⭐ API 全部失败时才回退本地模型。
+        #    本地模型加载失败不会影响 API 正常路径，也不会让单 API 策略失效。
+        if self._has_local():
+            return self._local_or(
+                text, source, target, f'[翻译失败 · {last_err}]')
+        return f'[翻译失败 · {last_err}]'
 
 
 # ============ 多翻译 API 轮询 ============
@@ -174,8 +251,10 @@ class RoundRobinTranslateStrategy(BaseStrategy):
     def translate(self, text, source='auto', target='zh'):
         n = len(self.translate_providers)
         if n == 0:
-            result = self._try_local(text, source, target)
-            return result or '[无翻译 API]'
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[无翻译 API]')
+            return '[无翻译 API]'
 
         with self._rr_lock:
             start = self._rr_index % n
@@ -188,6 +267,11 @@ class RoundRobinTranslateStrategy(BaseStrategy):
             if r.success and r.text.strip():
                 return r.text
             last_err = f'{p.name}: {r.error}'
+
+        if self._has_local():
+            return self._local_or(
+                text, source, target,
+                f'[所有翻译 API 失败 · {last_err}]')
         return f'[所有翻译 API 失败 · {last_err}]'
 
 
@@ -206,30 +290,42 @@ class HybridStrategy(BaseStrategy):
         return self._translate_first(text, source, target)
 
     def _translate_first(self, text, source, target):
+        last_err = ''
         if self._has_translate():
-            r = _throttled_translate(
-                self._primary_translate(), text, source, target)
+            p = self._primary_translate()
+            r = _throttled_translate(p, text, source, target)
             if r.success and r.text.strip():
                 return r.text
+            last_err = f'{p.name}: {r.error}'
         if self._has_ai():
-            r = _throttled_translate(
-                self._primary_ai(), text, source, target)
+            p = self._primary_ai()
+            r = _throttled_translate(p, text, source, target)
             if r.success and r.text.strip():
                 return r.text
-        return '[混合翻译失败]'
+            last_err += f'；{p.name}: {r.error}'
+        if self._has_local():
+            return self._local_or(
+                text, source, target, f'[混合翻译失败 · {last_err}]')
+        return f'[混合翻译失败 · {last_err}]' if last_err else '[混合翻译失败]'
 
     def _ai_first(self, text, source, target):
+        last_err = ''
         if self._has_ai():
-            r = _throttled_translate(
-                self._primary_ai(), text, source, target)
+            p = self._primary_ai()
+            r = _throttled_translate(p, text, source, target)
             if r.success and r.text.strip():
                 return r.text
+            last_err = f'{p.name}: {r.error}'
         if self._has_translate():
-            r = _throttled_translate(
-                self._primary_translate(), text, source, target)
+            p = self._primary_translate()
+            r = _throttled_translate(p, text, source, target)
             if r.success and r.text.strip():
                 return r.text
-        return '[混合翻译失败]'
+            last_err += f'；{p.name}: {r.error}'
+        if self._has_local():
+            return self._local_or(
+                text, source, target, f'[混合翻译失败 · {last_err}]')
+        return f'[混合翻译失败 · {last_err}]' if last_err else '[混合翻译失败]'
 
     def _concurrent(self, text, source, target):
         candidates = []
@@ -238,6 +334,9 @@ class HybridStrategy(BaseStrategy):
         if self._has_ai():
             candidates.append(self._primary_ai())
         if not candidates:
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[无可用 API]')
             return '[无可用 API]'
 
         ex = ThreadPoolExecutor(max_workers=len(candidates))
@@ -257,6 +356,9 @@ class HybridStrategy(BaseStrategy):
                 ex.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 pass
+        if self._has_local():
+            return self._local_or(
+                text, source, target, '[混合翻译失败]')
         return '[混合翻译失败]'
 
 
@@ -266,18 +368,26 @@ class SingleAIStrategy(BaseStrategy):
 
     def translate(self, text, source='auto', target='zh'):
         if not self._has_ai():
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[无 AI 模型]')
             return '[无 AI 模型]'
         primary = self._primary_ai()
         r = _throttled_translate(primary, text, source, target)
         if r.success and r.text.strip():
             return r.text
+        last_err = f'{primary.name}: {r.error}'
         for other in self.ai_providers:
             if other is primary:
                 continue
             r2 = _throttled_translate(other, text, source, target)
             if r2.success and r2.text.strip():
                 return r2.text
-        return f'[AI 失败 · {primary.name}: {r.error}]'
+            last_err += f'；{other.name}: {r2.error}'
+        if self._has_local():
+            return self._local_or(
+                text, source, target, f'[AI 失败 · {last_err}]')
+        return f'[AI 失败 · {last_err}]'
 
 
 # ============ 多 AI 高精度投票 ============
@@ -286,13 +396,26 @@ class MultiAIVoteStrategy(BaseStrategy):
 
     def translate(self, text, source='auto', target='zh'):
         if not self._has_ai():
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[无 AI 模型]')
             return '[无 AI 模型]'
 
         enabled = [p for p in self.ai_providers if p.enabled]
+        if not enabled:
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[无 AI 模型]')
+            return '[无 AI 模型]'
 
         if len(enabled) == 1:
             r = _throttled_translate(enabled[0], text, source, target)
-            return r.text if r.success else f'[AI 失败: {r.error}]'
+            if r.success and r.text.strip():
+                return r.text
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, f'[AI 失败: {r.error}]')
+            return f'[AI 失败: {r.error}]'
 
         vote_count = max(2, int(self.options.get('vote_count', 3)))
         vote_strategy = self.options.get('vote_strategy', 'similarity')
@@ -325,6 +448,9 @@ class MultiAIVoteStrategy(BaseStrategy):
                 pass
 
         if not results:
+            if self._has_local():
+                return self._local_or(
+                    text, source, target, '[所有 AI 翻译失败]')
             return '[所有 AI 翻译失败]'
         if len(results) == 1:
             return results[0]

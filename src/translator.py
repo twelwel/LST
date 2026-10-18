@@ -39,6 +39,17 @@ class Translator:
     def get_strategy_name(self):
         return self._manager.get_strategy_name()
 
+    def set_mode_override(self, mode):
+        """临时切换策略（主界面「本地流式」按钮使用）。"""
+        return self._manager.set_mode_override(mode)
+
+    def clear_mode_override(self):
+        return self._manager.clear_mode_override()
+
+    def preload_local_model(self, model_id=''):
+        """后台预热本地模型，返回 (ok, error)。"""
+        return self._manager.preload_local_model(model_id)
+
 
 def translate_text(text, source='auto', target='zh'):
     return Translator(source=source, target=target).translate(text)

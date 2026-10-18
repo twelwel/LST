@@ -30,6 +30,7 @@ class ModelPickerDialog(ctk.CTkToplevel):
         self._downloader = None
         self._download_task = None
         self._last_download_ok = False
+        self._last_download_model_id = ''
         
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
@@ -186,6 +187,7 @@ class ModelPickerDialog(ctk.CTkToplevel):
 
         original_text = btn.cget('text')
         self._downloading = True
+        self._last_download_model_id = model_id
         self._downloader = downloader
         btn.configure(state='disabled', text="下载中...")
         progress_bar.pack(side='left', padx=(10, 0))
@@ -281,13 +283,14 @@ class ModelPickerDialog(ctk.CTkToplevel):
 
         self._update_cache_label()
         if self._last_download_ok:
-            self._sync_and_refresh_master()
+            self._sync_and_refresh_master(
+                getattr(self, '_last_download_model_id', ''))
 
         if not self._closing:
             delay = 1200 if self._last_download_ok else 2500
             self.after(delay, self._refresh_list)
 
-    def _sync_and_refresh_master(self):
+    def _sync_and_refresh_master(self, model_id=''):
         """下载成功后同步 Provider，并让主窗口重新扫描模型目录。"""
         try:
             from translation.api_config import sync_downloaded_models
@@ -303,11 +306,16 @@ class ModelPickerDialog(ctk.CTkToplevel):
             if (master is not None
                     and master.winfo_exists()
                     and hasattr(master, '_refresh_local_models')):
-                try:
-                    master.translator.reload_config()
-                except Exception:
-                    pass
-                master.after(0, master._refresh_local_models)
+                if (model_id
+                        and hasattr(master,
+                                    '_select_downloaded_local_model')):
+                    master._select_downloaded_local_model(model_id)
+                else:
+                    try:
+                        master.translator.reload_config()
+                    except Exception:
+                        pass
+                    master.after(0, master._refresh_local_models)
         except Exception:
             pass
 
