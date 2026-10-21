@@ -138,6 +138,26 @@ def _resolve_enum(enum_cls, names):
     return None
 
 
+_SMALL_VALUE = None
+
+
+def _get_small_value():
+    """解析 PP-OCRv6 的 SMALL 模型枚举值。
+
+    'server' 档实际加载的是 PP-OCRv6_*_small 模型（9.5MB/20.3MB）。
+    这里显式钉住 SMALL，避免上层不写 model_type 时依赖 rapidocr 的默认值 ——
+    否则依赖升级一旦把默认改成 server/medium 大模型，OCR 会静默变慢。
+    """
+    global _SMALL_VALUE
+    if _SMALL_VALUE is not None:
+        return _SMALL_VALUE
+    mt = _find_model_type()
+    _SMALL_VALUE = _resolve_enum(mt, [
+        'SMALL', 'Small', 'small',
+    ])
+    return _SMALL_VALUE
+
+
 def _get_tiny_value():
     """解析 PP-OCRv6 的 TINY 模型枚举值"""
     global _TINY_VALUE
@@ -216,6 +236,13 @@ def _build_model_params(model_size='server', lang_name='CH'):
             return None
         params["Det.model_type"] = tiny_v
         params["Rec.model_type"] = tiny_v
+    else:
+        # 显式钉住 SMALL（= 历史行为实际加载的模型）。
+        # 解析失败时保持不写，退回 rapidocr 默认值，不阻断启动。
+        small_v = _get_small_value()
+        if small_v is not None:
+            params["Det.model_type"] = small_v
+            params["Rec.model_type"] = small_v
 
     # 语言类型
     ld, lr = _find_lang_enums()

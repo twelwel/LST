@@ -324,6 +324,65 @@ class LocalModelProvider(BaseProvider):
         except Exception as e:
             return self._err(f'翻译异常：{e}')
 
+    def translate_batch(self, texts, from_lang='auto', to_lang='zh'):
+        """批量翻译：返回与 texts 等长的 ProviderResult 列表。
+
+        本地模型支持一次推理多条，可摊薄逐条推理的固定开销；
+        其它适配器没有此方法，调用方需自行回退。
+        """
+        texts = list(texts or [])
+        n = len(texts)
+        if n == 0:
+            return []
+        t0 = time.time()
+
+        model_id = (self.params.get('model_id') or '').strip()
+        if not model_id:
+            return [self._err('未配置 model_id') for _ in texts]
+
+        try:
+            instance = self._get_instance(model_id)
+        except ImportError as e:
+            return [self._err(f'本地模型模块加载失败：{e}') for _ in texts]
+        except Exception as e:
+            return [self._err(f'模型创建失败：{e}') for _ in texts]
+
+        if instance is None:
+            return [self._err(f'未知模型：{model_id}') for _ in texts]
+
+        if not instance.is_loaded:
+            detail = (getattr(instance, 'last_error', '') or '').strip()
+            msg = (f'本地模型加载失败：{model_id}（{detail}）' if detail
+                   else f'模型未加载：{model_id}')
+            return [self._err(msg) for _ in texts]
+
+        if not instance.supports(from_lang, to_lang):
+            msg = f'模型 {instance.name} 不支持 {from_lang}→{to_lang}'
+            return [self._err(msg) for _ in texts]
+
+        try:
+            batch_fn = getattr(instance, 'translate_batch', None)
+            outs = (batch_fn(texts, from_lang, to_lang) if batch_fn
+                    else [instance.translate(t, from_lang, to_lang)
+                          for t in texts])
+        except Exception as e:
+            return [self._err(f'翻译异常：{e}') for _ in texts]
+
+        if not outs or len(outs) != n:
+            return [self._err('批量返回数量不匹配') for _ in texts]
+
+        elapsed = int((time.time() - t0) * 1000)
+        results = []
+        for s in outs:
+            s = (s or '').strip()
+            if not s or s.startswith('['):
+                results.append(self._err(s or '空结果'))
+            else:
+                results.append(ProviderResult(
+                    True, text=s, provider_id=self.id,
+                    provider_name=self.name, elapsed_ms=elapsed))
+        return results
+
 
 # ============ 注册表 ============
 PROVIDER_REGISTRY = {

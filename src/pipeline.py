@@ -41,6 +41,14 @@ from logger import get_logger
 from config import (
     LOCAL_LOOKUP_MAX_WORDS,
     LOCAL_LOOKUP_MAX_CHARS,
+    OVERLAY_BG_COLOR,
+    DEFAULT_OVERLAY_BG_OPACITY,
+    OVERLAY_BG_OPACITY_MIN,
+    OVERLAY_BG_OPACITY_MAX,
+    PARAGRAPH_REUSE_JACCARD,
+    PARAGRAPH_REUSE_LEN_RATIO,
+    PARAGRAPH_MEMORY_MAX,
+    DEFAULT_MERGE_LEVEL,
 )
 from translation.strategies import STRATEGY_LABELS
 from emit_debouncer import EmitDebouncer
@@ -85,6 +93,12 @@ PERF_REPORT_INTERVAL = 10.0
 
 POSITION_MATCH_TOLERANCE = 40
 TRACKER_TIMEOUT = 1.5
+
+# 并发 emit 时的 key 占用保护：
+# pipeline 线程与翻译池线程都可能调用 _emit_paragraphs，各自的 used_keys
+# 互不可见，同一 key 可能被两个不同位置的段落同时拿到 → 一个盒子内容被另一个覆盖。
+KEY_CLAIM_TTL = 0.35           # 占用有效期（约一帧）
+KEY_CLAIM_POS_TOLERANCE = 20   # 位置差超过此值才视为「另一个位置」
 
 OCR_VERIFY_PADDING = 8
 OCR_VERIFY_SIMILARITY = 0.6
@@ -225,6 +239,11 @@ class AppState:
         self.translation_strategy = 'single_translate'
         self.display_mode = 'overlay'
         self.fg_color = 'auto'
+        # 覆盖层外观：浅黑面板 + 不透明度（0.70 = 30% 透明）
+        self.overlay_bg_color = OVERLAY_BG_COLOR
+        self.overlay_bg_opacity = DEFAULT_OVERLAY_BG_OPACITY
+        # 文字合并强度：off / weak / mid / strong
+        self.merge_level = DEFAULT_MERGE_LEVEL
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.lock = threading.Lock()
@@ -307,6 +326,10 @@ class Pipeline:
         self.inpaint_cache_max = INPAINT_CACHE_MAX
         self._inpaint_lock = threading.Lock()
 
+        # 段落级译文记忆（抗「合并/拆分」结构抖动）
+        self._para_memory = OrderedDict()
+        self._para_mem_lock = threading.Lock()
+
         self.phrase_cache = PhraseCache()
 
         self.translate_pool = ThreadPoolExecutor(max_workers=4)
@@ -319,15 +342,45 @@ class Pipeline:
         self._generation = 0
         self._tracker_entries = {}
         self._tracker_lock = threading.Lock()
+        self._key_claims = {}
 
         self._verify_engine = None
         self._verify_engine_lock = threading.Lock()
+
+        self._stopped = False
+        self._worker = None
 
         self._perf = _PerfStats()
         self._perf_last_report = time.time()
 
     def start(self):
-        threading.Thread(target=self._process_loop, daemon=True).start()
+        self._stopped = False
+        self._worker = threading.Thread(target=self._process_loop, daemon=True)
+        self._worker.start()
+
+    def stop(self, timeout=1.5):
+        """有序停止后台线程与翻译线程池（退出时调用）。
+
+        退出卡顿的主因不是窗口销毁，而是进程结束时才由解释器回收：
+        线程池里可能有正在等待 API 的请求（超时可达 30s），
+        ORT/DirectML 会话也会在这时被析构（驱动层很慢）。
+        这里主动停线程、取消排队任务，把耗时从「退出后」挪到可控流程里。
+        """
+        self._stopped = True
+        try:
+            self.task_queue.put_nowait(None)     # 唤醒阻塞的 get
+        except Exception:
+            pass
+        try:
+            self.translate_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        t = self._worker
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=timeout)
+            except Exception:
+                pass
 
     def reset_debouncer(self):
         with self._known_lock:
@@ -336,6 +389,7 @@ class Pipeline:
 
         with self._tracker_lock:
             self._tracker_entries.clear()
+            self._key_claims.clear()
 
         self.emit_debouncer.reset()
 
@@ -361,15 +415,37 @@ class Pipeline:
             pass
 
     def _process_loop(self):
-        while True:
+        while not self._stopped:
             try:
                 img = self.task_queue.get(timeout=1)
             except queue.Empty:
                 continue
+            if img is None:          # 停止哨兵
+                break
+            if self._stopped:
+                break
             try:
                 self._process_one(img)
             except Exception as e:
                 log.exception(f"[处理错误] {e}")
+
+    def _touch_tracker(self, key, x1, y1, x2, y2, now, text):
+        """刷新 tracker 条目的位置/时间/文本（调用方需已持有 _tracker_lock）。"""
+        e = self._tracker_entries.get(key)
+        if e is None:
+            return
+        e['box'] = (x1, y1, x2, y2)
+        e['last_seen'] = now
+        if text:
+            e['text'] = text
+
+    def _claim_key(self, key, cx, cy, now):
+        """登记 key 的最近占用位置（调用方需已持有 _tracker_lock）。"""
+        self._key_claims[key] = (cx, cy, now)
+        if len(self._key_claims) > 400:
+            for k, v in list(self._key_claims.items()):
+                if now - v[2] > KEY_CLAIM_TTL * 4:
+                    del self._key_claims[k]
 
     def _assign_stable_key(self, para_box, fallback_key,
                             used_keys=None, text=None):
@@ -387,11 +463,19 @@ class Pipeline:
                 del self._tracker_entries[k]
 
             best_key = None
+            best_score = None
             best_dist = float('inf')
 
             for k, e in self._tracker_entries.items():
                 if used_keys and k in used_keys:
                     continue
+
+                # 并发 emit 保护：该 key 刚被「另一个位置」占用 → 不复用
+                claim = self._key_claims.get(k)
+                if claim is not None and now - claim[2] < KEY_CLAIM_TTL:
+                    if (abs(claim[0] - cx) > KEY_CLAIM_POS_TOLERANCE or
+                            abs(claim[1] - cy) > KEY_CLAIM_POS_TOLERANCE):
+                        continue
 
                 ex1, ey1, ex2, ey2 = e['box']
                 ecx = (ex1 + ex2) / 2
@@ -400,34 +484,32 @@ class Pipeline:
 
                 e_text_norm = normalize_key_text(e.get('text', ''))
 
-                if (cur_text_norm and e_text_norm and
-                        d < POSITION_MATCH_TOLERANCE):
-                    from difflib import SequenceMatcher as _SM
-                    sim = _SM(None, cur_text_norm, e_text_norm).ratio()
-                    if sim < 0.3:
+                sim = 0.0
+                if cur_text_norm and e_text_norm:
+                    sim = text_similarity(cur_text_norm, e_text_norm)
+                    if d < POSITION_MATCH_TOLERANCE and sim < 0.3:
                         continue
 
-                same_text = (cur_text_norm and e_text_norm and
-                             cur_text_norm == e_text_norm)
+                same_text = bool(cur_text_norm and e_text_norm and
+                                 cur_text_norm == e_text_norm)
 
                 if same_text and d < POSITION_MATCH_TOLERANCE * 2:
-                    self._tracker_entries[k]['box'] = (x1, y1, x2, y2)
-                    self._tracker_entries[k]['last_seen'] = now
-                    if text:
-                        self._tracker_entries[k]['text'] = text
+                    self._touch_tracker(k, x1, y1, x2, y2, now, text)
+                    self._claim_key(k, cx, cy, now)
                     if used_keys is not None:
                         used_keys.add(k)
                     return k
 
-                if d < best_dist:
-                    best_dist = d
-                    best_key = k
+                # 同样近的候选里优先选内容更相近的，避免相邻两段互换 key
+                # （只按距离选会让文字「跳到」另一个盒子）。
+                if d < POSITION_MATCH_TOLERANCE:
+                    score = (sim, -d)
+                    if best_score is None or score > best_score:
+                        best_score, best_key, best_dist = score, k, d
 
-            if best_key is not None and best_dist < POSITION_MATCH_TOLERANCE:
-                self._tracker_entries[best_key]['box'] = (x1, y1, x2, y2)
-                self._tracker_entries[best_key]['last_seen'] = now
-                if text:
-                    self._tracker_entries[best_key]['text'] = text
+            if best_key is not None:
+                self._touch_tracker(best_key, x1, y1, x2, y2, now, text)
+                self._claim_key(best_key, cx, cy, now)
                 if used_keys is not None:
                     used_keys.add(best_key)
                 return best_key
@@ -443,9 +525,41 @@ class Pipeline:
                 'last_seen': now,
                 'text': text or '',
             }
+            self._claim_key(fallback_key, cx, cy, now)
             if used_keys is not None:
                 used_keys.add(fallback_key)
             return fallback_key
+
+    def _suppress_duplicate_items(self, items, center_tol=8):
+        """同一帧里「文本相同 + 位置几乎重合」的条目只保留一个。
+
+        分块扫描时，ROI 之外保留下来的旧条目，可能与新识别出的同一个单词
+        同时存在；两者 key 不同 → 覆盖层会画出两个重叠窗口，
+        看起来就像「单个单词的译文被重复输出」。
+        """
+        if not items or len(items) < 2:
+            return items
+
+        kept = []
+        for it in items:
+            try:
+                x1, y1, x2, y2 = (it['x1'], it['y1'], it['x2'], it['y2'])
+            except Exception:
+                continue
+            text = normalize_key_text(it.get('text', ''))
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            dup = False
+            if text:
+                for kt, kcx, kcy, _k in kept:
+                    if (kt == text and
+                            abs(cx - kcx) <= center_tol and
+                            abs(cy - kcy) <= center_tol):
+                        dup = True
+                        break
+            if not dup:
+                kept.append((text, cx, cy, it))
+        return [k[3] for k in kept]
 
     def _dedupe_same_frame(self, cur_items):
         def center(item):
@@ -1152,7 +1266,8 @@ class Pipeline:
         cur_keys = self._make_frame_keys(items)
         self.state.last_frame_keys = cur_keys
 
-        paragraphs = merge_lines_to_paragraphs(items)
+        paragraphs = merge_lines_to_paragraphs(
+            items, getattr(self.state, 'merge_level', DEFAULT_MERGE_LEVEL))
         to_translate = [
             p for p in paragraphs
             if not is_target_language_text(p['text'], target_lang)
@@ -1193,6 +1308,12 @@ class Pipeline:
             if zh:
                 self.cache.put(p_hash, zh, line_hashes)
                 continue
+            # 段落结构抖动（背景变动导致多一行/少一行）时，先用旧译文占位，
+            # 保证显示连续（盒子不消失、文字不跳）。真正的翻译仍会请求，
+            # 结果回来后覆盖这条缓存，所以占位是自纠正的。
+            reused_para = self._recall_paragraph(p, line_hashes)
+            if reused_para:
+                self.cache.put(p_hash, reused_para, line_hashes)
             need_api.append((p, p_hash, line_hashes))
 
         self._emit_paragraphs(to_translate, img, region, rois)
@@ -1349,12 +1470,14 @@ class Pipeline:
         verify_count = 0
         t_verify_total = 0.0
         used_keys = set()
+        bg_opacity = 1.0      # 覆盖模式在下方按面板类型覆盖
 
         for p in paragraphs:
             p_hash = hash_paragraph(p)
             zh = self.cache.get(p_hash)
             if not zh:
                 continue
+            self._remember_paragraph(p, zh)
 
             x1, y1, x2, y2 = p['box']
 
@@ -1427,17 +1550,53 @@ class Pipeline:
                         fg = user_fg
                     else:
                         fg = self.color_cache[p_hash]
-                bg_hex = '#FFFFFF'
+                if bg_image is None:
+                    # 精细修复失败（算法判定不适合，返回 None）时退回浅黑面板，
+                    # 否则会出现「白底 + 浅色文字」看不见的情况。
+                    bg_hex = (getattr(self.state, 'overlay_bg_color', '')
+                              or OVERLAY_BG_COLOR)
+                    _uf = getattr(self.state, 'fg_color', 'auto')
+                    if not _uf or _uf == 'auto':
+                        fg = '#FFFFFF'
+                    if bg_opacity >= 0.999:
+                        try:
+                            bg_opacity = max(
+                                OVERLAY_BG_OPACITY_MIN,
+                                min(OVERLAY_BG_OPACITY_MAX,
+                                    float(getattr(
+                                        self.state, 'overlay_bg_opacity',
+                                        DEFAULT_OVERLAY_BG_OPACITY))))
+                        except Exception:
+                            pass
+                else:
+                    bg_hex = '#FFFFFF'
                 item_extra = {'force_font_size': base_font}
             else:
-                avg = self._crop_avg_color(img, x1, y1, x2, y2)
-                bg_hex = f'#{avg[0]:02x}{avg[1]:02x}{avg[2]:02x}'
-                fg = self._resolve_fg_color(avg)
+                # ⭐ 浅黑面板（美化）：不再逐段采样背景色。
+                # 采样色会随画面内容变化而闪烁，观感差；固定浅黑更统一。
+                # 透明度由 state.overlay_bg_opacity 控制（默认 30% 透明）。
+                bg_hex = (getattr(self.state, 'overlay_bg_color', '')
+                          or OVERLAY_BG_COLOR)
+                user_fg = getattr(self.state, 'fg_color', 'auto')
+                # 深色面板上自动用白字；用户显式选色时尊重其选择
+                fg = (user_fg if (user_fg and user_fg != 'auto')
+                      else '#FFFFFF')
                 bg_image = None
                 if use_inpaint:
                     inpaint_used += 1
                     bg_image = self._get_inpaint_cached(
                         p_hash, img, x1, y1, x2, y2)
+                # 有修复背景图时保持完全不透明（要看清修复后的底图），
+                # 否则按滑杆设置的不透明度叠加在画面上。
+                if bg_image is None:
+                    try:
+                        op = float(getattr(
+                            self.state, 'overlay_bg_opacity',
+                            DEFAULT_OVERLAY_BG_OPACITY))
+                    except Exception:
+                        op = DEFAULT_OVERLAY_BG_OPACITY
+                    bg_opacity = max(OVERLAY_BG_OPACITY_MIN,
+                                     min(OVERLAY_BG_OPACITY_MAX, op))
                 item_extra = {}
 
             item = {
@@ -1450,6 +1609,7 @@ class Pipeline:
                 'bg_hex': bg_hex,
                 'fg': fg,
                 'bg_image': bg_image,
+                'bg_opacity': bg_opacity,
                 'key': display_key,
                 'bilingual': False,
                 'subtitle': False,
@@ -1488,6 +1648,7 @@ class Pipeline:
                 self._known_items = dict(cur_items)
             all_known = list(self._known_items.values())
 
+        all_known = self._suppress_duplicate_items(all_known)
         stable = self.emit_debouncer.process(all_known)
         if stable is None:
             if all_known:
@@ -1527,6 +1688,56 @@ class Pipeline:
             if ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1:
                 return True
         return False
+
+    # ==================== 段落级译文复用 ====================
+
+    def _remember_paragraph(self, paragraph, zh):
+        """记住「位置 → 行集合 + 译文」，供结构抖动时复用。"""
+        if not zh or zh.startswith('['):
+            return
+        try:
+            lh = get_line_hashes(paragraph)
+        except Exception:
+            return
+        if not lh:
+            return
+        key = paragraph_display_key(paragraph)
+        with self._para_mem_lock:
+            old = self._para_memory.get(key)
+            if old and old['lines'] == lh and old['zh'] == zh:
+                return
+            self._para_memory[key] = {
+                'lines': lh,
+                'zh': zh,
+                'len': len(paragraph.get('text', '')),
+                'ts': time.time(),
+            }
+            self._para_memory.move_to_end(key)
+            while len(self._para_memory) > PARAGRAPH_MEMORY_MAX:
+                self._para_memory.popitem(last=False)
+
+    def _recall_paragraph(self, paragraph, line_hashes):
+        """按「同位置 + 行集合相似度」取回旧译文；不满足条件返回 None。"""
+        if not line_hashes:
+            return None
+        key = paragraph_display_key(paragraph)
+        with self._para_mem_lock:
+            cand = self._para_memory.get(key)
+        if not cand:
+            return None
+        old_lines = cand.get('lines') or frozenset()
+        if not old_lines:
+            return None
+        union = len(line_hashes | old_lines)
+        if not union:
+            return None
+        if (len(line_hashes & old_lines) / union) < PARAGRAPH_REUSE_JACCARD:
+            return None
+        la = len(paragraph.get('text', ''))
+        lb = cand.get('len', 0)
+        if la and lb and (min(la, lb) / max(la, lb)) < PARAGRAPH_REUSE_LEN_RATIO:
+            return None
+        return cand.get('zh') or None
 
     def _get_inpaint_cached(self, p_hash, img, x1, y1, x2, y2):
         with self._inpaint_lock:

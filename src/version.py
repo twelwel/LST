@@ -2,8 +2,8 @@
 所有版本号统一在这里修改
 """
 
-__version__ = "1.40.7"
-__version_tuple__ = (1, 40, 7)
+__version__ = "1.40.8"
+__version_tuple__ = (1, 40, 8)
 __author__ = "twelwel"
 __email__ = "2033697674@qq.com"
 __license__ = "MIT"
@@ -15,6 +15,9 @@ REPO_URL = "https://github.com/twelwel/LST"
 RELEASE_URL = REPO_URL + "/releases"
 
 VERSION_INFO = {
+    "1.40.8": "v1.40.8：本地模型改批量推理并走 CPU（3.6×，DirectML 反而慢 6~7 倍）；"
+              "覆盖层浅黑半透明 + 不透明度滑杆、鼠标穿透、重复译文抑制；"
+              "抑制背景变动导致的译文抖动；修复退出卡顿；新增文字合并强度开关",
     "1.40.7": "v1.40.7：修复打包版本地模型因缺少 unittest 无法加载；"
               "本地模型下拉选择可持久化并优先调用；"
               "所有策略在 API/AI 全部失败时回退本地模型",

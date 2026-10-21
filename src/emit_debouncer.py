@@ -35,6 +35,9 @@ class EmitDebouncer:
     # 位置更新阈值（文本未变时）
     POS_UPDATE_THRESHOLD = 8
 
+    # 几何量化网格（px）
+    GEOMETRY_QUANTIZE = 2
+
     # 消失容忍
     MISS_TOLERANCE = 2
 
@@ -213,7 +216,12 @@ class EmitDebouncer:
 
     @staticmethod
     def _box(it):
-        return (it['x1'], it['y1'], it['x2'], it['y2'])
+        # 几何量化：把坐标对齐到 2px 网格，抹掉 OCR 的 1px 级边界抖动。
+        # 否则每个像素级的框变化都会走到 POS_UPDATE_THRESHOLD 判断，
+        # 并在超过阈值时推动窗口移动/改尺寸，观感就是抖动。
+        q = EmitDebouncer.GEOMETRY_QUANTIZE
+        return (int(it['x1']) // q * q, int(it['y1']) // q * q,
+                int(it['x2']) // q * q, int(it['y2']) // q * q)
 
     @staticmethod
     def _center_close(a, b, tol):

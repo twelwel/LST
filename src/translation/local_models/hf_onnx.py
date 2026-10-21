@@ -26,6 +26,30 @@ def get_preferred_device() -> str:
         if _preferred_device is not None: return _preferred_device
     return (os.environ.get('LST_LOCAL_DEVICE', 'auto') or 'auto').lower()
 
+# torch 默认把线程数开到 CPU 核数，会与 ORT 的 intra_op 线程互相抢占。
+# 实测（本机 8 线程）：
+#   短句 54ms / CPU 时间 500ms（9.3 核）
+#   → 限到 1 线程后：43ms / 141ms（3.3 核）—— 更快，且省 72% CPU
+TORCH_THREADS = max(1, int(os.environ.get('LST_TORCH_THREADS', '1') or 1))
+
+
+def _limit_torch_threads():
+    """限制 torch 线程数。
+
+    本地翻译只把 torch 用于每步解码的 logits 处理（no_repeat_ngram /
+    repetition_penalty / 张量搬运），单线程足够，多线程纯属内耗。
+    """
+    try:
+        import torch
+        torch.set_num_threads(TORCH_THREADS)
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass          # 已初始化过会抛异常，忽略
+    except Exception as e:
+        log.debug(f"[ONNX] 设置 torch 线程数失败：{e}")
+
+
 def _resolve_provider():
     force = get_preferred_device()
     try:
@@ -40,10 +64,12 @@ def _resolve_provider():
     if force == 'directml' and 'DmlExecutionProvider' in available:
         return "DmlExecutionProvider", dml_provider_options()
 
-    # auto
-    if 'CUDAExecutionProvider' in available: return "CUDAExecutionProvider", [{"device_id": 0}]
-    if 'DmlExecutionProvider' in available:
-        return "DmlExecutionProvider", dml_provider_options()
+    # ⭐ auto → CPU（实测结论，勿改回“GPU 优先”）
+    # Opus-MT 是小模型 + 逐 token 自回归，一次翻译要跑十几次小 Run；
+    # DirectML 每次 Run 都有固定提交/同步开销，实测慢 6~7 倍：
+    #   短句 335ms → CPU 43ms；长段落 3039ms → CPU 363ms
+    # 而 OCR 是卷积大图、一次 Run，DML 反而快 1.6 倍，所以 OCR 继续走 DML。
+    # 显式选 directml / cuda 时仍按上面的分支执行，只有 auto 收敛到 CPU。
     return "CPUExecutionProvider", None
 
 def _build_session_options(use_gpu: bool):
@@ -65,6 +91,28 @@ def _inference_mode():
         return torch.inference_mode()
     except Exception:
         return nullcontext()
+
+
+try:
+    from config import (LOCAL_BATCH_MAX as _BATCH_MAX,
+                        LOCAL_BATCH_PADDING_RATIO as _BATCH_RATIO)
+except Exception:
+    _BATCH_MAX, _BATCH_RATIO = 8, 1.6
+
+
+def _bucket_by_length(texts, max_size=_BATCH_MAX, ratio=_BATCH_RATIO):
+    """按长度分桶：长短混批会让 padding 吃掉全部收益。"""
+    ordered = sorted(texts, key=len)
+    bucket = []
+    for t in ordered:
+        if bucket:
+            shortest = len(bucket[0])          # ordered 升序，首元素最短
+            if len(bucket) >= max_size or len(t) > max(1, shortest) * ratio:
+                yield bucket
+                bucket = []
+        bucket.append(t)
+    if bucket:
+        yield bucket
 
 def detect_variants(model_path: Path) -> dict:
     onnx_dir = Path(model_path) / 'onnx'
@@ -99,6 +147,7 @@ class HFONNXModel(BaseTranslationModel):
     def variant_tag(self) -> str: return 'GPU' if self._variant_label == 'FP32' else 'CPU'
 
     def load(self, model_path: Path) -> bool:
+        _limit_torch_threads()      # 必须在建会话/生成之前限制
         with self._lock:
             if self._model is not None: return True
             self.last_error = ''
@@ -121,10 +170,9 @@ class HFONNXModel(BaseTranslationModel):
             onnx_dir = model_path / 'onnx'
             has_fp32 = (onnx_dir / 'encoder_model.onnx').exists()
             has_int8 = (onnx_dir / 'encoder_model_quantized.onnx').exists()
-            # 自动模式只有下载了 FP32 才走 GPU；否则直接使用 int8 CPU，
-            # 避免“只下载 CPU 版”时被误判为 GPU 不可用而加载失败。
-            prefer_gpu = (pref in ('cuda', 'directml')
-                          or (pref == 'auto' and has_fp32))
+            # 只有显式选 cuda / directml 才走 GPU；auto 一律 CPU
+            # （DML 对本地翻译模型是负优化，见 _resolve_provider 的说明）。
+            prefer_gpu = pref in ('cuda', 'directml')
 
             # ⭐ 智能选择：GPU 必须用 FP32，CPU 优先 int8
             if prefer_gpu:
@@ -210,13 +258,10 @@ class HFONNXModel(BaseTranslationModel):
                     inputs = self._tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
                     # 按输入长度限制输出，防止短词（如 Settings）重复生成到 512 token
                     max_new = max(24, min(192, len(text) + 24))
-                    # 短标签严格禁止 token 重复，避免 "Settings" -> "设置设置设置"
-                    if len(text) <= 16:
-                        no_repeat = 1
-                    elif len(text) <= 40:
-                        no_repeat = 2
-                    else:
-                        no_repeat = 3
+                    # 固定 3：原 nrn=1（短文本分支）会禁止任何 token 重复，
+                    # 中文译文基本无法满足，实测译文更差（"Settings"→"设置布设"）；
+                    # 固定值同时保证单条与批量推理的输出一致。
+                    no_repeat = 3
                     with _inference_mode():
                         outputs = self._model.generate(
                             **inputs,
@@ -230,6 +275,74 @@ class HFONNXModel(BaseTranslationModel):
                     snippet = text[:80].replace('\n', ' ')
                     log.warning(f"[ONNX] 翻译失败 @ {self._provider_name}: {e} | 文本={snippet!r}")
                     return f'[翻译错误: {e}]'
+
+    def translate_batch(self, texts, src_lang='auto', tgt_lang='zh'):
+        """批量翻译：一次 generate 处理多条，摊薄固定开销。
+
+        实测 8 条短句：逐条 56.1ms/条 → 批量 18.4ms/条（约 3.1×）。
+        去重 + 按长度分桶 + DML 下整批只取一次闸门。
+        """
+        if not self._model:
+            return ['[未加载]'] * len(texts)
+        texts = list(texts or [])
+        if not texts:
+            return []
+        if len(texts) == 1:
+            return [self.translate(texts[0], src_lang, tgt_lang)]
+
+        # 去重（同一帧常出现重复短语）
+        uniq, out_map = [], {}
+        for t in texts:
+            s = (t or '').strip()
+            if s and s not in out_map and s not in uniq:
+                uniq.append(s)
+        for s in uniq:
+            out_map[s] = None
+
+        for group in _bucket_by_length(uniq):
+            got = self._generate_group(group)
+            if got is None:
+                # 批量失败 → 逐条兜底（注意此处已释放实例锁，避免重入死锁）
+                for t in group:
+                    out_map[t] = self.translate(t, src_lang, tgt_lang)
+            else:
+                out_map.update(got)
+
+        return [out_map.get((t or '').strip(), '') if (t or '').strip() else ''
+                for t in texts]
+
+    def _generate_group(self, group):
+        """一个批次跑一次 generate；失败返回 None 交给调用方逐条重试。"""
+        if not group:
+            return {}
+        longest = max(group, key=len)
+        max_new = max(24, min(192, len(longest) + 24))
+        no_repeat = 3       # 与单条路径保持一致（见 translate 中的说明）
+
+        guard = dml_guard() if is_dml_provider(self._provider_name) else nullcontext()
+        with self._lock:
+            with guard:
+                try:
+                    inputs = self._tokenizer(
+                        list(group), return_tensors='pt', padding=True,
+                        truncation=True, max_length=512)
+                    with _inference_mode():
+                        outputs = self._model.generate(
+                            **inputs,
+                            max_new_tokens=max_new,
+                            num_beams=1,
+                            no_repeat_ngram_size=no_repeat,
+                            repetition_penalty=1.15,
+                        )
+                    decoded = self._tokenizer.batch_decode(
+                        outputs, skip_special_tokens=True)
+                    if len(decoded) != len(group):
+                        return None
+                    return {t: (s or '').strip() for t, s in zip(group, decoded)}
+                except Exception as e:
+                    log.warning(f"[ONNX] 批量翻译失败（{len(group)} 条），"
+                                f"回退逐条：{e}")
+                    return None
 
     def unload(self) -> None:
         with self._lock:

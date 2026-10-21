@@ -103,6 +103,15 @@ try:
 except Exception:
     pass
 
+# safetensors：transformers 在模块级硬 import safetensors.torch
+# （modeling_utils / pytorch_utils / model_debugging_utils / trainer），
+# 缺了会让打包版本地模型加载时报 “No module named 'safetensors.torch'”。
+# 注意：safetensors 带 Rust 扩展 _safetensors_rust，必须连二进制一起收。
+try:
+    _merge(collect_all('safetensors'))
+except Exception:
+    pass
+
 # transformers：只收核心，不拉 torch
 try:
     _merge(collect_all(
@@ -143,6 +152,10 @@ hiddenimports += [
     'unittest.runner',
     'unittest.signals',
     'doctest',
+
+    # safetensors：transformers 模块级硬依赖，绝不能进 excludes（见上方说明）
+    'safetensors',
+    'safetensors.torch',
 
     # 项目模块
     'emit_debouncer',
@@ -194,7 +207,6 @@ hiddenimports += [
     'translation.local_models.hf_onnx',
     'translation.local_models.gemma3_onnx',
     'translation.local_models.downloader',
-    'translation.local_models.cache',
     'translation.local_models.registry',
 
     # 对话框
@@ -271,7 +283,8 @@ a = Analysis(
         'accelerate',
         'datasets',
         'evaluate',
-        'safetensors.torch',
+        # ⚠️ 不要加 'safetensors.torch'：transformers 模块级硬 import 它，
+        #    排除后打包版本地模型直接报 No module named 'safetensors.torch'（v1.40.7 实锤）。
         'tensorboardX',
         'wandb',
         'mlflow',

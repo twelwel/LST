@@ -23,6 +23,12 @@ from config import (
     DEFAULT_ENABLE_FINE_TEXT,
     DEFAULT_ENABLE_ASYNC_OVERLAY,
     FG_COLOR_PRESETS, DEFAULT_FG_COLOR,
+    OVERLAY_BG_COLOR,
+    DEFAULT_OVERLAY_BG_OPACITY,
+    OVERLAY_BG_OPACITY_MIN,
+    OVERLAY_BG_OPACITY_MAX,
+    MERGE_LEVELS,
+    DEFAULT_MERGE_LEVEL,
     HOTKEY_LABELS,
 )
 from inpaint import CV2_AVAILABLE
@@ -421,10 +427,40 @@ class DisplayPanelMixin:
         self.fg_color_selector.grid(row=28, column=1, columnspan=2,
                                      sticky='w', padx=10, pady=6)
 
+        # ===== 覆盖层不透明度 =====
+        ctk.CTkLabel(
+            parent, text="覆盖层不透明度：", font=(FONT_NAME, 11),
+        ).grid(row=29, column=0, sticky='w', padx=(15, 5), pady=6)
+
+        self.overlay_opacity_label = ctk.CTkLabel(
+            parent, text=f"{int(DEFAULT_OVERLAY_BG_OPACITY * 100)}%",
+            width=60, font=(FONT_NAME, 11),
+        )
+        self.overlay_opacity_label.grid(row=29, column=2, sticky='e',
+                                        padx=(5, 15))
+
+        self.overlay_opacity_slider = ctk.CTkSlider(
+            parent,
+            from_=OVERLAY_BG_OPACITY_MIN * 100,
+            to=OVERLAY_BG_OPACITY_MAX * 100,
+            number_of_steps=90,
+            command=self._on_overlay_opacity_change,
+        )
+        self.overlay_opacity_slider.set(DEFAULT_OVERLAY_BG_OPACITY * 100)
+        self.overlay_opacity_slider.grid(row=29, column=1,
+                                         sticky='ew', padx=10)
+
+        ctk.CTkLabel(
+            parent,
+            text="💡 70% = 30% 透明；越低越透，文字也会一起变淡",
+            font=(FONT_NAME, 9), text_color='#888888', anchor='w',
+        ).grid(row=30, column=0, columnspan=3,
+               sticky='w', padx=(25, 15), pady=(0, 6))
+
         # ===== 图像修复 =====
         ctk.CTkLabel(
             parent, text="图像修复（整框）：", font=(FONT_NAME, 11),
-        ).grid(row=29, column=0, sticky='w', padx=(15, 5),
+        ).grid(row=31, column=0, sticky='w', padx=(15, 5),
                pady=(12, 6))
 
         self.inpaint_switch = ctk.CTkSwitch(
@@ -434,7 +470,7 @@ class DisplayPanelMixin:
         )
         if DEFAULT_USE_INPAINTING and CV2_AVAILABLE:
             self.inpaint_switch.select()
-        self.inpaint_switch.grid(row=29, column=1, sticky='w', padx=10)
+        self.inpaint_switch.grid(row=31, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.inpaint_switch.configure(state='disabled')
@@ -443,7 +479,7 @@ class DisplayPanelMixin:
         ctk.CTkLabel(
             parent, text="精细文字替换（保留背景）：",
             font=(FONT_NAME, 11),
-        ).grid(row=30, column=0, sticky='w', padx=(15, 5),
+        ).grid(row=32, column=0, sticky='w', padx=(15, 5),
                pady=(8, 6))
 
         self.fine_text_switch = ctk.CTkSwitch(
@@ -453,7 +489,7 @@ class DisplayPanelMixin:
         )
         if DEFAULT_ENABLE_FINE_TEXT and CV2_AVAILABLE:
             self.fine_text_switch.select()
-        self.fine_text_switch.grid(row=30, column=1, sticky='w', padx=10)
+        self.fine_text_switch.grid(row=32, column=1, sticky='w', padx=10)
 
         if not CV2_AVAILABLE:
             self.fine_text_switch.configure(state='disabled')
@@ -462,7 +498,7 @@ class DisplayPanelMixin:
         ctk.CTkLabel(
             parent, text="异步覆盖（逐字显示）：",
             font=(FONT_NAME, 11),
-        ).grid(row=31, column=0, sticky='w', padx=(15, 5),
+        ).grid(row=33, column=0, sticky='w', padx=(15, 5),
                pady=(8, 6))
 
         self.async_overlay_switch = ctk.CTkSwitch(
@@ -472,13 +508,13 @@ class DisplayPanelMixin:
         )
         if DEFAULT_ENABLE_ASYNC_OVERLAY:
             self.async_overlay_switch.select()
-        self.async_overlay_switch.grid(row=31, column=1,
+        self.async_overlay_switch.grid(row=33, column=1,
                                         sticky='w', padx=10)
 
         # ===== 自动清理缓存 =====
         ctk.CTkLabel(
             parent, text="自动清理缓存：", font=(FONT_NAME, 11),
-        ).grid(row=32, column=0, sticky='w', padx=(15, 5),
+        ).grid(row=34, column=0, sticky='w', padx=(15, 5),
                pady=(12, 6))
 
         self.auto_clean_switch = ctk.CTkSwitch(
@@ -487,19 +523,19 @@ class DisplayPanelMixin:
             onvalue=True, offvalue=False,
         )
         self.auto_clean_switch.select()
-        self.auto_clean_switch.grid(row=32, column=1,
+        self.auto_clean_switch.grid(row=34, column=1,
                                      sticky='w', padx=10)
 
         # ===== 缓存上限 =====
         ctk.CTkLabel(
             parent, text="缓存上限 (条)：", font=(FONT_NAME, 11),
-        ).grid(row=33, column=0, sticky='w', padx=(15, 5), pady=6)
+        ).grid(row=35, column=0, sticky='w', padx=(15, 5), pady=6)
 
         self.cache_limit_label = ctk.CTkLabel(
             parent, text=str(CACHE_DEFAULT), width=60,
             font=(FONT_NAME, 11),
         )
-        self.cache_limit_label.grid(row=33, column=2, sticky='e',
+        self.cache_limit_label.grid(row=35, column=2, sticky='e',
                                      padx=(5, 15))
 
         self.cache_limit_slider = ctk.CTkSlider(
@@ -508,12 +544,12 @@ class DisplayPanelMixin:
             command=self._on_cache_limit_change,
         )
         self.cache_limit_slider.set(CACHE_DEFAULT)
-        self.cache_limit_slider.grid(row=33, column=1,
+        self.cache_limit_slider.grid(row=35, column=1,
                                       sticky='ew', padx=10)
 
         # ===== 缓存显示与操作 =====
         cache_row = ctk.CTkFrame(parent, fg_color='transparent', height=1)
-        cache_row.grid(row=34, column=0, columnspan=3,
+        cache_row.grid(row=36, column=0, columnspan=3,
                        sticky='ew', padx=(15, 15), pady=(4, 12))
         cache_row.pack_propagate(True)
 
@@ -536,6 +572,27 @@ class DisplayPanelMixin:
             fg_color='#dc3545', hover_color='#c82333',
             command=self._manual_clear_cache,
         ).pack(side='right')
+
+        # ===== 文字合并强度 =====
+        ctk.CTkLabel(
+            parent, text="文字合并强度：", font=(FONT_NAME, 11),
+        ).grid(row=37, column=0, sticky='w', padx=(15, 5), pady=(12, 6))
+
+        self.merge_level_selector = ctk.CTkOptionMenu(
+            parent, values=list(MERGE_LEVELS.values()),
+            command=self._on_merge_level_change,
+            font=(FONT_NAME, 10), width=200,
+        )
+        self.merge_level_selector.set(MERGE_LEVELS[DEFAULT_MERGE_LEVEL])
+        self.merge_level_selector.grid(row=37, column=1, columnspan=2,
+                                       sticky='w', padx=10, pady=(12, 6))
+
+        ctk.CTkLabel(
+            parent,
+            text="💡 强：同排短词也并成一句；弱：只并长行；关：每行独立",
+            font=(FONT_NAME, 9), text_color='#888888', anchor='w',
+        ).grid(row=38, column=0, columnspan=3, sticky='w',
+               padx=(25, 15), pady=(0, 6))
 
         self._update_phrase_count()
 

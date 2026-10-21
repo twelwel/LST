@@ -3,8 +3,8 @@
 # 修改版本号时需与 src/version.py 中的 __version__ 保持一致
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 40, 7, 0),
-    prodvers=(1, 40, 7, 0),
+    filevers=(1, 40, 8, 0),
+    prodvers=(1, 40, 8, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'twelwel'),
             StringStruct('FileDescription', 'LST 实时屏幕翻译 (DirectML)'),
-            StringStruct('FileVersion', '1.40.7'),
+            StringStruct('FileVersion', '1.40.8'),
             StringStruct('InternalName', 'LST-DirectML'),
             StringStruct('LegalCopyright', 'Copyright (C) 2026 twelwel'),
             StringStruct('OriginalFilename', 'LST-DirectML.exe'),
             StringStruct('ProductName', 'LST'),
-            StringStruct('ProductVersion', '1.40.7')
+            StringStruct('ProductVersion', '1.40.8')
           ]
         )
       ]

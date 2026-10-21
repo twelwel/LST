@@ -340,6 +340,27 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self.app_state.translation_strategy = saved_translation_strategy
         self.app_state.display_mode = saved_display_mode
         self.app_state.fg_color = saved_fg_color
+
+        # 覆盖层外观：浅黑面板 + 不透明度（默认 70% = 30% 透明）
+        from config import (OVERLAY_BG_COLOR, DEFAULT_OVERLAY_BG_OPACITY,
+                            OVERLAY_BG_OPACITY_MIN, OVERLAY_BG_OPACITY_MAX)
+        self.app_state.overlay_bg_color = OVERLAY_BG_COLOR
+        try:
+            _op = float(self.user_cfg.get('overlay_bg_opacity',
+                                          DEFAULT_OVERLAY_BG_OPACITY))
+        except Exception:
+            _op = DEFAULT_OVERLAY_BG_OPACITY
+        self.app_state.overlay_bg_opacity = max(
+            OVERLAY_BG_OPACITY_MIN, min(OVERLAY_BG_OPACITY_MAX, _op))
+
+        # 文字合并强度
+        try:
+            _ml = str(self.user_cfg.get('merge_level', 'mid') or 'mid').lower()
+        except Exception:
+            _ml = 'mid'
+        if _ml not in ('off', 'weak', 'mid', 'strong'):
+            _ml = 'mid'
+        self.app_state.merge_level = _ml
         self.app_state.source_lang = saved_source_lang
         self.app_state.target_lang = saved_target_lang
 
@@ -421,6 +442,10 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         self._fg_label_to_key = {
             v: k for k, v in FG_COLOR_PRESETS.items()
         }
+        from config import MERGE_LEVELS as _ML
+        self._merge_label_to_key = {
+            v: k for k, v in _ML.items()
+        }
 
         self._build_ui()
 
@@ -464,6 +489,26 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
             self.scan_value_label.configure(text=f"{scan:.2f} s")
             self.font_slider.set(font)
             self.font_value_label.configure(text=str(font))
+
+            # 覆盖层不透明度滑块
+            try:
+                _op = float(getattr(self.app_state,
+                                    'overlay_bg_opacity', 0.70))
+                self.overlay_opacity_slider.set(
+                    max(10.0, min(100.0, _op * 100)))
+                self.overlay_opacity_label.configure(
+                    text=f"{int(round(_op * 100))}%")
+            except Exception:
+                pass
+
+            # 文字合并强度下拉
+            try:
+                from config import MERGE_LEVELS as _ML2
+                _lv = getattr(self.app_state, 'merge_level', 'mid')
+                self.merge_level_selector.set(
+                    _ML2.get(_lv, _ML2['mid']))
+            except Exception:
+                pass
             self.cpu_count_slider.set(self.cpu_engine_count)
             self.cpu_count_label.configure(
                 text=str(self.cpu_engine_count))
@@ -2553,6 +2598,60 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         except Exception:
             pass
 
+    # ================= 覆盖层不透明度 =================
+
+    def _on_overlay_opacity_change(self, value):
+        try:
+            v = max(0.10, min(1.0, float(value) / 100.0))
+        except Exception:
+            return
+        self.app_state.overlay_bg_opacity = v
+        try:
+            self.overlay_opacity_label.configure(
+                text=f"{int(round(v * 100))}%")
+        except Exception:
+            pass
+        self.user_cfg.set('overlay_bg_opacity', round(v, 2))
+        self.user_cfg.save()
+        # 立即应用到已存在的窗口，不必等下一帧
+        try:
+            self.overlay.set_bg_opacity(v)
+        except Exception:
+            pass
+        try:
+            self.bottom_label.configure(
+                text=f"覆盖层不透明度：{int(round(v * 100))}%")
+        except Exception:
+            pass
+
+    # ================= 文字合并强度 =================
+
+    def _on_merge_level_change(self, label):
+        key = self._merge_label_to_key.get(label, 'mid')
+        self.app_state.merge_level = key
+        self.user_cfg.set('merge_level', key)
+        self.user_cfg.save()
+
+        # 立即按新规则重算：清防抖状态与已有覆盖框
+        try:
+            self.pipeline.reset_debouncer()
+        except Exception:
+            pass
+        try:
+            self.overlay.clear()
+        except Exception:
+            pass
+        try:
+            self.app_state.reset_signature()
+        except Exception:
+            pass
+
+        log.info(f"[文字合并] 切换为 {key}")
+        try:
+            self.bottom_label.configure(text=f"文字合并强度：{label}")
+        except Exception:
+            pass
+
     # ================= 译文模式 =================
 
     def _on_follow_mode_change(self, mode_name):
@@ -3695,6 +3794,13 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
     def quit_app(self):
         log.info(f"========== 退出 v{__version__} ==========")
 
+        # 先把界面收起来：用户感知「秒关」，后续清理不再阻塞观感
+        try:
+            self.withdraw()
+            self.update_idletasks()
+        except Exception:
+            pass
+
         try:
             self.user_cfg.set('window_geometry', self.geometry())
             self.user_cfg.save()
@@ -3706,10 +3812,26 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
         except Exception:
             pass
 
+        # ① 先停管线。否则它仍在抓屏 / OCR / 翻译：
+        #    既会和下面的 DML 清理抢全局闸门，也会让线程池里的任务
+        #    一直拖到进程退出时才被 join —— 那就是「关窗后卡一下」。
+        try:
+            self.pipeline.stop()
+        except Exception as e:
+            log.warning(f"[退出] 停止管线失败：{e}")
+
         try:
             self.scroll_detector.stop()
         except Exception:
             pass
+
+        # ② 主动卸载本地模型：把 ORT / DirectML 会话在退出前释放。
+        #    留给解释器析构会卡在驱动层，也是 0xC0000005 的高发路径。
+        try:
+            from translation.local_models import unload_all_models
+            unload_all_models(force=True)
+        except Exception as e:
+            log.warning(f"[退出] 卸载本地模型失败：{e}")
 
         try:
             self.caption_window.destroy()
@@ -3718,10 +3840,38 @@ class TranslatorApp(DisplayPanelMixin, HotkeyPanelMixin, ctk.CTk):
 
         try:
             self.ocr_engine.shutdown()
+        except Exception as e:
+            log.warning(f"[退出] 关闭 OCR 引擎失败：{e}")
+
+        try:
+            self.hk_mgr.remove_all()
+        except Exception as e:
+            log.warning(f"[退出] 移除热键失败：{e}")
+
+        try:
+            self.region_manager.destroy()
         except Exception:
             pass
 
-        self.hk_mgr.remove_all()
-        self.region_manager.destroy()
-        self.overlay.clear()
-        self.destroy()
+        try:
+            self.overlay.clear()
+        except Exception:
+            pass
+
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+        # ③ 跳过解释器 atexit 对线程池的 join：
+        #    若有正在等待 API 的请求（超时最长 30s），进程会卡在退出阶段。
+        try:
+            import logging
+            logging.shutdown()
+        except Exception:
+            pass
+        try:
+            import os
+            os._exit(0)
+        except Exception:
+            pass

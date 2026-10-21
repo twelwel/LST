@@ -13,6 +13,7 @@
 import re
 import tkinter as tk
 import ctypes
+from difflib import SequenceMatcher
 from PIL import ImageTk
 from layout import calc_font_size
 from logger import get_logger
@@ -23,6 +24,13 @@ log = get_logger('overlay')
 DEFAULT_FONT = 'Microsoft YaHei'
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 POSITION_QUANTIZE = 6
+
+# ==================== 窗口扩展样式（鼠标穿透） ====================
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000        # Tk 设置 -alpha 时必需
+WS_EX_TRANSPARENT = 0x00000020    # 鼠标穿透（不接收点击）
+WS_EX_NOACTIVATE = 0x08000000     # 不抢焦点
+LWA_ALPHA = 0x00000002            # SetLayeredWindowAttributes 的「整体透明度」模式
 
 # ==================== 双语模式参数 ====================
 BILINGUAL_FONT_SCALE = 0.9
@@ -48,6 +56,27 @@ CAPTION_FONT_SIZE = 12
 CAPTION_MIN_TEXT_LEN = 2
 
 
+def _is_minor_text_change(old, new, min_len_ratio=0.7, min_sim=0.7):
+    """判断译文改动是否「小到不该重启动画」。
+
+    背景变动会让 OCR 轻微抖动，进而让译文差一两个标点/字。
+    这种改动若每次都重打字机动画，观感就是抖动；
+    此处判定为 minor 时直接整体替换、不重启动画。
+    """
+    if not old or not new:
+        return False
+    la, lb = len(old), len(new)
+    longest = max(la, lb)
+    if not longest:
+        return False
+    if (min(la, lb) / longest) < min_len_ratio:
+        return False
+    try:
+        return SequenceMatcher(None, old, new).ratio() >= min_sim
+    except Exception:
+        return False
+
+
 def _get_toplevel_hwnd(hwnd):
     try:
         root = ctypes.windll.user32.GetAncestor(hwnd, 2)
@@ -62,6 +91,70 @@ def exclude_from_capture(hwnd):
         return bool(ctypes.windll.user32.SetWindowDisplayAffinity(
             top, WDA_EXCLUDEFROMCAPTURE
         ))
+    except Exception:
+        return False
+
+
+_click_through_logged = False
+
+
+def make_click_through(hwnd, alpha=1.0):
+    """让窗口不接收鼠标事件（点击穿透到下层窗口）。
+
+    覆盖层是「贴在屏幕上的译文」，任何点击都应该落到底下的游戏/程序。
+    需要 WS_EX_TRANSPARENT，并加 WS_EX_NOACTIVATE 避免抢焦点。
+
+    ⚠️ 两个必须注意的坑：
+    1. Tk 的 -alpha 是「直接赋值」GWL_EXSTYLE，会抹掉 TRANSPARENT /
+       NOACTIVATE，所以必须在设置 -alpha 之后调用本函数。
+    2. 若本次把窗口变成「分层窗口」（补了 WS_EX_LAYERED），必须同时调用
+       SetLayeredWindowAttributes 设置分层属性 —— 否则会得到一个
+       「没有任何分层属性的分层窗口」，在 Windows 上**完全不可见**
+       （表现为译文整片消失）。
+
+    幂等：样式已正确时不会重复调用 SetWindowLong。
+    """
+    global _click_through_logged
+    try:
+        top = _get_toplevel_hwnd(hwnd)
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_long]
+        ex = user32.GetWindowLongW(top, GWL_EXSTYLE)
+        want = ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+        if want != ex:
+            user32.SetWindowLongW(top, GWL_EXSTYLE, want)
+            if not (ex & WS_EX_LAYERED):
+                # 刚刚变成分层窗口 → 立刻补分层属性，避免窗口变隐形
+                try:
+                    a = max(0, min(255, int(round(float(alpha) * 255))))
+                    user32.SetLayeredWindowAttributes(
+                        top, 0, a, LWA_ALPHA)
+                except Exception as e:
+                    log.warning(f"[覆盖层] 设置分层属性失败（可能不可见）：{e}")
+        if not _click_through_logged:
+            _click_through_logged = True
+            log.info("[覆盖层] 鼠标穿透已启用（WS_EX_TRANSPARENT）")
+        return True
+    except Exception as e:
+        if not _click_through_logged:
+            _click_through_logged = True
+            log.warning(f"[覆盖层] 鼠标穿透启用失败：{e}")
+        return False
+
+
+def is_click_through(hwnd):
+    """诊断用：读取当前窗口是否已带鼠标穿透样式。"""
+    try:
+        top = _get_toplevel_hwnd(hwnd)
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        ex = user32.GetWindowLongW(top, GWL_EXSTYLE)
+        return bool(ex & WS_EX_TRANSPARENT)
     except Exception:
         return False
 
@@ -240,21 +333,44 @@ class TranslationBox(tk.Toplevel):
         self._initialized = False
         self._bilingual = False
         self._subtitle = False
+        self._bg_opacity = 1.0
+        self._font_cache_key = None
+        self._font_cache_text = ''
+        self._font_cache_size = 15
 
     def _apply_alpha(self):
         try:
-            if self._bilingual:
-                self.attributes('-alpha', BILINGUAL_ALPHA)
-            else:
-                self.attributes('-alpha', 1.0)
+            alpha = (BILINGUAL_ALPHA if self._bilingual
+                     else self._bg_opacity)
+            self.attributes('-alpha', alpha)
+            # 设置 -alpha 会让窗口变为分层窗口，而 Tk 是「赋值」GWL_EXSTYLE，
+            # 会抹掉 TRANSPARENT / NOACTIVATE；这里在之后补一次
+            # （幂等、开销极小），并把 alpha 传进去避免分层属性缺失导致隐形。
+            make_click_through(self.winfo_id(), alpha)
         except Exception:
             pass
 
+    def set_bg_opacity(self, value):
+        """设置覆盖面板不透明度（1.0 = 完全不透明）。"""
+        try:
+            v = max(0.05, min(1.0, float(value)))
+        except Exception:
+            return
+        if abs(v - self._bg_opacity) < 0.001:
+            return
+        self._bg_opacity = v
+        self._apply_alpha()
+
     def reset(self, x, y, w, h, text, bg_hex, fg, bg_image,
               base_font_size, async_enabled=False, bilingual=False,
-              subtitle=False):
+              subtitle=False, bg_opacity=None):
         self._bilingual = bool(bilingual)
         self._subtitle = bool(subtitle)
+        if bg_opacity is not None:
+            try:
+                self._bg_opacity = max(0.05, min(1.0, float(bg_opacity)))
+            except Exception:
+                pass
         self._box_w = w
         self._box_h = h
         self._full_text = text
@@ -281,9 +397,14 @@ class TranslationBox(tk.Toplevel):
             self._initialized = True
 
     def _apply_capture_exclusion(self):
+        """应用窗口样式：排除截屏 + 鼠标穿透（窗口首次显示后执行）。"""
         try:
             self.update_idletasks()
-            exclude_from_capture(self.winfo_id())
+            hwnd = self.winfo_id()
+            alpha = (BILINGUAL_ALPHA if self._bilingual
+                     else self._bg_opacity)
+            exclude_from_capture(hwnd)
+            make_click_through(hwnd, alpha)
         except Exception:
             pass
 
@@ -346,8 +467,19 @@ class TranslationBox(tk.Toplevel):
         else:
             self.canvas.configure(bg=self._bg_hex)
 
-        font_size = calc_font_size(
-            self._full_text, self._box_w, self._box_h, self._base_font_size)
+        # 字号滞后：盒子尺寸变化 1~2px 时不重算字号。
+        # 否则框高抖动 1px 就可能让字号跳一级，字形重新排版 → 视觉抖动。
+        _fkey = (self._box_w // 2, self._box_h // 2)
+        if (self._font_cache_key == _fkey and
+                self._font_cache_text == self._full_text):
+            font_size = self._font_cache_size
+        else:
+            font_size = calc_font_size(
+                self._full_text, self._box_w, self._box_h,
+                self._base_font_size)
+            self._font_cache_key = _fkey
+            self._font_cache_text = self._full_text
+            self._font_cache_size = font_size
         visible = self._full_text[:self._visible_len]
 
         self.canvas.create_text(
@@ -360,16 +492,25 @@ class TranslationBox(tk.Toplevel):
 
     def update_content(self, text, base_font_size, bg_hex, fg, bg_image,
                        async_enabled=False, bilingual=False,
-                       subtitle=False):
-        text_changed = (self._full_text != text)
+                       subtitle=False, bg_opacity=None):
+        new_opacity = self._bg_opacity
+        if bg_opacity is not None:
+            try:
+                new_opacity = max(0.05, min(1.0, float(bg_opacity)))
+            except Exception:
+                new_opacity = self._bg_opacity
+        old_text = self._full_text
+        text_changed = (old_text != text)
         style_changed = (
             self._base_font_size != base_font_size or
             self._bg_hex != bg_hex or
             self._fg != fg or
             self._bg_image is not bg_image or
             self._bilingual != bool(bilingual) or
-            self._subtitle != bool(subtitle)
+            self._subtitle != bool(subtitle) or
+            abs(new_opacity - self._bg_opacity) > 0.001
         )
+        self._bg_opacity = new_opacity
 
         if not text_changed and not style_changed:
             return
@@ -385,7 +526,10 @@ class TranslationBox(tk.Toplevel):
         self._apply_alpha()
 
         if text_changed:
-            if async_enabled:
+            # 小幅改动（OCR 抖动、标点差异）不重启动画：
+            # 否则每帧都从第一个字重新打字，观感就是「译文抖一下」。
+            minor = _is_minor_text_change(old_text, text)
+            if async_enabled and not minor:
                 self._visible_len = 0
                 self._animating = True
             else:
@@ -771,6 +915,7 @@ class OverlayWindow:
             bg_hex = item.get('bg_hex', '#FFFFFF')
             fg = item.get('fg', '#000000')
             bg_image = item.get('bg_image')
+            bg_opacity = item.get('bg_opacity')
             item_font = item.get('force_font_size', base_font_size)
 
             bilingual = item.get('bilingual', False)
@@ -803,6 +948,7 @@ class OverlayWindow:
                     async_enabled=self.async_enabled,
                     bilingual=bilingual,
                     subtitle=subtitle,
+                    bg_opacity=bg_opacity,
                 )
                 self.boxes[key] = box
             else:
@@ -813,12 +959,21 @@ class OverlayWindow:
                     async_enabled=self.async_enabled,
                     bilingual=bilingual,
                     subtitle=subtitle,
+                    bg_opacity=bg_opacity,
                 )
 
         for key in list(self.boxes.keys()):
             if key not in new_map:
                 self._release(self.boxes[key])
                 del self.boxes[key]
+
+    def set_bg_opacity(self, value):
+        """立即更新所有已存在窗口的不透明度（滑杆实时生效）。"""
+        for box in list(self.boxes.values()):
+            try:
+                box.set_bg_opacity(value)
+            except Exception:
+                pass
 
     # ========== 边界裁剪 ==========
 

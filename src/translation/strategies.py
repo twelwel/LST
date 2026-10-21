@@ -143,22 +143,56 @@ class LocalOnlyStrategy(BaseStrategy):
         return '[离线：本地模型未命中]'
 
     def translate_lines(self, lines, source='auto', target='zh'):
-        """本地流式批量翻译：跳过空行，同批重复文本只调用一次模型。"""
+        """本地流式批量翻译。
+
+        跳过空行、同批去重，并**优先走模型的批量推理**（一次 generate 多条）；
+        批量失败或个别失败时逐条兜底。
+        """
         if not lines:
             return []
-        cache = {}
-        results = []
+        results = [''] * len(lines)
+
+        # 1) 收集需要翻译的唯一条目（保持首次出现顺序）
+        uniq = {}
         for line in lines:
             text = (line or '').strip()
-            if not text:
-                results.append('')
+            if text and text not in uniq:
+                uniq[text] = None
+        if not uniq:
+            return results
+
+        texts = list(uniq.keys())
+
+        # 2) 优先批量推理（本地 provider 才提供 translate_batch）
+        for lp in self.local_providers:
+            batch_fn = getattr(lp, 'translate_batch', None)
+            if batch_fn is None:
                 continue
-            if text not in cache:
+            try:
+                rs = batch_fn(texts, source, target)
+            except Exception as e:
+                log.warning(f"[离线] 批量翻译失败，回退逐条：{e}")
+                continue
+            if not rs or len(rs) != len(texts):
+                continue
+            for t, r in zip(texts, rs):
+                if getattr(r, 'success', False) and r.text and r.text.strip():
+                    uniq[t] = r.text
+            if all(v is not None for v in uniq.values()):
+                break
+
+        # 3) 未命中的逐条兜底（保留原有的错误提示）
+        for t in texts:
+            if uniq[t] is None:
                 try:
-                    cache[text] = self.translate(text, source, target)
+                    uniq[t] = self.translate(t, source, target)
                 except Exception as e:
-                    cache[text] = f'[翻译异常: {e}]'
-            results.append(cache[text])
+                    uniq[t] = f'[翻译异常: {e}]'
+
+        for i, line in enumerate(lines):
+            text = (line or '').strip()
+            if text:
+                results[i] = uniq.get(text, '')
         return results
 
 

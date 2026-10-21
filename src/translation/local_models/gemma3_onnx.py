@@ -36,9 +36,8 @@ def _resolve_provider():
     if force == 'cuda' and 'CUDAExecutionProvider' in available: return "CUDAExecutionProvider", [{"device_id": 0}]
     if force == 'directml' and 'DmlExecutionProvider' in available:
         return "DmlExecutionProvider", dml_provider_options()
-    if 'CUDAExecutionProvider' in available: return "CUDAExecutionProvider", [{"device_id": 0}]
-    if 'DmlExecutionProvider' in available:
-        return "DmlExecutionProvider", dml_provider_options()
+    # ⭐ auto → CPU：Gemma3 是 CausalLM，同样逐 token 解码，
+    # DML 每步 dispatch 开销同样吃光收益（与 Opus-MT 同理）。
     return "CPUExecutionProvider", None
 
 def _inference_mode():
@@ -79,6 +78,12 @@ class Gemma3ONNXModel(BaseTranslationModel):
     def variant_tag(self) -> str: return 'GPU' if self._variant_label == 'FP32' else 'CPU'
 
     def load(self, model_path: Path) -> bool:
+        # torch 线程数在 hf_onnx 统一限制（两个实现共用同一套 torch）
+        try:
+            from .hf_onnx import _limit_torch_threads
+            _limit_torch_threads()
+        except Exception:
+            pass
         with self._lock:
             if self._model is not None: return True
             self.last_error = ''
@@ -100,9 +105,8 @@ class Gemma3ONNXModel(BaseTranslationModel):
             onnx_dir = model_path / 'onnx'
             has_fp32 = (onnx_dir / 'model.onnx').exists()
             has_q4 = (onnx_dir / 'model_q4.onnx').exists()
-            # 自动模式只有下载了 FP32 才走 GPU；否则使用量化 CPU 版。
-            prefer_gpu = (pref in ('cuda', 'directml')
-                          or (pref == 'auto' and has_fp32))
+            # 只有显式选 cuda / directml 才走 GPU；auto 一律 CPU。
+            prefer_gpu = pref in ('cuda', 'directml')
 
             # ⭐ 智能选择
             if prefer_gpu:

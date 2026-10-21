@@ -68,6 +68,8 @@ DEFAULT_USER_CONFIG = {
     # 显示设置
     "scan_interval": 0.30,
     "font_size": 14,
+    "overlay_bg_opacity": 0.70,
+    "merge_level": "mid",
     "use_inpainting": False,
 
     # 缓存

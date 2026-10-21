@@ -108,6 +108,24 @@ def _normalize_jp(text):
     return t
 
 
+def _normalize_for_hash(text):
+    """归一化用于缓存哈希的文本（所有语言）。
+
+    背景变动时 OCR 常多出/少掉空格或首尾标点。旧实现只对日语归一化，
+    中英文直接用原文哈希 → 同一句话算出不同 key → 翻译缓存全部失效
+    → 每帧重新翻译 + 重绘，表现就是「译文抖动」。
+
+    这里只做不改变语义的归一化：
+    - 删除所有空白（空格抖动最常见）
+    - 去掉首尾标点
+    - 保留大小写与内部标点（避免把 "1.5" 与 "15" 混为一句）
+    """
+    if not text:
+        return ''
+    t = ''.join(text.split())
+    return t.strip('.,;:!?"\'`´“”‘’、。，！？；：…·~～')
+
+
 def hash_paragraph(paragraph):
     """段落内容 hash（不含位置，用于翻译缓存）
 
@@ -119,7 +137,7 @@ def hash_paragraph(paragraph):
         if _has_kana(raw):
             line_texts.append(_normalize_jp(raw))
         else:
-            line_texts.append(raw)
+            line_texts.append(_normalize_for_hash(raw))
 
     line_hashes = sorted(hash_text(t) for t in line_texts)
     return hashlib.md5('|'.join(line_hashes).encode('utf-8')).hexdigest()
@@ -133,7 +151,7 @@ def get_line_hashes(paragraph):
         if _has_kana(raw):
             result.add(hash_text(_normalize_jp(raw)))
         else:
-            result.add(hash_text(raw))
+            result.add(hash_text(_normalize_for_hash(raw)))
     return frozenset(result)
 
 
@@ -488,32 +506,83 @@ def text_similarity(a, b):
     return _SM(None, a_n, b_n).ratio()
 
 
+# ==================== 合并强度预设 ====================
+# 游戏 UI 里「短标签 + 短数值」很常见，默认阈值会把它们拆成碎片；
+# 而左右分栏 / 独立菜单项又容易被错误拼成一句。这里给四档交给用户按场景调。
+# 注意：'mid' 的数值与历史行为完全一致，改主流程默认行为时请新增档位。
+MERGE_PRESETS = {
+    'off': {
+        'enabled': False,
+    },
+    'weak': {
+        'enabled': True,
+        'require_long': 'both',          # 必须两条都算长行
+        'min_len': 18, 'min_width': 180,
+        'jp_min_len': 4, 'jp_min_width': 72,
+        'align_ratio': 1.5, 'width_sim': 0.40,
+        'gap_ratio': 0.45, 'length_sim': 0.50,
+        'h_gap_ratio': None,
+    },
+    'mid': {
+        'enabled': True,
+        'require_long': 'one',           # 至少一条长行（历史行为）
+        'min_len': MIN_MERGE_LINE_LENGTH, 'min_width': MIN_MERGE_LINE_WIDTH,
+        'jp_min_len': 3, 'jp_min_width': 60,
+        'align_ratio': ALIGN_TOLERANCE_RATIO,
+        'width_sim': WIDTH_SIMILAR_RATIO,
+        'gap_ratio': LINE_GAP_RATIO,
+        'length_sim': LENGTH_SIMILAR_RATIO,
+        'h_gap_ratio': None,
+    },
+    'strong': {
+        'enabled': True,
+        'require_long': 'none',          # 不再要求长行：同排短词也合并
+        'min_len': 8, 'min_width': 60,
+        'jp_min_len': 2, 'jp_min_width': 24,
+        'align_ratio': 2.5, 'width_sim': 0.20,
+        'gap_ratio': 0.75, 'length_sim': 0.25,
+        # 同行水平间距上限（× 字高）：防止把同一行里相隔很远的元素粘成一句
+        'h_gap_ratio': 1.5,
+    },
+}
+
+DEFAULT_MERGE_LEVEL = 'mid'
+
+
+def get_merge_preset(level=None):
+    """按名称取合并预设；未知名称回退到 mid。"""
+    key = str(level or DEFAULT_MERGE_LEVEL).strip().lower()
+    return MERGE_PRESETS.get(key, MERGE_PRESETS['mid'])
+
+
 # ==================== 行长度判断 ====================
 
-def _is_long_line(item):
+def _is_long_line(item, preset=None):
+    preset = preset or MERGE_PRESETS['mid']
     text = item['text'].strip()
     x1, y1, x2, y2 = item['box']
     width = x2 - x1
 
     # ⭐ 日语行：字符数阈值降低
     if _has_kana(text):
-        return len(text) >= 3 and width >= 60
+        return (len(text) >= preset['jp_min_len']
+                and width >= preset['jp_min_width'])
 
-    return (len(text) >= MIN_MERGE_LINE_LENGTH
-            and width >= MIN_MERGE_LINE_WIDTH)
+    return (len(text) >= preset['min_len']
+            and width >= preset['min_width'])
 
 
-def _length_similar(text_a, text_b):
+def _length_similar(text_a, text_b, ratio=None):
     a = len(text_a.strip())
     b = len(text_b.strip())
     if a == 0 or b == 0:
         return False
-    return min(a, b) / max(a, b) >= LENGTH_SIMILAR_RATIO
+    return min(a, b) / max(a, b) >= (ratio or LENGTH_SIMILAR_RATIO)
 
 
 # ==================== 对齐检测 ====================
 
-def _is_aligned(prev, cur, avg_h):
+def _is_aligned(prev, cur, avg_h, ratio=None):
     px1, py1, px2, py2 = prev['box']
     x1, y1, x2, y2 = cur['box']
 
@@ -522,22 +591,38 @@ def _is_aligned(prev, cur, avg_h):
     center_d = abs((x1 + x2) / 2 - (px1 + px2) / 2)
     min_align = min(left_d, right_d, center_d)
 
-    return min_align <= avg_h * ALIGN_TOLERANCE_RATIO
+    return min_align <= avg_h * (ratio or ALIGN_TOLERANCE_RATIO)
 
 
-def _width_similar(prev, cur):
+def _width_similar(prev, cur, ratio=None):
     pw = prev['box'][2] - prev['box'][0]
     cw = cur['box'][2] - cur['box'][0]
     if pw <= 0 or cw <= 0:
         return False
-    return min(pw, cw) / max(pw, cw) >= WIDTH_SIMILAR_RATIO
+    return min(pw, cw) / max(pw, cw) >= (ratio or WIDTH_SIMILAR_RATIO)
 
 
 # ==================== 段落合并 ====================
 
-def merge_lines_to_paragraphs(items):
+def merge_lines_to_paragraphs(items, level=None):
+    """把 OCR 行合并成段落。
+
+    level: 'off' / 'weak' / 'mid' / 'strong'（None → mid，与历史行为一致）
+    """
     if not items:
         return []
+
+    preset = get_merge_preset(level)
+    if not preset.get('enabled', True):
+        # 关闭合并：每个 OCR 行独立成段
+        return [_build([it]) for it in items]
+
+    align_ratio = preset['align_ratio']
+    width_sim = preset['width_sim']
+    gap_ratio = preset['gap_ratio']
+    length_sim = preset['length_sim']
+    h_gap_ratio = preset.get('h_gap_ratio')
+    require_long = preset.get('require_long', 'one')
 
     sorted_items = sorted(items, key=lambda it: (it['box'][1], it['box'][0]))
     paragraphs = []
@@ -556,23 +641,35 @@ def merge_lines_to_paragraphs(items):
         if gap < -avg_h * 0.5:
             same_line = True
         else:
-            same_line = gap < avg_h * LINE_GAP_RATIO
+            same_line = gap < avg_h * gap_ratio
 
-        aligned = _is_aligned(prev, it, avg_h)
-        width_ok = _width_similar(prev, it)
+        aligned = _is_aligned(prev, it, avg_h, align_ratio)
+        width_ok = _width_similar(prev, it, width_sim)
 
-        prev_long = _is_long_line(prev)
-        cur_long = _is_long_line(it)
-        at_least_one_long = prev_long or cur_long
+        prev_long = _is_long_line(prev, preset)
+        cur_long = _is_long_line(it, preset)
+        if require_long == 'none':
+            long_ok = True
+        elif require_long == 'both':
+            long_ok = prev_long and cur_long
+        else:
+            long_ok = prev_long or cur_long
 
         if prev_long and cur_long:
-            length_ok = _length_similar(prev['text'], it['text'])
+            length_ok = _length_similar(prev['text'], it['text'], length_sim)
         else:
             length_ok = True
 
+        # 同行水平间距上限（仅 strong 启用）
+        h_ok = True
+        if h_gap_ratio is not None:
+            h_gap = x1 - px2
+            if h_gap > avg_h * h_gap_ratio:
+                h_ok = False
+
         can_merge = (
             same_line and aligned and width_ok
-            and at_least_one_long and length_ok
+            and long_ok and length_ok and h_ok
         )
 
         if can_merge:

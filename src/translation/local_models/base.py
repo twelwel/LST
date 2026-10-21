@@ -53,3 +53,14 @@ class BaseTranslationModel(ABC):
         if src == 'auto':
             return any(t == tgt for _, t in self.supported_languages)
         return (src, tgt) in self.supported_languages
+
+    def translate_batch(self, texts, src_lang: str = 'auto',
+                        tgt_lang: str = 'zh') -> List[str]:
+        """批量翻译，返回与 texts 等长的译文列表。
+
+        默认实现逐条调用 translate()；支持真正批量推理的子类应覆盖它
+        （一次 forward 处理多条，可摊薄固定开销）。
+        """
+        if not texts:
+            return []
+        return [self.translate(t, src_lang, tgt_lang) for t in texts]

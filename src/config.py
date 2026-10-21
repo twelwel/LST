@@ -217,6 +217,15 @@ FG_COLOR_PRESETS = {
 
 DEFAULT_FG_COLOR = 'auto'
 
+# ==================== 覆盖层外观 ====================
+# 浅黑面板 + 可调不透明度。
+# 0.70 = 30% 透明（默认）：能隐约看到底图，白字仍清晰。
+# 注意：这是整窗 alpha，文字会一起半透明；深底白字下观感正常。
+OVERLAY_BG_COLOR = '#0e0e0e'
+DEFAULT_OVERLAY_BG_OPACITY = 0.70
+OVERLAY_BG_OPACITY_MIN = 0.10
+OVERLAY_BG_OPACITY_MAX = 1.00
+
 # OCR 模型大小（PP-OCRv6）
 # - 'server'：PP-OCRv6 small/medium，精度高，慢
 # - 'tiny'：PP-OCRv6 tiny，速度极快，参数约 1.1M
@@ -317,13 +326,41 @@ THROTTLE_QPS_MAX = 20.0
 # ==================== 本地模型设备 ====================
 
 LOCAL_MODEL_DEVICES = {
-    'auto':     '自动（GPU 优先）',
+    'auto':     '自动（推荐：CPU）',
     'cuda':     'NVIDIA CUDA',
-    'directml': 'DirectML',
+    'directml': 'DirectML（慢，勿选）',
     'cpu':      'CPU（不占显卡）',
 }
 
 DEFAULT_LOCAL_MODEL_DEVICE = 'auto'
+
+# ==================== 本地模型批量推理 ====================
+# 一次 generate 处理多条，摊薄逐条推理的固定开销。
+# 实测（8 条短句）：CPU 56.1ms/条 → 18.4ms/条（3.1×）
+LOCAL_BATCH_MAX = 8               # 单批最多几条
+# 批内最长/最短超过此倍数才另起一批。实测放到 4.0 最优：
+# padding 浪费远小于"多切一批"的代价（3 批 30.7ms/条 → 1 批 18.8ms/条）。
+# 仍然保留倍率是为了防"8 字符 vs 500 字符"混批时 padding 爆炸。
+LOCAL_BATCH_PADDING_RATIO = 4.0
+
+# ==================== 段落级译文复用（抗结构抖动） ====================
+# 背景变动会让段落「合并 / 拆分」（多一行、少一行），p_hash 随之改变，
+# 翻译缓存必然失效 → 重新翻译 + 重绘，表现为抖动。
+# 这里按「同位置 + 行集合相似度」复用旧译文，减少抖动与重复请求。
+PARAGRAPH_REUSE_JACCARD = 0.66     # 行集合 Jaccard 下限（约 2/3）
+PARAGRAPH_REUSE_LEN_RATIO = 0.5    # 原文长度比下限，避免短标签套用长译文
+PARAGRAPH_MEMORY_MAX = 300         # 记忆表上限（条）
+
+# ==================== 文字合并强度 ====================
+# 游戏 UI 里「短标签 + 短数值」常被拆成碎片；而左右分栏/独立菜单项
+# 又容易被错误拼成一句。这里给四档，用户可按场景自己调。
+MERGE_LEVELS = {
+    'off':    '关闭（每行独立）',
+    'weak':   '弱（只并长行）',
+    'mid':    '中（默认）',
+    'strong': '强（相邻短词也并）',
+}
+DEFAULT_MERGE_LEVEL = 'mid'
 
 # ==================== 缓存范围 ====================
 CACHE_MIN = 100
